@@ -1,0 +1,13 @@
+/target/
+/.cargo/config.toml
+/.camera-adapter-state/
+/captures/
+*.db
+*.db-shm
+*.db-wal
+*.partial
+*.log
+simulators/.env
+simulators/generated/
+__pycache__/
+*.py[cod]

@@ -1,0 +1,17 @@
+{
+  "publicBaseUrl": "https://camera.test:18443",
+  "endpointReference": "urn:uuid:edgecommons-onvif-tls-simulator",
+  "auth": {
+    "mode": "digest",
+    "algorithm": "SHA-256",
+    "username": "operator",
+    "password": "camera-secret"
+  },
+  "device": {
+    "manufacturer": "EdgeCommons",
+    "model": "Deterministic ONVIF TLS Simulator",
+    "firmwareVersion": "1.0.0-tls",
+    "serialNumber": "SIM-TLS-0001",
+    "hardwareId": "EC-SIM-TLS"
+  }
+}

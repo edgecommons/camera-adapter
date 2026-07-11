@@ -44,7 +44,7 @@ The design is successful when an implementation can demonstrate all of the follo
    unavailable or explicitly not desired.
 4. Trigger capture through an optional schedule, a terminal request/reply command, or an asynchronous
    submitted command.
-5. Persist an image atomically before reporting success.
+5. Persist a complete, verified image before reporting success.
 6. Publish enough metadata for a local consumer to find and validate the image, including both its
    absolute and output-root-relative paths.
 7. Preserve request correlation in direct replies and command-originated terminal messages.
@@ -69,7 +69,7 @@ The design is successful when an implementation can demonstrate all of the follo
 - ONVIF capability discovery, media profiles, snapshot URI capture, authentication, and PTZ.
 - RTSP frame extraction as an ONVIF backend capture mode and fallback.
 - Durable capture-job state, idempotent submission, cancellation, status recovery, and message outbox.
-- Atomic local file persistence under one configured output root.
+- Crash-recoverable local file persistence under one configured output root.
 - Optional local metadata sidecars.
 - Commands, events, health, metrics, logging, credentials, config reload, and shutdown.
 - Native packaging and deployment requirements for HOST, Greengrass, and Kubernetes.
@@ -101,7 +101,7 @@ The words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 | Direct capture | `sb/capture`; one request receives one terminal reply. |
 | Submitted capture | `sb/capture-submit`; one request receives an immediate acceptance reply and observes completion through terminal messages or status. |
 | Source frame | Bytes and metadata acquired from the camera before optional conversion. |
-| Final image | The atomically installed file visible to consumers. |
+| Final image | The installed file visible to consumers. |
 | Resource group | A configurable admission-control group, normally a NIC, USB controller, or storage path. |
 | PTZ | Pan, tilt, and zoom control exposed only when enabled and supported. |
 | Terminal state | `SUCCEEDED`, `FAILED`, `CANCELLED`, or `INTERRUPTED`. |
@@ -148,7 +148,7 @@ flowchart LR
   Bus -->|"command delivery"| CameraAdapter
   Scheduler -->|"scheduled capture"| CameraAdapter
   CameraAdapter <-->|"capture and PTZ"| Cameras
-  CameraAdapter -->|"atomic image write"| Disk
+  CameraAdapter -->|"durable image persistence"| Disk
   CameraAdapter -->|"app metadata, evt alarms, and replies"| Bus
   Replicator -->|"watch"| Disk
   Replicator -->|"optional delivery"| Remote
@@ -176,7 +176,7 @@ flowchart TB
     Jobs["Durable job catalog and message outbox"]
     Workers["Per-camera actors"]
     Encoder["Bounded conversion pool"]
-    Writer["Atomic image writer"]
+    Writer["Image persistence writer"]
     Publisher["Outbox publisher"]
   end
 
@@ -220,8 +220,8 @@ flowchart TB
 - **Job catalog:** durably records job parameters, effective profile, state, paths, results, errors,
   idempotency keys, and terminal-message delivery state.
 - **Encoder pool:** performs CPU-heavy pixel conversion outside async executor threads.
-- **Atomic writer:** validates paths, writes a same-directory partial file, flushes it, atomically renames
-  it, and returns checksum and final metadata.
+- **Image persistence writer:** validates paths, writes and flushes a same-directory partial file, then
+  finalizes it under the platform-specific guarantees in §9.2 and returns checksum and final metadata.
 - **Outbox publisher:** retries terminal `app` messages until the messaging service confirms publication.
 
 ### 6.2 Backend abstraction
@@ -323,8 +323,8 @@ stateDiagram-v2
   Encoding --> Cancelled: cancellation before persistence
   Encoding --> Failed: unsupported format or conversion error
   Persisting --> Succeeded: final file installed and catalog committed
-  Persisting --> Cancelled: cancellation before atomic rename
-  Persisting --> Failed: write, flush, rename, or verification error
+  Persisting --> Cancelled: cancellation before final installation
+  Persisting --> Failed: write, flush, finalization, or verification error
   Accepted --> Interrupted: restart before durable queue transition
   Queued --> Interrupted: restart recovery policy
   Acquiring --> Interrupted: process restart
@@ -403,7 +403,7 @@ prevent indefinite starvation of scheduled jobs.
 
 - A queued job is cancelled synchronously.
 - Acquisition cancellation is best effort and backend-specific.
-- Encoding and persistence cancellation is allowed only before the atomic rename starts.
+- Encoding and persistence cancellation is allowed only before final installation starts.
 - A final file is never deleted by `sb/capture-cancel`.
 - A deferred direct requester receives a terminal `CAPTURE_CANCELLED` error when another consumer
   successfully cancels its job.
@@ -422,8 +422,11 @@ unless `cameraDirectoryTemplate` or `fileNameTemplate` is overridden:
 Each camera therefore receives its own subdirectory under the single output root. Templates may use
 only documented variables. Rendered paths MUST be relative, MUST NOT contain `..`, and MUST resolve
 under the canonical output root. Camera IDs and other path variables are sanitized before rendering.
+Linux enforces this at every filesystem operation with handle-relative no-follow traversal. Windows uses
+the accepted portable-persistence profile in §9.2 and does not guarantee containment against a hostile
+concurrent local junction/reparse or directory-rename actor after validation.
 
-### 9.2 Atomic persistence
+### 9.2 Platform-specific finalization
 
 ```mermaid
 flowchart LR
@@ -431,7 +434,7 @@ flowchart LR
   Convert --> Temp["Exclusive same-directory .partial file"]
   Temp --> Flush["Write, checksum, and flush"]
   Flush --> Record["Catalog records PERSISTING target"]
-  Record --> Rename["Atomic rename to final name"]
+  Record --> Rename["Final install (Linux atomic; Windows no-overwrite link)"]
   Rename --> Verify["Verify size and final path"]
   Verify --> Commit["Catalog SUCCEEDED plus message outbox"]
 ```
@@ -443,11 +446,13 @@ The writer MUST:
 3. Stream bytes through a SHA-256 calculation.
 4. Flush file content to the operating system and request durable storage where supported.
 5. Record the intended final path while the job is `PERSISTING`.
-6. Atomically rename within the same filesystem.
+6. Install the final file within the same filesystem. Linux uses atomic no-replace installation; Windows
+   uses standard-library no-overwrite link/install followed by partial cleanup and reports a collision,
+   unsupported hard-link filesystem, or finalization failure as `PERSISTENCE_FAILED`.
 7. Flush the parent directory where the platform supports it.
 8. Commit terminal metadata and an outbox message transactionally in SQLite.
 
-A crash after rename but before terminal catalog commit is recovered by inspecting the `PERSISTING`
+A crash after finalization but before terminal catalog commit is recovered by inspecting the `PERSISTING`
 record and verifying the final file. A partial file without a valid final image is removed during
 recovery and the job becomes `INTERRUPTED` or `FAILED` according to recovery policy.
 
@@ -496,7 +501,7 @@ tests.
 
 When `writeMetadataSidecar` is true, the adapter writes `<image-name>.json` containing the terminal
 application-message body without its EdgeCommons envelope. The sidecar uses its own same-directory
-partial file and atomic rename. The job remains `PERSISTING` until both image and sidecar are durable;
+partial file and the same platform-specific finalization profile. The job remains `PERSISTING` until both image and sidecar are durable;
 `ImageCaptured` is not published earlier. Restart reconciliation completes or fails the sidecar from the
 durable job record. A final image left visible by a crash before sidecar completion is an unannounced
 orphan until reconciliation and MUST NOT be treated as a successful capture merely because it exists.
@@ -714,7 +719,7 @@ without replacing camera sessions.
 | `limits.maxConnectedCameras` | `256`; 1–4096 | Maximum enabled supervisors/sessions. | increase live; decrease drains excess by config order |
 | `limits.maxConcurrentCaptures` | `32`; 1–256 | Global acquisition permits. | live for new admission |
 | `limits.maxConcurrentEncodes` | CPU count capped at 8; 1–64 | CPU conversion permits. | live |
-| `limits.maxConcurrentWrites` | `8`; 1–64 | Simultaneous atomic writers. | live |
+| `limits.maxConcurrentWrites` | `8`; 1–64 | Simultaneous persistence writers. | live |
 | `limits.maxConcurrentConnects` | `16`; 1–256 | Reconnect-storm bound. | live |
 | `limits.maxInFlightBytes` | `1 GiB`; 64 MiB–host safe limit | Total raw/encoded frame reservation. | live for new admission |
 | `limits.maxFrameBytesPerCamera` | `256 MiB`; 1 MiB–2 GiB | Reservation and hard decoded-frame ceiling unless profile is lower. | live for new jobs |
@@ -1438,7 +1443,7 @@ must round-trip unchanged.
 | `REPLY_REQUIRED` | Deferred `sb/capture` was sent without `reply_to`; use request/reply or `sb/capture-submit`. |
 | `UNSUPPORTED_PIXEL_FORMAT` | The source frame cannot produce the configured output. |
 | `STORAGE_PRESSURE` | Free-space policy blocks capture. |
-| `PERSISTENCE_FAILED` | Partial write, flush, rename, or verification failed. |
+| `PERSISTENCE_FAILED` | Partial write, flush, finalization, or verification failed. |
 | `PTZ_DISABLED` | PTZ is not enabled for this camera. |
 | `PTZ_RANGE_ERROR` | Requested normalized value is outside the permitted range. |
 | `PTZ_TIMEOUT` | PTZ operation did not receive a protocol response in time. |
@@ -1577,7 +1582,7 @@ sequenceDiagram
   participant Catalog as Job catalog
   participant Worker as Camera actor
   participant Camera as Camera backend
-  participant Disk as Atomic writer
+  participant Disk as Image persistence writer
   participant Outbox as Message outbox
   participant Bus as Local bus
 
@@ -1626,7 +1631,7 @@ sequenceDiagram
   Note over Inbox: return Deferred(token) and release dispatcher permit
   Worker->>Camera: acquire frame
   Camera-->>Worker: frame
-  Worker->>Disk: atomically persist
+  Worker->>Disk: persist and finalize image
   Disk-->>Worker: final metadata
   Worker->>Catalog: commit SUCCEEDED and message outbox
   Worker->>Deferred: settle success(token, terminal result)
@@ -1867,9 +1872,11 @@ Greengrass recipes and MQTT ACLs grant only:
 ### 18.3 Path and file safety
 
 - Templates render only beneath the configured canonical output root.
-- Symlink and junction traversal is rejected for newly created path components unless an explicit trusted
-  deployment policy allows it.
-- Final files are created without overwrite.
+- Linux rejects symlink and junction traversal for newly created path components unless an explicit trusted
+  deployment policy allows it. Windows relies on deployment-controlled output roots and portable path
+  validation; it does not claim hostile-local-actor junction/rename containment.
+- Linux final files are created without overwrite. Windows uses standard-library no-overwrite link/install;
+  a collision, unsupported hard-link filesystem, or finalization failure is `PERSISTENCE_FAILED`.
 - Filename variables are sanitized and length-limited.
 - Absolute paths are intentionally published locally but may expose host layout if messages are bridged.
 
@@ -2028,7 +2035,7 @@ flowchart TB
 - USB3 Vision needs a device plugin or explicit device mapping and stable permissions.
 - GigE Vision commonly needs `hostNetwork`, Multus, or a dedicated secondary interface so discovery and
   UDP receive traffic reach the camera VLAN.
-- Configure termination grace long enough for atomic persistence and PTZ stop.
+- Configure termination grace long enough for final image persistence and PTZ stop.
 - Prometheus, JSON stdout logging, and health probes use the current Kubernetes EdgeCommons facilities.
 
 ### 21.6 Sharding
@@ -2088,7 +2095,7 @@ sequenceDiagram
   participant FileReplicator
   participant Remote
 
-  CameraAdapter->>Disk: atomic final image
+  CameraAdapter->>Disk: final image installation
   CameraAdapter->>Bus: ImageCaptured metadata
   FileReplicator->>Disk: discover final file
   FileReplicator->>Remote: replicate and verify
@@ -2115,7 +2122,7 @@ timing. Neither substitutes for the other.
 ### 23.1 Unit and property tests
 
 - Configuration defaults, invalid combinations, redaction, per-backend parsing, and reload diffing.
-- Path rendering, Windows/POSIX absolute paths, sanitization, traversal, symlink/junction rejection,
+- Path rendering, Windows/POSIX absolute paths, sanitization, traversal, Linux symlink/junction rejection,
   collision resistance, and maximum lengths.
 - Cron time zones, DST transitions, misfires, overlap, jitter, and deterministic schedule deduplication.
 - Job state transitions, cancellation races, restart reconciliation, catalog transactions, retention,
@@ -2351,7 +2358,7 @@ Reviewers should explicitly decide:
    into one reply within the existing single-reply command model. A core pattern would also serve other
    fan-out surfaces (multi-instance adapters, edge-console bulk commands) and, if wanted, should be
    designed in core with four-language parity rather than per component.
-10. Should the P2 common engine (config, catalog/outbox, admission, scheduling, atomic writer, command
+10. Should the P2 common engine (config, catalog/outbox, admission, scheduling, image persistence writer, command
     surface) be extracted into the planned reusable Rust protocol-adapter CLI template, and in which
     phase does that extraction land?
 

@@ -1,0 +1,7 @@
+{
+  "fault": {
+    "soap": "malformed",
+    "snapshot": "normal",
+    "delayMs": 0
+  }
+}

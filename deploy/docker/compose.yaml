@@ -1,0 +1,90 @@
+name: camera-adapter-demo
+
+# Deterministic demo only. The ONVIF fixture disables authentication here so no credential
+# material is embedded in Compose. Production deployments use a real camera configuration and
+# EdgeCommons credential references, not this file.
+services:
+  broker:
+    image: docker.io/emqx/emqx@sha256:9e4b8176519eecbada12174a38dd605964259fd3fdfd2f24e6557d90c67de0fa
+    environment:
+      EMQX_ALLOW_ANONYMOUS: "true"
+    read_only: true
+    mem_limit: 256m
+    pids_limit: 192
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /opt/emqx/data:size=64m,mode=1777
+      - /opt/emqx/log:size=16m,mode=1777
+      - /tmp:size=16m,mode=1777
+    healthcheck:
+      test: ["CMD", "emqx_ctl", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  onvif-sim:
+    build:
+      context: ../../simulators/onvif_sim
+      target: runtime
+    read_only: true
+    mem_limit: 256m
+    pids_limit: 96
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    environment:
+      SIM_FIXTURE: /fixtures/simulator-onvif.json
+    volumes:
+      - ./simulator-onvif.json:/fixtures/simulator-onvif.json:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  data-init:
+    image: docker.io/library/debian@sha256:1def178129dfb5f24db43afbf2fcac04530012e3264ba4ff81c71184e17a9ee4
+    user: "0:0"
+    read_only: true
+    cap_drop: ["ALL"]
+    # This one-shot initializer creates a volume owned by the non-root adapter identity. Retain
+    # only the capability required for that ownership hand-off; the long-running adapter drops all.
+    cap_add: ["CHOWN"]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - adapter-data:/data
+    # Set modes while this one-shot container still owns the new directories; with every other
+    # capability dropped, changing ownership afterward needs only CAP_CHOWN.
+    command: ["/bin/sh", "-ec", "install -d -m 0700 /data/state && chown 65532:65532 /data/state && install -d -m 0750 /data/output && chown 65532:65532 /data/output"]
+
+  camera-adapter:
+    build:
+      context: ../../..
+      dockerfile: camera-adapter/Dockerfile
+      target: onvif
+    image: camera-adapter:simulator
+    depends_on:
+      broker:
+        condition: service_healthy
+      onvif-sim:
+        condition: service_healthy
+      data-init:
+        condition: service_completed_successfully
+    read_only: true
+    mem_limit: 512m
+    pids_limit: 160
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    ports:
+      - "127.0.0.1:18081:8081"
+    volumes:
+      - ./simulator-config.json:/etc/edgecommons/config.json:ro
+      - adapter-data:/data
+    command: ["--platform", "HOST", "--transport", "MQTT", "/etc/edgecommons/config.json", "-c", "FILE", "/etc/edgecommons/config.json"]
+
+volumes:
+  adapter-data:

@@ -1,0 +1,49 @@
+{
+  "logging": {
+    "level": "INFO"
+  },
+  "health": {
+    "enabled": true,
+    "port": 8081
+  },
+  "messaging": {
+    "local": {
+      "host": "broker",
+      "port": 1883,
+      "clientId": "camera-adapter-simulator"
+    }
+  },
+  "component": {
+    "token": "camera-adapter",
+    "global": {
+      "output": {
+        "rootDirectory": "/data/output",
+        "minimumFreeBytes": 1073741824,
+        "writeMetadataSidecar": true
+      },
+      "state": {
+        "directory": "/data/state"
+      }
+    },
+    "instances": [
+      {
+        "id": "onvif-simulator",
+        "backend": {
+          "type": "onvif-rtsp",
+          "deviceServiceUrl": "http://onvif-sim:8080/onvif/device_service",
+          "mediaProfile": "main",
+          "allowInsecure": true
+        },
+        "defaultCaptureProfile": "inspection",
+        "captureProfiles": {
+          "inspection": {
+            "captureMode": "snapshot-uri",
+            "output": {
+              "encoding": "png"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

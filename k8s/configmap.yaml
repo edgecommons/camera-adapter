@@ -1,0 +1,48 @@
+---
+# Mount this ConfigMap as a whole directory. Do not use subPath: CONFIGMAP reload observes
+# Kubernetes' ..data swap only when the volume itself is mounted.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: camera-adapter-config
+  labels:
+    app.kubernetes.io/name: camera-adapter
+data:
+  config.json: |-
+    {
+      "logging": { "level": "INFO" },
+      "health": { "enabled": true, "port": 8081 },
+      "messaging": {
+        "local": {
+          "host": "emqx.default.svc.cluster.local",
+          "port": 1883,
+          "clientId": "camera-adapter"
+        }
+      },
+      "component": {
+        "token": "camera-adapter",
+        "global": {
+          "output": {
+            "rootDirectory": "/var/lib/edgecommons/camera-adapter/output",
+            "minimumFreeBytes": 1073741824,
+            "writeMetadataSidecar": true
+          },
+          "state": {
+            "directory": "/var/lib/edgecommons/camera-adapter/state"
+          }
+        },
+        "instances": [{
+          "id": "camera-01",
+          "backend": {
+            "type": "onvif-rtsp",
+            "deviceServiceUrl": "https://replace-with-camera.example/onvif/device_service",
+            "mediaProfile": "replace-with-profile-token",
+            "allowedUriHosts": ["replace-with-camera.example"]
+          },
+          "defaultCaptureProfile": "inspection",
+          "captureProfiles": {
+            "inspection": { "output": { "encoding": "png" } }
+          }
+        }]
+      }
+    }

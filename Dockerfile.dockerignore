@@ -1,0 +1,26 @@
+# Dockerfile-specific build context filter. The build context is the EdgeCommons umbrella, but the
+# adapter image needs only these local source dependencies. Keep generated outputs, other component
+# repositories, credentials, and simulator runtime state out of the build context.
+**
+
+!camera-adapter/
+camera-adapter/**
+!camera-adapter/Cargo.toml
+!camera-adapter/Cargo.lock
+!camera-adapter/src/**
+!camera-adapter/native/**
+
+!core/
+core/**
+!core/libs/
+core/libs/**
+!core/libs/rust/
+!core/libs/rust/**
+!core/libs/rust-streamlog/
+!core/libs/rust-streamlog/**
+!core/proto/
+!core/proto/**
+
+# Local Cargo outputs are never source inputs to the image build.
+core/libs/rust/target/
+core/libs/rust-streamlog/target/

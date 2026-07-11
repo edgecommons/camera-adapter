@@ -1,0 +1,7 @@
+{
+  "fault": {
+    "soap": "normal",
+    "snapshot": "truncate",
+    "delayMs": 0
+  }
+}

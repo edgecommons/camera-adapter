@@ -1,0 +1,23 @@
+[package]
+name = "aravis-scoped"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+links = "camera_adapter_aravis_scoped"
+
+[dependencies]
+glib-sys = "0.20"
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+correctness = "deny"
+suspicious = "warn"
+complexity = "warn"
+perf = "warn"

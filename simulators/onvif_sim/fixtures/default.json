@@ -1,0 +1,34 @@
+{
+  "endpointReference": "urn:uuid:edgecommons-onvif-simulator",
+  "publicBaseUrl": "http://onvif-sim:8080",
+  "auth": {
+    "mode": "digest",
+    "algorithm": "MD5",
+    "username": "operator",
+    "password": "camera-secret"
+  },
+  "media": {
+    "media1": true,
+    "media2": true,
+    "profile": {
+      "token": "main",
+      "name": "main",
+      "width": 64,
+      "height": 48
+    },
+    "snapshotPath": "/snapshot/main.png",
+    "rtspUri": "rtsp://mediamtx:8554/camera"
+  },
+  "ptz": {
+    "enabled": true,
+    "presets": {
+      "home": "Home",
+      "loading-dock": "Loading dock"
+    }
+  },
+  "fault": {
+    "soap": "normal",
+    "snapshot": "normal",
+    "delayMs": 0
+  }
+}

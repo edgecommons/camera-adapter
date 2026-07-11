@@ -1,0 +1,128 @@
+name: camera-adapter-simulators
+
+services:
+  aravis-fake:
+    profiles: ["linux-l2"]
+    build:
+      context: ./aravis_fake
+    network_mode: host
+    read_only: true
+    mem_limit: 256m
+    pids_limit: 96
+    cpus: 1.0
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command: ["--interface=${ARAVIS_INTERFACE:-eth0}"]
+
+  onvif-sim:
+    build:
+      context: ./onvif_sim
+      target: runtime
+    read_only: true
+    mem_limit: 256m
+    pids_limit: 96
+    cpus: 0.5
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "18080:8080"
+      - "13702:3702/udp"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  onvif-sim-tests:
+    profiles: ["verify"]
+    build:
+      context: ./onvif_sim
+      target: tests
+    read_only: true
+    mem_limit: 256m
+    pids_limit: 96
+    cpus: 0.5
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  onvif-sim-tls:
+    build:
+      context: ./onvif_sim
+      target: runtime
+    read_only: true
+    mem_limit: 256m
+    pids_limit: 96
+    cpus: 0.5
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      SIM_FIXTURE: /fixtures/tls.json
+      SIM_HTTP_PORT: "8443"
+      SIM_DISCOVERY_PORT: "3703"
+      SIM_TLS_CERT: /fixtures/tls/server-cert.pem
+      SIM_TLS_KEY: /fixtures/tls/server-key.pem
+    ports:
+      - "18443:8443"
+      - "13703:3703/udp"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import ssl,urllib.request; urllib.request.urlopen('https://127.0.0.1:8443/healthz', context=ssl._create_unverified_context(), timeout=2).read()"
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  mediamtx:
+    image: docker.io/bluenviron/mediamtx@sha256:08c837deb7bac85d509e2a4c2737308e5a34f8f084a46a0d8793cdb0579a6e5d
+    read_only: true
+    mem_limit: 512m
+    pids_limit: 160
+    cpus: 2.0
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    ports:
+      - "18554:8554"
+      - "19997:9997"
+      - "19998:9998"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9997/v3/config/global/get"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
+    read_only: true
+    mem_limit: 128m
+    pids_limit: 64
+    cpus: 0.5
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "18474:8474"
+      - "28080:28080"
+      - "28554:28554"

@@ -1,0 +1,47 @@
+---
+RecipeFormatVersion: "2020-01-25"
+ComponentName: "com.mbreissi.edgecommons.CameraAdapter"
+ComponentVersion: "0.1.0"
+ComponentDescription: "EdgeCommons camera adapter: durable ONVIF/RTSP and optional GenICam image capture."
+ComponentPublisher: "EdgeCommons"
+ComponentConfiguration:
+  # This is deliberately a non-runnable safety template. The adapter requires at least one
+  # enabled valid camera, so a deployment must replace ComponentConfig atomically before Run.
+  DefaultConfiguration:
+    ComponentConfig:
+      logging:
+        level: "INFO"
+      component:
+        token: "camera-adapter"
+        global:
+          output:
+            rootDirectory: "/var/lib/edgecommons/camera-adapter/output"
+            minimumFreeBytes: 1073741824
+            writeMetadataSidecar: true
+          state:
+            directory: "/var/lib/edgecommons/camera-adapter/state"
+        instances: []
+    accessControl:
+      aws.greengrass.ipc.pubsub:
+        "com.mbreissi.edgecommons.CameraAdapter:publish:1":
+          policyDescription: "Publishes camera adapter state, events, metrics, and application messages."
+          operations:
+            - "aws.greengrass#PublishToTopic"
+          resources:
+            - "ecv1/*/camera-adapter/*"
+        "com.mbreissi.edgecommons.CameraAdapter:subscribe:1":
+          policyDescription: "Subscribes only to the camera adapter main command inbox."
+          operations:
+            - "aws.greengrass#SubscribeToTopic"
+          resources:
+            - "ecv1/*/camera-adapter/main/cmd/*"
+Manifests:
+  - Platform:
+      os: linux
+    Artifacts:
+      - URI: "s3://REPLACE_WITH_ARTIFACT_BUCKET/camera-adapter/0.1.0/camera-adapter"
+    Lifecycle:
+      Install:
+        Script: "chmod +x {artifacts:path}/camera-adapter"
+      Run:
+        Script: "{artifacts:path}/camera-adapter --platform GREENGRASS -c GG_CONFIG"

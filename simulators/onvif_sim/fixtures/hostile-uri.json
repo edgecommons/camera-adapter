@@ -1,0 +1,8 @@
+{
+  "fault": {
+    "soap": "normal",
+    "snapshot": "hostile-uri",
+    "discovery": "hostile-xaddr",
+    "delayMs": 0
+  }
+}

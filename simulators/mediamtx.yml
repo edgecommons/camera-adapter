@@ -1,0 +1,44 @@
+logLevel: info
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+        path:
+      - action: read
+        path:
+      - action: playback
+        path:
+      - action: api
+      - action: metrics
+rtspAddress: :8554
+rtspTransports: [tcp]
+rtmp: false
+hls: false
+webrtc: false
+srt: false
+moq: false
+api: yes
+apiAddress: :9997
+metrics: yes
+metricsAddress: :9998
+pathDefaults:
+  source: publisher
+paths:
+  camera:
+    runOnInit: >-
+      ffmpeg -hide_banner -loglevel warning -re
+      -f lavfi -i testsrc2=size=320x240:rate=10
+      -vf format=yuv420p -c:v libx264 -preset ultrafast -tune zerolatency
+      -g 10 -keyint_min 10 -sc_threshold 0
+      -f rtsp rtsp://127.0.0.1:8554/camera
+    runOnInitRestart: yes
+  camera-h265:
+    runOnInit: >-
+      ffmpeg -hide_banner -loglevel warning -re
+      -f lavfi -i testsrc2=size=320x240:rate=10
+      -vf format=yuv420p -c:v libx265 -preset ultrafast
+      -x265-params keyint=10:min-keyint=10:scenecut=0
+      -f rtsp rtsp://127.0.0.1:8554/camera-h265
+    runOnInitRestart: yes

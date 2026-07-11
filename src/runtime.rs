@@ -1,0 +1,8611 @@
+//! Runtime composition and command-plane hand-off.
+//!
+//! This module deliberately separates inbox registration from construction of the durable
+//! runtime. The core command inbox is subscribed during [`edgecommons::EdgeCommonsBuilder`]
+//! construction, while the adapter cannot safely accept camera work until catalog recovery,
+//! storage probing, and supervisor creation have completed. [`RuntimeCommandRouter`] closes that
+//! short interval without a command-registration race.
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use edgecommons::commands::{
+    CommandError, CommandInbox, CommandOutcome, DeferredReplyRegistry, DeferredReplyToken,
+    outcome_handler,
+};
+use edgecommons::config::ConfigurationChangeListener;
+use edgecommons::config::{Config, ConfigurationValidationPhase, ConfigurationValidationResult};
+use edgecommons::facades::{AppFacade, EventsFacade, Severity};
+use edgecommons::messaging::Message;
+use edgecommons::platform::Platform;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::{
+    COMPONENT_NAME, Result,
+    actor::{CameraActor, CameraActorHandle},
+    admission::{AdmissionController, FilesystemSpaceProbe},
+    backend::{BackendRuntimeContext, ConnectRequest, DiscoveryCandidate},
+    catalog::{Catalog, CatalogOptions},
+    config::AdapterConfig,
+    jobs::{
+        AcceptanceHook, AppTerminalEnvelopeEncoder, CaptureDescriptor, CaptureDispatcher,
+        DispatchReservation, JobEngine, JobHooks,
+    },
+    outbox::{EdgeCommonsConfirmedPublisher, OutboxDurability, OutboxPressure, OutboxPublisher},
+    registry::{CameraConnectionState, CameraRegistry, CameraStatusError},
+    scheduler::{ScheduleDecision, ScheduleOccurrence, SchedulePlan},
+    state_path::resolve_state_directory,
+    storage::{StorageReservation, StorageRoot},
+    storage_pressure::{RootPressure, StoragePressureMonitor, StoragePressureSnapshot},
+};
+
+use crate::commands::{
+    self, CancelRequest, CaptureRequest, CaptureStatusMode, CaptureStatusRequest, DiscoverRequest,
+    GroupCaptureRequest, ListRequest, PtzCommandRequest, PtzPresetsRequest, ReconnectRequest,
+    StatusRequest,
+};
+
+// Continuations are intentionally process-local capability tokens.  They contain no request
+// data and a caller cannot manufacture a valid one by guessing an offset.  A short retention
+// window also bounds memory when an untrusted client deliberately abandons pages.
+const CURSOR_TTL: Duration = Duration::from_secs(300);
+const MAX_RETAINED_CURSORS: usize = 256;
+const MAX_RETAINED_SNAPSHOT_VALUES: usize = 10_000;
+const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const SCHEDULER_MISFIRE_GRACE: Duration = Duration::from_secs(5);
+
+type ReadySetter = dyn Fn(bool) + Send + Sync;
+
+/// Combines the one-way startup gate with independently observed durable-state availability.
+///
+/// A recovered outbox catalog pass cannot make the component ready before every startup gate has
+/// completed, and it cannot re-enable readiness after shutdown begins. This keeps the core's
+/// single boolean readiness flag honest without treating ordinary broker pressure as a storage
+/// failure.
+#[derive(Clone)]
+pub struct RuntimeReadiness {
+    startup_complete: Arc<AtomicBool>,
+    catalog_available: Arc<AtomicBool>,
+    outbox_available: Arc<AtomicBool>,
+    state_storage_available: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
+    set_ready: Arc<ReadySetter>,
+}
+
+impl RuntimeReadiness {
+    /// Creates a readiness bridge in its initial not-ready state.
+    #[must_use]
+    pub fn new(set_ready: Arc<ReadySetter>) -> Self {
+        Self {
+            startup_complete: Arc::new(AtomicBool::new(false)),
+            catalog_available: Arc::new(AtomicBool::new(true)),
+            outbox_available: Arc::new(AtomicBool::new(true)),
+            state_storage_available: Arc::new(AtomicBool::new(true)),
+            stopping: Arc::new(AtomicBool::new(false)),
+            set_ready,
+        }
+    }
+
+    /// Opens readiness after command routing and all runtime startup gates have completed.
+    pub fn complete_startup(&self) {
+        if !self.startup_complete.swap(true, Ordering::AcqRel) {
+            self.publish();
+        }
+    }
+
+    /// Permanently closes readiness for ordered shutdown.
+    pub fn begin_shutdown(&self) {
+        if !self.stopping.swap(true, Ordering::AcqRel) {
+            self.publish();
+        }
+    }
+
+    fn set_catalog_available(&self, available: bool) {
+        if self.catalog_available.swap(available, Ordering::AcqRel) != available {
+            self.publish();
+        }
+    }
+
+    fn set_outbox_available(&self, available: bool) {
+        if self.outbox_available.swap(available, Ordering::AcqRel) != available {
+            self.publish();
+        }
+    }
+
+    fn set_state_storage_available(&self, available: bool) {
+        if self
+            .state_storage_available
+            .swap(available, Ordering::AcqRel)
+            != available
+        {
+            self.publish();
+        }
+    }
+
+    fn publish(&self) {
+        let ready = self.startup_complete.load(Ordering::Acquire)
+            && self.catalog_available.load(Ordering::Acquire)
+            && self.outbox_available.load(Ordering::Acquire)
+            && self.state_storage_available.load(Ordering::Acquire)
+            && !self.stopping.load(Ordering::Acquire);
+        (self.set_ready)(ready);
+    }
+
+    #[cfg(test)]
+    fn noop() -> Self {
+        Self::new(Arc::new(|_| {}))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum OutboxAlarmTransition {
+    Raise(serde_json::Value),
+    Clear(serde_json::Value),
+}
+
+struct OutboxHealthWatchers {
+    pressure: watch::Receiver<OutboxPressure>,
+    durability: watch::Receiver<OutboxDurability>,
+    catalog_availability: watch::Receiver<crate::catalog::CatalogAvailability>,
+}
+
+#[derive(Default)]
+struct OutboxAlarmState {
+    delayed: bool,
+}
+
+impl OutboxAlarmState {
+    fn transition(&mut self, pressure: &OutboxPressure) -> Option<OutboxAlarmTransition> {
+        if self.delayed == pressure.delayed {
+            return None;
+        }
+        self.delayed = pressure.delayed;
+        let context = outbox_pressure_context(pressure);
+        if pressure.delayed {
+            Some(OutboxAlarmTransition::Raise(context))
+        } else {
+            Some(OutboxAlarmTransition::Clear(context))
+        }
+    }
+}
+
+fn outbox_pressure_context(pressure: &OutboxPressure) -> serde_json::Value {
+    let mut context = serde_json::Map::new();
+    context.insert("pending".to_string(), pressure.pending.into());
+    context.insert("oldestAgeMs".to_string(), pressure.oldest_age_ms.into());
+    context.insert("maxAttempts".to_string(), pressure.max_attempts.into());
+    if let Some(error) = &pressure.last_error {
+        context.insert(
+            "lastError".to_string(),
+            serde_json::Value::String(error.clone()),
+        );
+    }
+    serde_json::Value::Object(context)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StorageAlarmContext {
+    root: String,
+    free_bytes: Option<u64>,
+    free_percent: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StorageAlarmTransition {
+    Raise(StorageAlarmContext),
+    Clear(StorageAlarmContext),
+}
+
+#[derive(Default)]
+struct StorageAlarmState {
+    active: Option<StorageAlarmContext>,
+}
+
+impl StorageAlarmState {
+    fn transition(&mut self, snapshot: &StoragePressureSnapshot) -> Option<StorageAlarmTransition> {
+        let next = snapshot.alarm_root().map(storage_alarm_context);
+        match (self.active.as_ref(), next) {
+            (None, None) => None,
+            (Some(previous), None) => {
+                let previous = previous.clone();
+                self.active = None;
+                Some(StorageAlarmTransition::Clear(previous))
+            }
+            (Some(previous), Some(next)) if previous == &next => None,
+            (_, Some(next)) => {
+                self.active = Some(next.clone());
+                Some(StorageAlarmTransition::Raise(next))
+            }
+        }
+    }
+}
+
+fn storage_alarm_context(root: &RootPressure) -> StorageAlarmContext {
+    StorageAlarmContext {
+        root: root.root.to_string_lossy().into_owned(),
+        free_bytes: root.free_bytes,
+        free_percent: root.free_percent,
+    }
+}
+
+fn storage_alarm_json(context: StorageAlarmContext) -> serde_json::Value {
+    serde_json::json!({
+        "root": context.root,
+        "freeBytes": context.free_bytes,
+        "freePercent": context.free_percent,
+    })
+}
+
+async fn publish_storage_alarm(
+    events: Option<EventsFacade>,
+    alarms: &Mutex<StorageAlarmState>,
+    snapshot: &StoragePressureSnapshot,
+) {
+    let transition = alarms
+        .lock()
+        .ok()
+        .and_then(|mut state| state.transition(snapshot));
+    let (Some(events), Some(transition)) = (events, transition) else {
+        return;
+    };
+    let result = match transition {
+        StorageAlarmTransition::Raise(context) => {
+            events
+                .raise_alarm(
+                    Severity::Critical,
+                    "storage-low",
+                    Some("a configured storage root cannot safely admit capture work".to_string()),
+                    Some(storage_alarm_json(context)),
+                )
+                .await
+        }
+        StorageAlarmTransition::Clear(context) => {
+            events
+                .clear_alarm(
+                    Severity::Critical,
+                    "storage-low",
+                    Some(storage_alarm_json(context)),
+                )
+                .await
+        }
+    };
+    if let Err(error) = result {
+        tracing::warn!(error = %error, "failed to publish storage-pressure alarm");
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CursorPayload {
+    Snapshot {
+        values: Vec<serde_json::Value>,
+        offset: usize,
+        completed_at: Option<serde_json::Value>,
+    },
+    Jobs {
+        before: Option<(i64, String)>,
+    },
+    List {
+        cameras: Vec<serde_json::Value>,
+        unconfigured: Vec<serde_json::Value>,
+        offset: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct CursorEntry {
+    kind: &'static str,
+    query_hash: String,
+    payload: CursorPayload,
+    expires_at: std::time::Instant,
+}
+
+#[derive(Default)]
+struct CursorStoreInner {
+    entries: HashMap<String, CursorEntry>,
+    insertion_order: VecDeque<String>,
+}
+
+/// Bounded retained pagination state.  All entries are verified against a canonical query hash
+/// before use, which makes a cursor unusable with a different camera filter, capability view, or
+/// backend selection.
+#[derive(Default)]
+struct CursorStore {
+    inner: Mutex<CursorStoreInner>,
+}
+
+impl CursorStore {
+    fn list_page(
+        &self,
+        query: &serde_json::Value,
+        cursor: Option<&str>,
+        initial: Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)>,
+        limit: usize,
+    ) -> Result<(
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+        Option<String>,
+    )> {
+        let query_hash = cursor_query_hash(query)?;
+        let mut inner = self.lock()?;
+        Self::prune(&mut inner);
+        let (cameras, unconfigured, offset) = match cursor {
+            Some(cursor) => {
+                let entry = inner.entries.get(cursor).ok_or_else(cursor_rejected)?;
+                if entry.kind != "list" || entry.query_hash != query_hash {
+                    return Err(cursor_rejected());
+                }
+                let CursorPayload::List {
+                    cameras,
+                    unconfigured,
+                    offset,
+                } = &entry.payload
+                else {
+                    return Err(cursor_rejected());
+                };
+                (cameras.clone(), unconfigured.clone(), *offset)
+            }
+            None => {
+                let (cameras, unconfigured) = initial.ok_or_else(cursor_rejected)?;
+                if cameras.len().saturating_add(unconfigured.len()) > MAX_RETAINED_SNAPSHOT_VALUES {
+                    return Err(crate::CameraError::rejected(
+                        crate::ErrorCode::InvalidRequest,
+                        "result exceeds the retained snapshot bound",
+                    ));
+                }
+                (cameras, unconfigured, 0)
+            }
+        };
+        let total = cameras.len().saturating_add(unconfigured.len());
+        let end = offset.saturating_add(limit).min(total);
+        let camera_start = offset.min(cameras.len());
+        let camera_end = end.min(cameras.len());
+        let page_cameras = cameras[camera_start..camera_end].to_vec();
+        let unconfigured_start = offset.saturating_sub(cameras.len()).min(unconfigured.len());
+        let unconfigured_end = end.saturating_sub(cameras.len()).min(unconfigured.len());
+        let page_unconfigured = unconfigured[unconfigured_start..unconfigured_end].to_vec();
+        let next = if end < total {
+            Some(Self::insert(
+                &mut inner,
+                "list",
+                query_hash,
+                CursorPayload::List {
+                    cameras,
+                    unconfigured,
+                    offset: end,
+                },
+            ))
+        } else {
+            None
+        };
+        Ok((page_cameras, page_unconfigured, next))
+    }
+
+    fn snapshot_page(
+        &self,
+        kind: &'static str,
+        query: &serde_json::Value,
+        cursor: Option<&str>,
+        initial: Option<Vec<serde_json::Value>>,
+        initial_completed_at: Option<serde_json::Value>,
+        limit: usize,
+    ) -> Result<(
+        Vec<serde_json::Value>,
+        Option<String>,
+        Option<serde_json::Value>,
+    )> {
+        let query_hash = cursor_query_hash(query)?;
+        let mut inner = self.lock()?;
+        Self::prune(&mut inner);
+        let (values, offset, completed_at) = match cursor {
+            Some(cursor) => {
+                let entry = inner.entries.get(cursor).ok_or_else(cursor_rejected)?;
+                if entry.kind != kind || entry.query_hash != query_hash {
+                    return Err(cursor_rejected());
+                }
+                let CursorPayload::Snapshot {
+                    values,
+                    offset,
+                    completed_at,
+                } = &entry.payload
+                else {
+                    return Err(cursor_rejected());
+                };
+                (values.clone(), *offset, completed_at.clone())
+            }
+            None => {
+                let values = initial.ok_or_else(cursor_rejected)?;
+                if values.len() > MAX_RETAINED_SNAPSHOT_VALUES {
+                    return Err(crate::CameraError::rejected(
+                        crate::ErrorCode::InvalidRequest,
+                        "result exceeds the retained snapshot bound",
+                    ));
+                }
+                (values, 0, initial_completed_at)
+            }
+        };
+        let end = offset.saturating_add(limit).min(values.len());
+        let page = values[offset..end].to_vec();
+        let next = if end < values.len() {
+            Some(Self::insert(
+                &mut inner,
+                kind,
+                query_hash,
+                CursorPayload::Snapshot {
+                    values,
+                    offset: end,
+                    completed_at: completed_at.clone(),
+                },
+            ))
+        } else {
+            None
+        };
+        Ok((page, next, completed_at))
+    }
+
+    fn job_before(
+        &self,
+        query: &serde_json::Value,
+        cursor: Option<&str>,
+    ) -> Result<Option<(i64, String)>> {
+        let query_hash = cursor_query_hash(query)?;
+        let Some(cursor) = cursor else {
+            return Ok(None);
+        };
+        let mut inner = self.lock()?;
+        Self::prune(&mut inner);
+        let entry = inner.entries.get(cursor).ok_or_else(cursor_rejected)?;
+        if entry.kind != "capture-status-list" || entry.query_hash != query_hash {
+            return Err(cursor_rejected());
+        }
+        let CursorPayload::Jobs { before } = &entry.payload else {
+            return Err(cursor_rejected());
+        };
+        Ok(before.clone())
+    }
+
+    fn next_job_cursor(&self, query: &serde_json::Value, before: (i64, String)) -> Result<String> {
+        let query_hash = cursor_query_hash(query)?;
+        let mut inner = self.lock()?;
+        Self::prune(&mut inner);
+        Ok(Self::insert(
+            &mut inner,
+            "capture-status-list",
+            query_hash,
+            CursorPayload::Jobs {
+                before: Some(before),
+            },
+        ))
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, CursorStoreInner>> {
+        self.inner.lock().map_err(|_| {
+            crate::CameraError::Catalog("retained cursor store is unavailable".to_string())
+        })
+    }
+
+    fn insert(
+        inner: &mut CursorStoreInner,
+        kind: &'static str,
+        query_hash: String,
+        payload: CursorPayload,
+    ) -> String {
+        Self::prune(inner);
+        while inner.entries.len() >= MAX_RETAINED_CURSORS {
+            let Some(oldest) = inner.insertion_order.pop_front() else {
+                break;
+            };
+            inner.entries.remove(&oldest);
+        }
+        let token = format!("cur_{}", uuid::Uuid::now_v7());
+        inner.insertion_order.push_back(token.clone());
+        inner.entries.insert(
+            token.clone(),
+            CursorEntry {
+                kind,
+                query_hash,
+                payload,
+                expires_at: std::time::Instant::now() + CURSOR_TTL,
+            },
+        );
+        token
+    }
+
+    fn prune(inner: &mut CursorStoreInner) {
+        let now = std::time::Instant::now();
+        inner.entries.retain(|_, entry| entry.expires_at > now);
+        inner
+            .insertion_order
+            .retain(|token| inner.entries.contains_key(token));
+    }
+}
+
+fn cursor_query_hash(query: &serde_json::Value) -> Result<String> {
+    crate::idempotency::canonical_request_hash(query, false).map(|hash| hash.to_hex())
+}
+
+fn cursor_rejected() -> crate::CameraError {
+    crate::CameraError::rejected(
+        crate::ErrorCode::InvalidRequest,
+        "cursor is unknown, expired, or does not match this query",
+    )
+}
+
+fn candidate_is_configured(
+    candidate: &DiscoveryCandidate,
+    instances: &[crate::config::CameraConfig],
+) -> bool {
+    instances.iter().any(|camera| {
+        if camera.backend.kind() != candidate.backend {
+            return false;
+        }
+        match &camera.backend {
+            crate::config::BackendConfig::GenicamAravis(config) => {
+                let selector = &config.selector;
+                selector_value_matches(&candidate.selector, "serial", selector.serial.as_deref())
+                    || selector_value_matches(&candidate.selector, "mac", selector.mac.as_deref())
+                    || selector_value_matches(
+                        &candidate.selector,
+                        "deviceId",
+                        selector.device_id.as_deref(),
+                    )
+                    || selector_value_matches(&candidate.selector, "ip", selector.ip.as_deref())
+            }
+            crate::config::BackendConfig::OnvifRtsp(config) => {
+                selector_value_matches(
+                    &candidate.selector,
+                    "endpointReference",
+                    config
+                        .selector
+                        .as_ref()
+                        .map(|selector| selector.endpoint_reference.as_str()),
+                ) || selector_value_matches(
+                    &candidate.selector,
+                    "deviceServiceUrl",
+                    config.device_service_url.as_deref(),
+                )
+            }
+            crate::config::BackendConfig::Sim(_) => false,
+        }
+    })
+}
+
+fn selector_value_matches(
+    selector: &serde_json::Value,
+    field: &str,
+    configured: Option<&str>,
+) -> bool {
+    configured.is_some_and(|configured| {
+        selector
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|observed| observed == configured)
+    })
+}
+
+/// Most recent bounded, credential-free discovery observation.  The cache is intentionally
+/// in-memory: it is an operator aid, never a configuration or camera-claim mechanism.
+#[derive(Default)]
+struct DiscoveryCache {
+    candidates: Vec<DiscoveryCandidate>,
+}
+
+/// Live composition of the protocol-neutral durable engine and per-camera protocol actors.
+///
+/// The object owns no global singleton camera state.  Each supervisor receives a fresh backend
+/// factory/session on every retry and retains only the compact registry snapshot and actor handle.
+/// This is important for reload/shutdown correctness: a stale actor can never acquire work after
+/// its supervisor cancellation token is observed.
+pub struct CameraRuntime {
+    config: RwLock<AdapterConfig>,
+    backend_context: BackendRuntimeContext,
+    catalog: Catalog,
+    admission: AdmissionController,
+    storage: StorageRoot,
+    registry: Arc<CameraRegistry>,
+    engines: RwLock<BTreeMap<String, JobEngine>>,
+    events: RwLock<BTreeMap<String, EventsFacade>>,
+    outbox_events: Option<EventsFacade>,
+    storage_pressure: Option<StoragePressureMonitor>,
+    storage_alarm: Arc<Mutex<StorageAlarmState>>,
+    readiness: RuntimeReadiness,
+    actors: Arc<RwLock<HashMap<String, CameraActorHandle>>>,
+    /// Per-supervisor shutdown tokens.  A child token also observes process shutdown, while a
+    /// reload can retire one connecting/backing-off supervisor without stopping the whole runtime.
+    supervisor_cancellations: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    /// Completion signals paired with [`Self::supervisor_cancellations`].  A replacement waits
+    /// for the old loop to retire before publishing a new actor for the same camera ID.
+    supervisor_finished: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    session_cancellations: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    scheduler_cancellations: RwLock<HashMap<(String, String), CancellationToken>>,
+    discovery_cancellation: RwLock<Option<CancellationToken>>,
+    discovery_cache: Mutex<DiscoveryCache>,
+    dispatchers: RwLock<BTreeMap<String, Arc<SupervisorDispatcher>>>,
+    cancellation: CancellationToken,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    connect_gate: Arc<Semaphore>,
+    waiters: Arc<RuntimeJobHooks>,
+    cursors: CursorStore,
+    reload_gate: tokio::sync::Mutex<()>,
+    reloading: AtomicBool,
+    self_reference: OnceLock<Weak<Self>>,
+}
+
+/// Process-local core deferred tokens paired with durable waiter records. The durable row makes
+/// acceptance auditable; only the opaque token stays in memory, because routing remains owned by
+/// the EdgeCommons command inbox.
+struct RuntimeJobHooks {
+    catalog: Catalog,
+    tokens: Mutex<HashMap<String, Vec<(String, DeferredReplyToken)>>>,
+    group_tokens: Mutex<HashMap<String, Vec<DeferredReplyToken>>>,
+    pending: Mutex<HashMap<(String, String), PendingDeferredWaiter>>,
+}
+
+type PendingDeferredWaiter = (String, DeferredReplyToken, String, String);
+
+impl RuntimeJobHooks {
+    fn new(catalog: Catalog) -> Self {
+        Self {
+            catalog,
+            tokens: Mutex::new(HashMap::new()),
+            group_tokens: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn register(
+        &self,
+        capture_id: String,
+        waiter_id: String,
+        token: DeferredReplyToken,
+    ) -> Result<()> {
+        self.tokens
+            .lock()
+            .map_err(|_| {
+                crate::CameraError::Catalog("deferred waiter registry is unavailable".to_string())
+            })?
+            .entry(capture_id)
+            .or_default()
+            .push((waiter_id, token));
+        Ok(())
+    }
+
+    fn register_group(&self, group_id: String, token: DeferredReplyToken) -> Result<()> {
+        self.group_tokens
+            .lock()
+            .map_err(|_| {
+                crate::CameraError::Catalog(
+                    "deferred group waiter registry is unavailable".to_string(),
+                )
+            })?
+            .entry(group_id)
+            .or_default()
+            .push(token);
+        Ok(())
+    }
+
+    async fn settle_group_waiters(&self, group: &crate::catalog::GroupRecord) {
+        let tokens = match self.group_tokens.lock() {
+            Ok(mut tokens) => tokens.remove(&group.group_id).unwrap_or_default(),
+            Err(_) => return,
+        };
+        let body = group_terminal_json(group);
+        for token in tokens {
+            let _ = token.settle_success(Some(body.clone())).await;
+        }
+    }
+
+    fn prepare(
+        &self,
+        instance: String,
+        request_id: String,
+        waiter_id: String,
+        token: DeferredReplyToken,
+        correlation_id: String,
+        request_uuid: String,
+    ) -> Result<()> {
+        let mut pending = self.pending.lock().map_err(|_| {
+            crate::CameraError::Catalog("deferred waiter registry is unavailable".to_string())
+        })?;
+        if pending
+            .insert(
+                (instance, request_id),
+                (waiter_id, token, correlation_id, request_uuid),
+            )
+            .is_some()
+        {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::IdempotencyConflict,
+                "a deferred request is already being accepted",
+            ));
+        }
+        Ok(())
+    }
+
+    fn take_pending(
+        &self,
+        instance: &str,
+        request_id: &str,
+    ) -> Option<(String, DeferredReplyToken, String, String)> {
+        self.pending
+            .lock()
+            .ok()?
+            .remove(&(instance.to_owned(), request_id.to_owned()))
+    }
+
+    async fn complete_group_if_terminal(&self, group_id: &str) {
+        let Ok(Some(group)) = self.catalog.group(group_id).await else {
+            return;
+        };
+        if group.state.is_terminal()
+            || group
+                .members
+                .iter()
+                .any(|member| !member.state.is_terminal())
+        {
+            return;
+        }
+        let succeeded = group
+            .members
+            .iter()
+            .filter(|member| member.state == crate::model::JobState::Succeeded)
+            .count();
+        // The durable catalog uses the shared job-state enum. `PARTIAL` is a public aggregate
+        // presentation state, while mixed groups retain FAILED durably with their complete member
+        // result vector. This preserves strict SQLite state validation and exact member evidence.
+        let state = if succeeded == group.members.len() {
+            crate::model::JobState::Succeeded
+        } else {
+            crate::model::JobState::Failed
+        };
+        let completed = self
+            .catalog
+            .complete_group(
+                group.group_id.clone(),
+                state,
+                group_terminal_json(&group),
+                None,
+                None,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await;
+        if let Ok(group) = completed {
+            self.settle_group_waiters(&group).await;
+        }
+    }
+}
+
+#[async_trait]
+impl JobHooks for RuntimeJobHooks {
+    async fn settle_waiters(
+        &self,
+        record: &crate::catalog::JobRecord,
+        terminal_body: &serde_json::Value,
+    ) {
+        let tokens = match self.tokens.lock() {
+            Ok(mut tokens) => tokens.remove(&record.capture_id).unwrap_or_default(),
+            Err(_) => return,
+        };
+        for (waiter_id, token) in tokens {
+            if token
+                .settle_success(Some(terminal_body.clone()))
+                .await
+                .is_ok()
+            {
+                let _ = self.catalog.remove_waiter(waiter_id).await;
+            }
+        }
+    }
+
+    async fn group_member_terminal(
+        &self,
+        record: &crate::catalog::JobRecord,
+        _terminal_body: &serde_json::Value,
+    ) {
+        if let Some(group_id) = record.group_id.as_deref() {
+            self.complete_group_if_terminal(group_id).await;
+        }
+    }
+}
+
+#[async_trait]
+impl AcceptanceHook for RuntimeJobHooks {
+    async fn accepted_before_queue(&self, record: &crate::catalog::JobRecord) -> Result<()> {
+        let (Some(verb), Some(request_id)) = (record.verb.as_deref(), record.request_id.as_deref())
+        else {
+            return Ok(());
+        };
+        if verb != "sb/capture" {
+            return Ok(());
+        }
+        let Some((waiter_id, token, correlation_id, request_uuid)) =
+            self.take_pending(&record.instance, request_id)
+        else {
+            return Ok(());
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        self.catalog
+            .add_waiter(crate::catalog::WaiterRecord {
+                waiter_id: waiter_id.clone(),
+                capture_id: record.capture_id.clone(),
+                correlation_id,
+                request_uuid: Some(request_uuid),
+                expires_at_ms: record.deadlines.terminal_at_ms,
+                created_at_ms: now,
+            })
+            .await?;
+        self.register(record.capture_id.clone(), waiter_id, token)?;
+        Ok(())
+    }
+}
+
+/// Runtime-owned facades and platform services supplied after durable startup resources exist.
+///
+/// Grouping these dependencies makes the boundary explicit: protocol construction, per-camera
+/// terminal/event publication, component outbox alarms, readiness, and confirmed messaging are
+/// process-owned services rather than configuration values.
+pub struct RuntimeServices {
+    /// Per-camera application facades used to encode terminal results.
+    pub apps: BTreeMap<String, Arc<AppFacade>>,
+    /// Per-camera event facades used by schedules and camera lifecycle events.
+    pub events: BTreeMap<String, EventsFacade>,
+    /// Component-main event facade used for component-wide outbox delivery alarms.
+    pub outbox_events: EventsFacade,
+    /// Combined startup/durable-state readiness bridge.
+    pub readiness: RuntimeReadiness,
+    /// Credential/discovery/security services required to construct a backend.
+    pub backend_context: BackendRuntimeContext,
+    /// Confirmed local publisher for durable terminal envelopes.
+    pub messaging: Arc<dyn edgecommons::messaging::MessagingService>,
+}
+
+impl CameraRuntime {
+    fn config_snapshot(&self) -> Result<AdapterConfig> {
+        self.config
+            .read()
+            .map(|config| config.clone())
+            .map_err(|_| {
+                crate::CameraError::Catalog("runtime configuration lock is unavailable".to_string())
+            })
+    }
+
+    fn new_engine(&self, app: Arc<AppFacade>) -> JobEngine {
+        JobEngine::new(
+            self.catalog.clone(),
+            self.admission.clone(),
+            self.storage.clone(),
+            Arc::new(AppTerminalEnvelopeEncoder::new(app)),
+            Arc::clone(&self.waiters) as Arc<dyn JobHooks>,
+        )
+        .with_acceptance_hook(Arc::clone(&self.waiters) as Arc<dyn AcceptanceHook>)
+    }
+
+    /// Builds the durable runtime, recovers install-owned records, starts outbox publication and
+    /// creates one lightweight supervisor for every enabled camera.
+    ///
+    /// The caller must have registered the command router but must not make the component ready
+    /// until this method succeeds.  Camera connection failure is intentionally not a startup
+    /// failure; it is represented by that camera's registry state and reconnect loop.
+    pub async fn start(
+        config: AdapterConfig,
+        resources: StartupResources,
+        services: RuntimeServices,
+    ) -> Result<Arc<Self>> {
+        let RuntimeServices {
+            apps,
+            events,
+            outbox_events,
+            readiness,
+            backend_context,
+            messaging,
+        } = services;
+        backend_context.validate_config(&config)?;
+        let max_connection_attempts = config.global.limits.max_concurrent_connects;
+        let storage_pressure = StoragePressureMonitor::new(
+            resources.storage.canonical_root(),
+            &resources.state_directory,
+            &config.global.output,
+            Arc::new(FilesystemSpaceProbe::default()),
+        );
+        let waiters = Arc::new(RuntimeJobHooks::new(resources.catalog.clone()));
+        let mut engines = BTreeMap::new();
+        let mut dispatchers = BTreeMap::new();
+        for camera in &config.instances {
+            let app = apps.get(&camera.id).ok_or_else(|| {
+                crate::CameraError::Catalog(format!(
+                    "missing instance application facade for camera '{}'",
+                    camera.id
+                ))
+            })?;
+            if !events.contains_key(&camera.id) {
+                return Err(crate::CameraError::Catalog(format!(
+                    "missing instance events facade for camera '{}'",
+                    camera.id
+                )));
+            }
+            engines.insert(
+                camera.id.clone(),
+                JobEngine::new(
+                    resources.catalog.clone(),
+                    resources.admission.clone(),
+                    resources.storage.clone(),
+                    Arc::new(AppTerminalEnvelopeEncoder::new(Arc::clone(app))),
+                    Arc::clone(&waiters) as Arc<dyn JobHooks>,
+                )
+                .with_acceptance_hook(Arc::clone(&waiters) as Arc<dyn AcceptanceHook>),
+            );
+            dispatchers.insert(
+                camera.id.clone(),
+                Arc::new(SupervisorDispatcher::new(
+                    camera.id.clone(),
+                    config.global.limits.max_queued_captures_per_camera,
+                )?),
+            );
+        }
+
+        let runtime = Arc::new(Self {
+            config: RwLock::new(config),
+            backend_context,
+            catalog: resources.catalog,
+            admission: resources.admission,
+            storage: resources.storage,
+            registry: resources.registry,
+            engines: RwLock::new(engines),
+            events: RwLock::new(events),
+            outbox_events: Some(outbox_events),
+            storage_pressure: Some(storage_pressure),
+            storage_alarm: Arc::new(Mutex::new(StorageAlarmState::default())),
+            readiness,
+            actors: Arc::new(RwLock::new(HashMap::new())),
+            supervisor_cancellations: Arc::new(RwLock::new(HashMap::new())),
+            supervisor_finished: Arc::new(RwLock::new(HashMap::new())),
+            session_cancellations: Arc::new(RwLock::new(HashMap::new())),
+            scheduler_cancellations: RwLock::new(HashMap::new()),
+            discovery_cancellation: RwLock::new(None),
+            discovery_cache: Mutex::new(DiscoveryCache::default()),
+            dispatchers: RwLock::new(dispatchers),
+            cancellation: CancellationToken::new(),
+            tasks: Mutex::new(Vec::new()),
+            connect_gate: Arc::new(Semaphore::new(max_connection_attempts)),
+            waiters,
+            cursors: CursorStore::default(),
+            reload_gate: tokio::sync::Mutex::new(()),
+            reloading: AtomicBool::new(false),
+            self_reference: OnceLock::new(),
+        });
+        let _ = runtime.self_reference.set(Arc::downgrade(&runtime));
+
+        runtime.refresh_storage_pressure().await;
+        runtime.start_storage_pressure_monitor()?;
+        runtime.recover_install_owned().await?;
+        runtime.start_outbox(messaging)?;
+        runtime.start_supervisors()?;
+        runtime.start_schedulers()?;
+        runtime.start_periodic_discovery()?;
+        Ok(runtime)
+    }
+
+    /// The compact configured registry used by command/status code.
+    #[must_use]
+    pub fn registry(&self) -> Arc<CameraRegistry> {
+        Arc::clone(&self.registry)
+    }
+
+    /// Returns the currently connected actor.  Offline submission is not allowed to fabricate a
+    /// queue entry: the caller must decide according to the immutable profile's offline policy.
+    pub fn actor(&self, instance: &str) -> Result<CameraActorHandle> {
+        self.actors
+            .read()
+            .map_err(|_| {
+                crate::CameraError::Catalog("camera actor map is unavailable".to_string())
+            })?
+            .get(instance)
+            .cloned()
+            .ok_or_else(|| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::CameraUnavailable,
+                    format!("camera instance '{instance}' is not connected"),
+                )
+            })
+    }
+
+    /// Returns the durable job engine for one configured camera.
+    pub fn engine(&self, instance: &str) -> Result<JobEngine> {
+        self.engines
+            .read()
+            .map_err(|_| {
+                crate::CameraError::Catalog("camera engine map is unavailable".to_string())
+            })?
+            .get(instance)
+            .cloned()
+            .ok_or_else(|| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::UnknownInstance,
+                    format!("camera instance '{instance}' is not configured"),
+                )
+            })
+    }
+
+    /// Returns the persistent dispatch queue for a camera.  Unlike a live actor handle, this
+    /// dispatcher survives a reconnect and is therefore the only capture admission seam used by
+    /// the command and scheduler paths.
+    pub fn dispatcher(&self, instance: &str) -> Result<Arc<SupervisorDispatcher>> {
+        self.dispatchers
+            .read()
+            .map_err(|_| {
+                crate::CameraError::Catalog("camera dispatcher map is unavailable".to_string())
+            })?
+            .get(instance)
+            .cloned()
+            .ok_or_else(|| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::UnknownInstance,
+                    format!("camera instance '{instance}' is not configured"),
+                )
+            })
+    }
+
+    /// Resolves and durably accepts one single-camera capture before exposing it to the persistent
+    /// supervisor queue.  The returned catalog outcome is safe to use for both direct and
+    /// submitted command semantics; duplicate keys never re-resolve a changed profile.
+    #[allow(clippy::too_many_arguments)] // Stable command fields are intentionally explicit at this boundary.
+    pub async fn submit_capture(
+        &self,
+        instance: String,
+        request_id: String,
+        requested_profile: Option<String>,
+        timeout_ms: Option<u64>,
+        metadata: serde_json::Map<String, serde_json::Value>,
+        correlation_id: String,
+        verb: &str,
+        priority: crate::admission::CapturePriority,
+    ) -> Result<crate::catalog::AcceptJobOutcome> {
+        // Idempotency is deliberately based on caller-owned immutable arguments, before any
+        // config defaults, generated identifiers, deadlines, or output paths are resolved.
+        // An exact retry after a reload must return the original durable job rather than compare
+        // a new resolution against its first acceptance.
+        let mut canonical_arguments = serde_json::Map::new();
+        canonical_arguments.insert(
+            "instance".to_string(),
+            serde_json::Value::String(instance.clone()),
+        );
+        canonical_arguments.insert(
+            "requestId".to_string(),
+            serde_json::Value::String(request_id.clone()),
+        );
+        if let Some(profile) = requested_profile.as_ref() {
+            canonical_arguments.insert(
+                "captureProfile".to_string(),
+                serde_json::Value::String(profile.clone()),
+            );
+        }
+        if let Some(timeout_ms) = timeout_ms {
+            canonical_arguments.insert("timeoutMs".to_string(), timeout_ms.into());
+        }
+        canonical_arguments.insert(
+            "metadata".to_string(),
+            serde_json::Value::Object(metadata.clone()),
+        );
+        let canonical = serde_json::Value::Object(canonical_arguments);
+        let request_hash = crate::idempotency::canonical_request_hash(&canonical, false)?;
+        let ledger_key =
+            crate::catalog::LedgerKey::new(instance.clone(), verb, request_id.clone())?;
+        if let Some(existing) = self.catalog.job_by_ledger(ledger_key.clone()).await? {
+            return Ok(if existing.request_hash == request_hash {
+                crate::catalog::AcceptJobOutcome::Existing(existing)
+            } else {
+                crate::catalog::AcceptJobOutcome::Conflict
+            });
+        }
+
+        let config = self.config_snapshot()?;
+        let camera = self.registry.camera_config(&instance)?;
+        let profile_name =
+            requested_profile.unwrap_or_else(|| camera.default_capture_profile.clone());
+        let profile = camera
+            .capture_profiles
+            .get(&profile_name)
+            .cloned()
+            .ok_or_else(|| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::UnknownCaptureProfile,
+                    "capture profile is not configured",
+                )
+            })?;
+        let accepted_at_ms = chrono::Utc::now().timestamp_millis();
+        let terminal_ms = timeout_ms
+            .or(profile.timeout_ms)
+            .unwrap_or(config.global.timeouts.job_terminal_ms);
+        let capture_mode = profile
+            .capture_mode
+            .unwrap_or_else(|| match &camera.backend {
+                crate::config::BackendConfig::Sim(_) => crate::model::CaptureMode::Simulated,
+                crate::config::BackendConfig::GenicamAravis(_) => {
+                    crate::model::CaptureMode::SoftwareTrigger
+                }
+                crate::config::BackendConfig::OnvifRtsp(config) => config.capture_mode,
+            });
+        let snapshot = self.registry.snapshot(&instance)?;
+        let camera_summary = crate::messages::CameraSummary {
+            backend: snapshot.backend,
+            vendor: snapshot
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.vendor.clone()),
+            model: snapshot
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.model.clone()),
+            firmware: snapshot
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.firmware.clone()),
+            serial: snapshot
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.serial.clone()),
+        };
+        let capture_id = format!("cap_{}", uuid::Uuid::now_v7());
+        let deadlines = crate::catalog::JobDeadlines {
+            terminal_at_ms: accepted_at_ms
+                .saturating_add(i64::try_from(terminal_ms).unwrap_or(i64::MAX)),
+            queue_at_ms: profile.queue_expiry_ms.map(|duration| {
+                accepted_at_ms.saturating_add(i64::try_from(duration).unwrap_or(i64::MAX))
+            }),
+            capture_at_ms: accepted_at_ms.saturating_add(
+                i64::try_from(config.global.timeouts.capture_ms).unwrap_or(i64::MAX),
+            ),
+            encode_at_ms: accepted_at_ms.saturating_add(
+                i64::try_from(config.global.timeouts.encode_ms).unwrap_or(i64::MAX),
+            ),
+            persist_at_ms: accepted_at_ms.saturating_add(
+                i64::try_from(config.global.timeouts.persist_ms).unwrap_or(i64::MAX),
+            ),
+        };
+        let relative_path = crate::storage::render_output_path(
+            &config.global.output,
+            crate::storage::OutputPathVariables {
+                camera_id: &instance,
+                capture_id: &capture_id,
+                timestamp: chrono::Utc::now(),
+            },
+            profile.output.encoding,
+        )?;
+        let offline_policy = profile
+            .offline_policy
+            .unwrap_or(crate::config::OfflinePolicy::WaitUntilDeadline);
+        let profile_snapshot = crate::jobs::JobProfileSnapshot {
+            name: profile_name.clone(),
+            capture: profile.clone(),
+            offline_policy,
+            maximum_frame_bytes: profile
+                .maximum_frame_bytes
+                .unwrap_or(config.global.limits.max_frame_bytes_per_camera),
+            capture_mode,
+            capture_interlock: profile
+                .capture_interlock
+                .unwrap_or(camera.ptz.capture_interlock),
+            settle_ms: camera.ptz.settle_ms,
+        };
+        let trigger = crate::messages::CaptureTrigger::Command {
+            request_id: request_id.clone(),
+        };
+        if let Err(error) = self.ensure_storage_capacity().await {
+            if error.code() == crate::ErrorCode::StoragePressure {
+                if let Some(existing) = self.catalog.job_by_ledger(ledger_key.clone()).await? {
+                    return Ok(if existing.request_hash == request_hash {
+                        crate::catalog::AcceptJobOutcome::Existing(existing)
+                    } else {
+                        crate::catalog::AcceptJobOutcome::Conflict
+                    });
+                }
+            }
+            return Err(error);
+        }
+        let job = crate::catalog::NewJob {
+            capture_id: capture_id.clone(),
+            instance: instance.clone(),
+            ledger_key: Some(ledger_key),
+            request_hash,
+            canonical_request: canonical,
+            effective_profile: serde_json::to_value(&profile_snapshot)?,
+            deadlines: deadlines.clone(),
+            trigger: serde_json::to_value(&trigger)?,
+            origin_correlation_id: Some(correlation_id.clone()),
+            intended_output: serde_json::json!({ "relativePath": relative_path.as_wire_path(), "backend": snapshot.backend.as_str() }),
+            accepted_at_ms,
+            group_id: None,
+        };
+        let submission = crate::jobs::JobSubmission {
+            job,
+            spec: crate::jobs::CaptureJobSpec {
+                capture_id,
+                instance: instance.clone(),
+                profile: profile_snapshot,
+                resource_group: camera.resource_group.clone(),
+                relative_path,
+                deadlines,
+                accepted_at_ms,
+                trigger,
+                correlation_id,
+                metadata,
+                camera: camera_summary,
+                group_size: None,
+            },
+            priority,
+        };
+        let dispatcher = self.dispatcher(&instance)?;
+        self.engine(&instance)?
+            .accept_and_queue(dispatcher.as_ref(), submission)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // The group builder preserves each immutable acceptance fact.
+    async fn build_group_submission(
+        &self,
+        instance: &str,
+        request_id: &str,
+        capture_group_id: &str,
+        requested_profile: Option<&str>,
+        timeout_ms: Option<u64>,
+        metadata: serde_json::Map<String, serde_json::Value>,
+        correlation_id: String,
+    ) -> Result<crate::jobs::JobSubmission> {
+        let config = self.config_snapshot()?;
+        let camera = self.registry.camera_config(instance)?;
+        if !camera.enabled {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::CameraDisabled,
+                "camera is disabled",
+            ));
+        }
+        let profile_name = requested_profile
+            .map(str::to_owned)
+            .unwrap_or_else(|| camera.default_capture_profile.clone());
+        let profile = camera
+            .capture_profiles
+            .get(&profile_name)
+            .cloned()
+            .ok_or_else(|| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::UnknownCaptureProfile,
+                    "capture profile is not configured",
+                )
+            })?;
+        let accepted_at_ms = chrono::Utc::now().timestamp_millis();
+        let terminal_ms = timeout_ms
+            .or(profile.timeout_ms)
+            .unwrap_or(config.global.timeouts.job_terminal_ms);
+        let capture_mode = profile
+            .capture_mode
+            .unwrap_or_else(|| match &camera.backend {
+                crate::config::BackendConfig::Sim(_) => crate::model::CaptureMode::Simulated,
+                crate::config::BackendConfig::GenicamAravis(_) => {
+                    crate::model::CaptureMode::SoftwareTrigger
+                }
+                crate::config::BackendConfig::OnvifRtsp(config) => config.capture_mode,
+            });
+        let snapshot = self.registry.snapshot(instance)?;
+        let camera_summary = crate::messages::CameraSummary {
+            backend: snapshot.backend,
+            vendor: snapshot
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.vendor.clone()),
+            model: snapshot
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.model.clone()),
+            firmware: snapshot
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.firmware.clone()),
+            serial: snapshot
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.serial.clone()),
+        };
+        let capture_id = format!("cap_{}", uuid::Uuid::now_v7());
+        let deadlines = crate::catalog::JobDeadlines {
+            terminal_at_ms: accepted_at_ms
+                .saturating_add(i64::try_from(terminal_ms).unwrap_or(i64::MAX)),
+            queue_at_ms: profile.queue_expiry_ms.map(|duration| {
+                accepted_at_ms.saturating_add(i64::try_from(duration).unwrap_or(i64::MAX))
+            }),
+            capture_at_ms: accepted_at_ms.saturating_add(
+                i64::try_from(config.global.timeouts.capture_ms).unwrap_or(i64::MAX),
+            ),
+            encode_at_ms: accepted_at_ms.saturating_add(
+                i64::try_from(config.global.timeouts.encode_ms).unwrap_or(i64::MAX),
+            ),
+            persist_at_ms: accepted_at_ms.saturating_add(
+                i64::try_from(config.global.timeouts.persist_ms).unwrap_or(i64::MAX),
+            ),
+        };
+        let relative_path = crate::storage::render_output_path(
+            &config.global.output,
+            crate::storage::OutputPathVariables {
+                camera_id: instance,
+                capture_id: &capture_id,
+                timestamp: chrono::Utc::now(),
+            },
+            profile.output.encoding,
+        )?;
+        let profile_snapshot = crate::jobs::JobProfileSnapshot {
+            name: profile_name.clone(),
+            capture: profile.clone(),
+            offline_policy: profile
+                .offline_policy
+                .unwrap_or(crate::config::OfflinePolicy::WaitUntilDeadline),
+            maximum_frame_bytes: profile
+                .maximum_frame_bytes
+                .unwrap_or(config.global.limits.max_frame_bytes_per_camera),
+            capture_mode,
+            capture_interlock: profile
+                .capture_interlock
+                .unwrap_or(camera.ptz.capture_interlock),
+            settle_ms: camera.ptz.settle_ms,
+        };
+        let trigger = crate::messages::CaptureTrigger::GroupCommand {
+            request_id: request_id.to_owned(),
+            capture_group_id: capture_group_id.to_owned(),
+        };
+        let canonical = serde_json::json!({
+            "requestId": request_id,
+            "captureGroupId": capture_group_id,
+            "instance": instance,
+            "captureProfile": profile_name,
+            "timeoutMs": terminal_ms,
+            "metadata": metadata,
+            "effectiveProfile": profile_snapshot,
+            "deadlines": {
+                "terminalAtMs": deadlines.terminal_at_ms,
+                "queueAtMs": deadlines.queue_at_ms,
+                "captureAtMs": deadlines.capture_at_ms,
+                "encodeAtMs": deadlines.encode_at_ms,
+                "persistAtMs": deadlines.persist_at_ms,
+            },
+            "intendedOutput": { "relativePath": relative_path.as_wire_path(), "backend": snapshot.backend.as_str() },
+        });
+        let job = crate::catalog::NewJob {
+            capture_id: capture_id.clone(),
+            instance: instance.to_owned(),
+            ledger_key: None,
+            request_hash: crate::idempotency::canonical_request_hash(&canonical, false)?,
+            canonical_request: canonical,
+            effective_profile: serde_json::to_value(&profile_snapshot)?,
+            deadlines: deadlines.clone(),
+            trigger: serde_json::to_value(&trigger)?,
+            origin_correlation_id: Some(correlation_id.clone()),
+            intended_output: serde_json::json!({ "relativePath": relative_path.as_wire_path(), "backend": snapshot.backend.as_str() }),
+            accepted_at_ms,
+            group_id: Some(capture_group_id.to_owned()),
+        };
+        Ok(crate::jobs::JobSubmission {
+            job,
+            spec: crate::jobs::CaptureJobSpec {
+                capture_id,
+                instance: instance.to_owned(),
+                profile: profile_snapshot,
+                resource_group: camera.resource_group.clone(),
+                relative_path,
+                deadlines,
+                accepted_at_ms,
+                trigger,
+                correlation_id,
+                metadata,
+                camera: camera_summary,
+                group_size: Some(2), // replaced by the caller with the exact validated member count.
+            },
+            priority: crate::admission::CapturePriority::Direct,
+        })
+    }
+
+    async fn submit_group(
+        &self,
+        body: GroupCaptureRequest,
+        correlation_id: String,
+        priority: crate::admission::CapturePriority,
+        deferred_token: Option<DeferredReplyToken>,
+    ) -> Result<crate::catalog::GroupRecord> {
+        // Preserve only caller-owned group arguments in the idempotency record.  Member capture
+        // IDs, group IDs, default profiles, deadlines, and output paths are acceptance facts;
+        // including them here would turn an exact retry into a conflict.
+        let mut canonical_arguments = serde_json::Map::new();
+        canonical_arguments.insert(
+            "requestId".to_string(),
+            serde_json::Value::String(body.request_id.clone()),
+        );
+        canonical_arguments.insert(
+            "instances".to_string(),
+            serde_json::to_value(&body.instances)?,
+        );
+        if let Some(profile) = body.capture_profile.as_ref() {
+            canonical_arguments.insert(
+                "captureProfile".to_string(),
+                serde_json::Value::String(profile.clone()),
+            );
+        }
+        canonical_arguments.insert(
+            "profileOverrides".to_string(),
+            serde_json::to_value(&body.profile_overrides)?,
+        );
+        if let Some(timeout_ms) = body.timeout_ms {
+            canonical_arguments.insert("timeoutMs".to_string(), timeout_ms.into());
+        }
+        canonical_arguments.insert(
+            "metadata".to_string(),
+            serde_json::Value::Object(body.metadata.clone()),
+        );
+        let canonical = serde_json::Value::Object(canonical_arguments);
+        let request_hash = crate::idempotency::canonical_request_hash(&canonical, true)?;
+        let ledger_key =
+            crate::catalog::LedgerKey::new("main", "sb/capture-group", body.request_id.clone())?;
+        if let Some(group) = self.catalog.group_by_ledger(ledger_key.clone()).await? {
+            if group.request_hash != request_hash {
+                return Err(crate::CameraError::rejected(
+                    crate::ErrorCode::IdempotencyConflict,
+                    "requestId was already used with different immutable group arguments",
+                ));
+            }
+            if let Some(token) = deferred_token {
+                if group.state.is_terminal() {
+                    token
+                        .settle_success(Some(group_terminal_json(&group)))
+                        .await
+                        .map_err(|_| {
+                            crate::CameraError::rejected(
+                                crate::ErrorCode::BackendError,
+                                "deferred group reply could not be settled",
+                            )
+                        })?;
+                } else {
+                    self.waiters.register_group(group.group_id.clone(), token)?;
+                }
+            }
+            return Ok(group);
+        }
+
+        let config = self.config_snapshot()?;
+        body.validate(
+            config.global.limits.max_cameras_per_group,
+            config.global.limits.max_metadata_bytes,
+        )?;
+        // Resolve every member before creating any durable row. This gives the all-or-nothing
+        // error surface required by the group contract.
+        for instance in &body.instances {
+            let _ = self.registry.resolve_actuation_instance(Some(instance))?;
+        }
+        let group_id = format!("grp_{}", uuid::Uuid::now_v7());
+        let mut submissions = Vec::with_capacity(body.instances.len());
+        for instance in &body.instances {
+            let selected = body
+                .profile_overrides
+                .get(instance)
+                .map(String::as_str)
+                .or(body.capture_profile.as_deref());
+            let mut submission = self
+                .build_group_submission(
+                    instance,
+                    &body.request_id,
+                    &group_id,
+                    selected,
+                    body.timeout_ms,
+                    body.metadata.clone(),
+                    correlation_id.clone(),
+                )
+                .await?;
+            submission.priority = priority;
+            submission.spec.group_size = Some(body.instances.len());
+            submissions.push(submission);
+        }
+        let new_group = crate::catalog::NewGroup {
+            group_id: group_id.clone(),
+            ledger_key: ledger_key.clone(),
+            request_hash,
+            canonical_request: canonical,
+            origin_correlation_id: Some(correlation_id),
+            accepted_at_ms: chrono::Utc::now().timestamp_millis(),
+            members: submissions
+                .iter()
+                .map(|submission| submission.job.clone())
+                .collect(),
+        };
+        if let Err(error) = self.ensure_storage_capacity().await {
+            if error.code() == crate::ErrorCode::StoragePressure {
+                if let Some(group) = self.catalog.group_by_ledger(ledger_key.clone()).await? {
+                    if group.request_hash != request_hash {
+                        return Err(crate::CameraError::rejected(
+                            crate::ErrorCode::IdempotencyConflict,
+                            "requestId was already used with different immutable group arguments",
+                        ));
+                    }
+                    if let Some(token) = deferred_token {
+                        if group.state.is_terminal() {
+                            token
+                                .settle_success(Some(group_terminal_json(&group)))
+                                .await
+                                .map_err(|_| {
+                                    crate::CameraError::rejected(
+                                        crate::ErrorCode::BackendError,
+                                        "deferred group reply could not be settled",
+                                    )
+                                })?;
+                        } else {
+                            self.waiters.register_group(group.group_id.clone(), token)?;
+                        }
+                    }
+                    return Ok(group);
+                }
+            }
+            return Err(error);
+        }
+        let outcome = self.catalog.accept_group(new_group).await?;
+        let group = match outcome {
+            crate::catalog::AcceptGroupOutcome::Inserted(group) => group,
+            crate::catalog::AcceptGroupOutcome::Existing(group) => {
+                if let Some(token) = deferred_token {
+                    if group.state.is_terminal() {
+                        token
+                            .settle_success(Some(group_terminal_json(&group)))
+                            .await
+                            .map_err(|_| {
+                                crate::CameraError::rejected(
+                                    crate::ErrorCode::BackendError,
+                                    "deferred group reply could not be settled",
+                                )
+                            })?;
+                    } else {
+                        self.waiters.register_group(group.group_id.clone(), token)?;
+                    }
+                }
+                return Ok(group);
+            }
+            crate::catalog::AcceptGroupOutcome::Conflict => {
+                return Err(crate::CameraError::rejected(
+                    crate::ErrorCode::IdempotencyConflict,
+                    "requestId was already used with different immutable group arguments",
+                ));
+            }
+        };
+        if let Some(token) = deferred_token {
+            self.waiters.register_group(group.group_id.clone(), token)?;
+        }
+        // Group ACCEPTED and QUEUED are separate durable commits. Queue every member in one
+        // catalog transaction before exposing any descriptor, then hand those already-queued
+        // records to their independent camera supervisors.
+        self.catalog
+            .queue_group(
+                group.group_id.clone(),
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await?;
+        for submission in submissions {
+            let dispatcher = self.dispatcher(&submission.spec.instance)?;
+            self.engine(&submission.spec.instance)?
+                .queue_preaccepted(dispatcher.as_ref(), submission)
+                .await?;
+        }
+        self.waiters
+            .complete_group_if_terminal(&group.group_id)
+            .await;
+        self.catalog
+            .group(group.group_id.clone())
+            .await?
+            .ok_or_else(|| {
+                crate::CameraError::Catalog("accepted capture group disappeared".to_string())
+            })
+    }
+
+    async fn discover(&self, body: DiscoverRequest) -> Result<serde_json::Value> {
+        body.validate()?;
+        let config = self.config_snapshot()?;
+        if !config.global.discovery.enabled {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::UnsupportedCapability,
+                "camera discovery is disabled by configuration",
+            ));
+        }
+        let query = serde_json::json!({ "backends": body.backends });
+        if body.cursor.is_some() {
+            let (candidates, next_cursor, completed_at) = self.cursors.snapshot_page(
+                "discover",
+                &query,
+                body.cursor.as_deref(),
+                None,
+                None,
+                usize::from(body.limit),
+            )?;
+            return Ok(serde_json::json!({
+                "candidates": candidates,
+                "nextCursor": next_cursor,
+                // A continuation is a view of the original retained result, not a second probe.
+                "completedAt": completed_at,
+            }));
+        }
+        let wanted = if body.backends.is_empty() {
+            None
+        } else {
+            Some(body.backends.clone())
+        };
+        let candidates = self
+            .discover_candidates(
+                &config,
+                wanted.as_deref(),
+                Duration::from_millis(body.timeout_ms),
+                self.cancellation.child_token(),
+            )
+            .await?
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let completed_at = serde_json::to_value(chrono::Utc::now())?;
+        let (candidates, next_cursor, completed_at) = self.cursors.snapshot_page(
+            "discover",
+            &query,
+            None,
+            Some(candidates),
+            Some(completed_at),
+            usize::from(body.limit),
+        )?;
+        Ok(serde_json::json!({
+            "candidates": candidates,
+            "nextCursor": next_cursor,
+            "completedAt": completed_at,
+        }))
+    }
+
+    /// Executes one credential-free discovery pass, bounded across all distinct configured
+    /// backend kinds.  The page size never affects the underlying snapshot: continuations may
+    /// safely page through every retained discovery result up to the configured hard maximum.
+    async fn discover_candidates(
+        &self,
+        config: &AdapterConfig,
+        wanted: Option<&[crate::model::BackendKind]>,
+        timeout: Duration,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<DiscoveryCandidate>> {
+        let mut candidates = Vec::new();
+        let mut attempted = Vec::new();
+        for camera in &config.instances {
+            let kind = camera.backend.kind();
+            if kind == crate::model::BackendKind::Sim
+                || wanted.is_some_and(|wanted| !wanted.contains(&kind))
+                || attempted.contains(&kind)
+            {
+                continue;
+            }
+            let remaining = config
+                .global
+                .discovery
+                .max_results
+                .saturating_sub(candidates.len());
+            if remaining == 0 {
+                break;
+            }
+            attempted.push(kind);
+            let factory = self
+                .backend_context
+                .factory_for(&camera.backend, &config.global)?;
+            let discovered = factory
+                .discover(crate::backend::DiscoveryRequest {
+                    eligible_interfaces: config.global.discovery.eligible_interfaces.clone(),
+                    timeout,
+                    max_results: remaining,
+                    cancellation: cancellation.child_token(),
+                })
+                .await?;
+            for candidate in discovered {
+                if candidates.len() == config.global.discovery.max_results {
+                    break;
+                }
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Returns a fresh view of retained discovery observations after excluding cameras already
+    /// represented by a stable configured selector.  This is read-only and never opens a session.
+    fn unconfigured_discoveries(&self, config: &AdapterConfig) -> Result<Vec<serde_json::Value>> {
+        let cache = self.discovery_cache.lock().map_err(|_| {
+            crate::CameraError::Catalog("discovery cache is unavailable".to_string())
+        })?;
+        cache
+            .candidates
+            .iter()
+            .filter(|candidate| !candidate_is_configured(candidate, &config.instances))
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::CameraError::from)
+    }
+
+    async fn cancel_capture(&self, body: CancelRequest) -> Result<serde_json::Value> {
+        body.validate()?;
+        let CancelRequest {
+            request_id,
+            capture_id,
+            capture_group_id,
+            reason,
+        } = body;
+        let canonical_reason = reason.clone();
+        let reason = reason.unwrap_or_else(|| "operator cancellation".to_string());
+        if let Some(capture_id) = capture_id {
+            let job = self.catalog.job(&capture_id).await?.ok_or_else(|| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::CaptureNotFound,
+                    "capture was not found",
+                )
+            })?;
+            let canonical = serde_json::json!({
+                "requestId": &request_id,
+                "target": { "kind": "capture", "captureId": &capture_id },
+                "reason": canonical_reason,
+            });
+            let key = crate::catalog::LedgerKey::new(
+                job.instance.clone(),
+                "sb/capture-cancel",
+                request_id,
+            )?;
+            return self
+                .cancel_with_ledger(
+                    key,
+                    canonical,
+                    serde_json::json!({
+                        "captureId": capture_id,
+                        "cancelled": false,
+                        "state": job.state,
+                        "cancellationInProgress": false,
+                    }),
+                    async {
+                        let outcome = self
+                            .engine(&job.instance)?
+                            .cancel_active(&capture_id, reason)
+                            .await?;
+                        Ok(serde_json::json!({
+                            "captureId": capture_id,
+                            "cancelled": outcome.cancelled,
+                            "state": outcome.state,
+                            "cancellationInProgress": outcome.cancellation_in_progress,
+                        }))
+                    },
+                )
+                .await;
+        }
+
+        let capture_group_id = capture_group_id.ok_or_else(|| {
+            crate::CameraError::rejected(
+                crate::ErrorCode::InvalidRequest,
+                "captureGroupId is required",
+            )
+        })?;
+        let group = self
+            .catalog
+            .group(&capture_group_id)
+            .await?
+            .ok_or_else(|| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::CaptureNotFound,
+                    "capture group was not found",
+                )
+            })?;
+        let canonical = serde_json::json!({
+            "requestId": &request_id,
+            "target": { "kind": "capture-group", "captureGroupId": &capture_group_id },
+            "reason": canonical_reason,
+        });
+        let key = crate::catalog::LedgerKey::new("main", "sb/capture-cancel", request_id)?;
+        self.cancel_with_ledger(
+            key,
+            canonical,
+            serde_json::json!({
+                "captureGroupId": capture_group_id,
+                "cancelledMembers": 0,
+                "unchangedMembers": group.members.len(),
+                "members": group.members.iter().map(|member| serde_json::json!({
+                    "captureId": member.capture_id,
+                    "instance": member.instance,
+                    "cancelled": false,
+                    "state": member.state,
+                    "cancellationInProgress": false,
+                })).collect::<Vec<_>>(),
+            }),
+            async {
+                let mut cancelled_members = 0_u64;
+                let mut unchanged_members = 0_u64;
+                let mut members = Vec::with_capacity(group.members.len());
+                for member in group.members {
+                    let outcome = if member.state.is_terminal() {
+                        unchanged_members = unchanged_members.saturating_add(1);
+                        crate::jobs::CancelResult {
+                            cancelled: false,
+                            state: member.state,
+                            cancellation_in_progress: false,
+                        }
+                    } else {
+                        let outcome = self
+                            .engine(&member.instance)?
+                            .cancel_active(&member.capture_id, reason.clone())
+                            .await?;
+                        if outcome.cancelled {
+                            cancelled_members = cancelled_members.saturating_add(1);
+                        } else {
+                            unchanged_members = unchanged_members.saturating_add(1);
+                        }
+                        outcome
+                    };
+                    members.push(serde_json::json!({
+                        "captureId": member.capture_id,
+                        "instance": member.instance,
+                        "cancelled": outcome.cancelled,
+                        "state": outcome.state,
+                        "cancellationInProgress": outcome.cancellation_in_progress,
+                    }));
+                }
+                Ok(serde_json::json!({
+                    "captureGroupId": capture_group_id,
+                    "cancelledMembers": cancelled_members,
+                    "unchangedMembers": unchanged_members,
+                    "members": members,
+                }))
+            },
+        )
+        .await
+    }
+
+    async fn cancel_with_ledger<F>(
+        &self,
+        key: crate::catalog::LedgerKey,
+        canonical: serde_json::Value,
+        in_progress: serde_json::Value,
+        operation: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: std::future::Future<Output = Result<serde_json::Value>>,
+    {
+        match self
+            .catalog
+            .begin_command(
+                key.clone(),
+                crate::idempotency::canonical_request_hash(&canonical, false)?,
+                canonical,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await?
+        {
+            crate::catalog::BeginCommandOutcome::Conflict => Err(crate::CameraError::rejected(
+                crate::ErrorCode::IdempotencyConflict,
+                "requestId was already used with different cancellation arguments",
+            )),
+            crate::catalog::BeginCommandOutcome::Existing(record) => match record.state {
+                crate::catalog::LedgerState::OutcomeUnknown => Err(crate::CameraError::rejected(
+                    crate::ErrorCode::PreviousOutcomeUnknown,
+                    "the prior cancellation outcome is unknown after restart",
+                )),
+                _ => Ok(record.reply.unwrap_or(in_progress)),
+            },
+            crate::catalog::BeginCommandOutcome::Started(_) => {
+                self.catalog
+                    .record_command_acceptance(
+                        key.clone(),
+                        in_progress,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
+                match operation.await {
+                    Ok(response) => {
+                        self.catalog
+                            .complete_command(
+                                key,
+                                crate::catalog::LedgerState::Succeeded,
+                                response.clone(),
+                                None,
+                                None,
+                                chrono::Utc::now().timestamp_millis(),
+                            )
+                            .await?;
+                        Ok(response)
+                    }
+                    Err(error) => {
+                        let reply = serde_json::json!({
+                            "errorCode": error.code().as_str(),
+                            "errorMessage": command_error(&error).message,
+                        });
+                        let _ = self
+                            .catalog
+                            .complete_command(
+                                key,
+                                crate::catalog::LedgerState::Failed,
+                                reply,
+                                Some(error.code().as_str().to_string()),
+                                Some(command_error(&error).message),
+                                chrono::Utc::now().timestamp_millis(),
+                            )
+                            .await;
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn reconnect(&self, body: ReconnectRequest) -> Result<serde_json::Value> {
+        body.validate()?;
+        let instance = self
+            .registry
+            .resolve_actuation_instance(body.instance.as_deref())?;
+        let canonical = serde_json::json!({ "instance": instance, "requestId": body.request_id, "reason": body.reason });
+        let key =
+            crate::catalog::LedgerKey::new(instance.clone(), "sb/reconnect", body.request_id)?;
+        match self
+            .catalog
+            .begin_command(
+                key.clone(),
+                crate::idempotency::canonical_request_hash(&canonical, false)?,
+                canonical,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await?
+        {
+            crate::catalog::BeginCommandOutcome::Conflict => Err(crate::CameraError::rejected(
+                crate::ErrorCode::IdempotencyConflict,
+                "requestId was already used with different reconnect arguments",
+            )),
+            crate::catalog::BeginCommandOutcome::Existing(record) => match record.state {
+                crate::catalog::LedgerState::OutcomeUnknown => Err(crate::CameraError::rejected(
+                    crate::ErrorCode::PreviousOutcomeUnknown,
+                    "the prior reconnect outcome is unknown after restart",
+                )),
+                _ => Ok(record.reply.unwrap_or_else(|| {
+                    serde_json::json!({
+                        "operationId": format!("op_{}", record.key.request_id),
+                        "instance": instance,
+                        "state": "ACCEPTED",
+                    })
+                })),
+            },
+            crate::catalog::BeginCommandOutcome::Started(_) => {
+                let operation = serde_json::json!({
+                    "operationId": format!("op_{}", uuid::Uuid::now_v7()),
+                    "instance": instance,
+                    "state": "ACCEPTED",
+                });
+                self.catalog
+                    .record_command_acceptance(
+                        key,
+                        operation.clone(),
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
+                if let Ok(sessions) = self.session_cancellations.read() {
+                    if let Some(cancellation) = sessions.get(&instance) {
+                        cancellation.cancel();
+                    }
+                }
+                // The ledger remains IN_PROGRESS until the next status/recovery observes the
+                // new session. This prevents an ambiguous retry from recreating physical work.
+                Ok(operation)
+            }
+        }
+    }
+
+    async fn perform_ptz(&self, request: PtzCommandRequest) -> Result<serde_json::Value> {
+        let config = self.config_snapshot()?;
+        request.validate(60_000)?;
+        let (instance, request_id, operation, physical, arguments) = match request {
+            PtzCommandRequest::Continuous {
+                instance,
+                request_id,
+                velocity,
+                timeout_ms,
+            } => (
+                self.registry
+                    .resolve_actuation_instance(instance.as_deref())?,
+                Some(request_id),
+                "continuous",
+                Some(crate::model::PtzRequest::Continuous {
+                    velocity,
+                    timeout: Duration::from_millis(timeout_ms),
+                }),
+                serde_json::json!({ "velocity": velocity, "timeoutMs": timeout_ms }),
+            ),
+            PtzCommandRequest::Absolute {
+                instance,
+                request_id,
+                position,
+                speed,
+            } => {
+                let physical_speed = speed.map(|speed| crate::model::PtzVector {
+                    pan: speed.pan,
+                    tilt: speed.tilt,
+                    zoom: speed.zoom,
+                });
+                (
+                    self.registry
+                        .resolve_actuation_instance(instance.as_deref())?,
+                    Some(request_id),
+                    "absolute",
+                    Some(crate::model::PtzRequest::Absolute {
+                        position,
+                        speed: physical_speed,
+                    }),
+                    serde_json::json!({
+                        "position": position,
+                        "speed": speed.map(|speed| serde_json::json!({
+                            "pan": speed.pan,
+                            "tilt": speed.tilt,
+                            "zoom": speed.zoom,
+                        })),
+                    }),
+                )
+            }
+            PtzCommandRequest::Relative {
+                instance,
+                request_id,
+                translation,
+                speed,
+            } => {
+                let physical_speed = speed.map(|speed| crate::model::PtzVector {
+                    pan: speed.pan,
+                    tilt: speed.tilt,
+                    zoom: speed.zoom,
+                });
+                (
+                    self.registry
+                        .resolve_actuation_instance(instance.as_deref())?,
+                    Some(request_id),
+                    "relative",
+                    Some(crate::model::PtzRequest::Relative {
+                        translation,
+                        speed: physical_speed,
+                    }),
+                    serde_json::json!({
+                        "translation": translation,
+                        "speed": speed.map(|speed| serde_json::json!({
+                            "pan": speed.pan,
+                            "tilt": speed.tilt,
+                            "zoom": speed.zoom,
+                        })),
+                    }),
+                )
+            }
+            PtzCommandRequest::Stop {
+                instance,
+                request_id,
+                axes,
+            } => {
+                let pan = axes.contains(&crate::commands::PtzAxis::Pan);
+                let tilt = axes.contains(&crate::commands::PtzAxis::Tilt);
+                let zoom = axes.contains(&crate::commands::PtzAxis::Zoom);
+                (
+                    self.registry
+                        .resolve_actuation_instance(instance.as_deref())?,
+                    Some(request_id),
+                    "stop",
+                    Some(crate::model::PtzRequest::Stop { pan, tilt, zoom }),
+                    serde_json::json!({ "pan": pan, "tilt": tilt, "zoom": zoom }),
+                )
+            }
+            PtzCommandRequest::Home {
+                instance,
+                request_id,
+            } => (
+                self.registry
+                    .resolve_actuation_instance(instance.as_deref())?,
+                Some(request_id),
+                "home",
+                Some(crate::model::PtzRequest::Home),
+                serde_json::json!({}),
+            ),
+            PtzCommandRequest::Status { instance } => (
+                self.registry
+                    .resolve_actuation_instance(instance.as_deref())?,
+                None,
+                "status",
+                Some(crate::model::PtzRequest::Status),
+                serde_json::Value::Null,
+            ),
+        };
+        let camera = self.registry.camera_config(&instance)?;
+        if !camera.ptz.enabled {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::PtzDisabled,
+                "PTZ is disabled by configuration",
+            ));
+        }
+        let actor = self.actor(&instance)?;
+        let physical = physical.ok_or_else(|| {
+            crate::CameraError::rejected(
+                crate::ErrorCode::UnsupportedCapability,
+                "PTZ operation has no backend request",
+            )
+        })?;
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(config.global.timeouts.ptz_ms);
+        if let Some(request_id) = request_id {
+            let canonical = serde_json::json!({
+                "instance": &instance,
+                "requestId": &request_id,
+                "operation": operation,
+                "arguments": arguments,
+            });
+            let key = crate::catalog::LedgerKey::new(
+                instance.clone(),
+                format!("sb/ptz/{operation}"),
+                request_id,
+            )?;
+            match self
+                .catalog
+                .begin_command(
+                    key.clone(),
+                    crate::idempotency::canonical_request_hash(&canonical, false)?,
+                    canonical,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?
+            {
+                crate::catalog::BeginCommandOutcome::Conflict => {
+                    return Err(crate::CameraError::rejected(
+                        crate::ErrorCode::IdempotencyConflict,
+                        "requestId was already used with different PTZ arguments",
+                    ));
+                }
+                crate::catalog::BeginCommandOutcome::Existing(record) => {
+                    match record.state {
+                        crate::catalog::LedgerState::OutcomeUnknown => {
+                            return Err(crate::CameraError::rejected(
+                                crate::ErrorCode::PreviousOutcomeUnknown,
+                                "the prior PTZ outcome is unknown after restart",
+                            ));
+                        }
+                        _ => return Ok(record.reply.unwrap_or_else(
+                            || serde_json::json!({ "operation": operation, "state": "COMMANDED" }),
+                        )),
+                    }
+                }
+                crate::catalog::BeginCommandOutcome::Started(_) => {}
+            }
+            let result = actor.ptz(physical, deadline, &self.cancellation).await;
+            let response = match result {
+                Ok(crate::model::PtzResult::Commanded) => {
+                    serde_json::json!({ "operation": operation, "state": "COMMANDED", "acceptedAt": chrono::Utc::now(), "stopDeadline": if operation == "continuous" { serde_json::json!(chrono::Utc::now() + chrono::Duration::milliseconds(i64::try_from(camera.ptz.maximum_continuous_move_ms).unwrap_or(i64::MAX))) } else { serde_json::Value::Null } })
+                }
+                Ok(crate::model::PtzResult::PresetToken(token)) => {
+                    serde_json::json!({ "operation": operation, "token": token })
+                }
+                Ok(crate::model::PtzResult::Removed) => {
+                    serde_json::json!({ "operation": operation, "removed": true })
+                }
+                Ok(_) => {
+                    return Err(crate::CameraError::rejected(
+                        crate::ErrorCode::UnsupportedCapability,
+                        "camera returned an unexpected PTZ response",
+                    ));
+                }
+                Err(error) => {
+                    let _ = self
+                        .catalog
+                        .complete_command(
+                            key,
+                            crate::catalog::LedgerState::Failed,
+                            serde_json::json!({ "operation": operation }),
+                            Some(error.code().as_str().to_string()),
+                            Some(command_error(&error).message),
+                            chrono::Utc::now().timestamp_millis(),
+                        )
+                        .await;
+                    return Err(error);
+                }
+            };
+            self.catalog
+                .complete_command(
+                    key,
+                    crate::catalog::LedgerState::Succeeded,
+                    response.clone(),
+                    None,
+                    None,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+            Ok(response)
+        } else {
+            match actor.ptz(physical, deadline, &self.cancellation).await? {
+                crate::model::PtzResult::Status(status) => Ok(
+                    serde_json::json!({ "position": status.position, "moving": status.moving, "available": true, "observedAt": status.observed_at }),
+                ),
+                _ => Err(crate::CameraError::rejected(
+                    crate::ErrorCode::UnsupportedCapability,
+                    "camera returned an unexpected PTZ status response",
+                )),
+            }
+        }
+    }
+
+    async fn perform_presets(&self, request: PtzPresetsRequest) -> Result<serde_json::Value> {
+        let config = self.config_snapshot()?;
+        request.validate()?;
+        match request {
+            PtzPresetsRequest::List {
+                instance,
+                limit,
+                cursor,
+            } => {
+                let instance = self
+                    .registry
+                    .resolve_actuation_instance(instance.as_deref())?;
+                let camera = self.registry.camera_config(&instance)?;
+                if !camera.ptz.enabled {
+                    return Err(crate::CameraError::rejected(
+                        crate::ErrorCode::PtzDisabled,
+                        "PTZ is disabled by configuration",
+                    ));
+                }
+                let query = serde_json::json!({ "instance": instance });
+                let initial = if cursor.is_none() {
+                    let deadline = tokio::time::Instant::now()
+                        + Duration::from_millis(config.global.timeouts.ptz_ms);
+                    match self
+                        .actor(&instance)?
+                        .ptz(
+                            crate::model::PtzRequest::ListPresets,
+                            deadline,
+                            &self.cancellation,
+                        )
+                        .await?
+                    {
+                        crate::model::PtzResult::Presets(presets) => Some(
+                            presets
+                                .into_iter()
+                                .map(serde_json::to_value)
+                                .collect::<std::result::Result<Vec<_>, _>>()?,
+                        ),
+                        _ => {
+                            return Err(crate::CameraError::rejected(
+                                crate::ErrorCode::UnsupportedCapability,
+                                "camera returned an unexpected preset-list response",
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                let (presets, next_cursor, _) = self.cursors.snapshot_page(
+                    "ptz-presets",
+                    &query,
+                    cursor.as_deref(),
+                    initial,
+                    None,
+                    usize::from(limit),
+                )?;
+                Ok(serde_json::json!({
+                    "presets": presets,
+                    "nextCursor": next_cursor,
+                }))
+            }
+            PtzPresetsRequest::Goto {
+                instance,
+                request_id,
+                token,
+            } => {
+                self.perform_preset_mutation(
+                    instance,
+                    request_id,
+                    "goto",
+                    crate::model::PtzRequest::GotoPreset(token.clone()),
+                    serde_json::json!({ "token": token }),
+                    false,
+                )
+                .await
+            }
+            PtzPresetsRequest::Set {
+                instance,
+                request_id,
+                name,
+            } => {
+                self.perform_preset_mutation(
+                    instance,
+                    request_id,
+                    "set",
+                    crate::model::PtzRequest::SetPreset(name.clone()),
+                    serde_json::json!({ "name": name }),
+                    true,
+                )
+                .await
+            }
+            PtzPresetsRequest::Remove {
+                instance,
+                request_id,
+                token,
+            } => {
+                self.perform_preset_mutation(
+                    instance,
+                    request_id,
+                    "remove",
+                    crate::model::PtzRequest::RemovePreset(token.clone()),
+                    serde_json::json!({ "token": token }),
+                    true,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn perform_preset_mutation(
+        &self,
+        requested_instance: Option<String>,
+        request_id: String,
+        operation: &'static str,
+        physical: crate::model::PtzRequest,
+        arguments: serde_json::Value,
+        requires_mutation_permission: bool,
+    ) -> Result<serde_json::Value> {
+        let config = self.config_snapshot()?;
+        let instance = self
+            .registry
+            .resolve_actuation_instance(requested_instance.as_deref())?;
+        let camera = self.registry.camera_config(&instance)?;
+        if !camera.ptz.enabled {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::PtzDisabled,
+                "PTZ is disabled by configuration",
+            ));
+        }
+        if requires_mutation_permission && !camera.ptz.allow_preset_mutation {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::UnsupportedCapability,
+                "preset mutation is disabled by configuration",
+            ));
+        }
+        let canonical = serde_json::json!({
+            "instance": &instance,
+            "requestId": &request_id,
+            "operation": operation,
+            "arguments": arguments,
+        });
+        let key = crate::catalog::LedgerKey::new(
+            instance.clone(),
+            format!("sb/ptz-presets/{operation}"),
+            request_id,
+        )?;
+        match self
+            .catalog
+            .begin_command(
+                key.clone(),
+                crate::idempotency::canonical_request_hash(&canonical, false)?,
+                canonical,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await?
+        {
+            crate::catalog::BeginCommandOutcome::Conflict => {
+                return Err(crate::CameraError::rejected(
+                    crate::ErrorCode::IdempotencyConflict,
+                    "requestId was already used with different preset arguments",
+                ));
+            }
+            crate::catalog::BeginCommandOutcome::Existing(record) => {
+                return match record.state {
+                    crate::catalog::LedgerState::OutcomeUnknown => {
+                        Err(crate::CameraError::rejected(
+                            crate::ErrorCode::PreviousOutcomeUnknown,
+                            "the prior preset outcome is unknown after restart",
+                        ))
+                    }
+                    _ => Ok(record.reply.unwrap_or_else(
+                        || serde_json::json!({ "operation": operation, "state": "COMMANDED" }),
+                    )),
+                };
+            }
+            crate::catalog::BeginCommandOutcome::Started(_) => {}
+        }
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(config.global.timeouts.ptz_ms);
+        let response = match self
+            .actor(&instance)?
+            .ptz(physical, deadline, &self.cancellation)
+            .await
+        {
+            Ok(crate::model::PtzResult::Commanded) => {
+                serde_json::json!({ "operation": operation, "state": "COMMANDED" })
+            }
+            Ok(crate::model::PtzResult::PresetToken(token)) => {
+                serde_json::json!({ "operation": operation, "token": token })
+            }
+            Ok(crate::model::PtzResult::Removed) => {
+                serde_json::json!({ "operation": operation, "removed": true })
+            }
+            Ok(_) => {
+                return Err(crate::CameraError::rejected(
+                    crate::ErrorCode::UnsupportedCapability,
+                    "camera returned an unexpected preset response",
+                ));
+            }
+            Err(error) => {
+                let _ = self
+                    .catalog
+                    .complete_command(
+                        key,
+                        crate::catalog::LedgerState::Failed,
+                        serde_json::json!({ "operation": operation }),
+                        Some(error.code().as_str().to_string()),
+                        Some(command_error(&error).message),
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await;
+                return Err(error);
+            }
+        };
+        self.catalog
+            .complete_command(
+                key,
+                crate::catalog::LedgerState::Succeeded,
+                response.clone(),
+                None,
+                None,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await?;
+        Ok(response)
+    }
+
+    fn group_status_page(
+        &self,
+        group: crate::catalog::GroupRecord,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let query = serde_json::json!({ "captureGroupId": group.group_id });
+        let initial = if cursor.is_none() {
+            Some(
+                group
+                    .members
+                    .iter()
+                    .map(job_status_json)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        let (members, next_cursor, _) = self.cursors.snapshot_page(
+            "capture-status-group",
+            &query,
+            cursor,
+            initial,
+            None,
+            limit,
+        )?;
+        Ok(serde_json::json!({
+            "group": {
+                "captureGroupId": group.group_id,
+                "requestId": group.request_id,
+                "state": group.state,
+                "acceptedAtMs": group.accepted_at_ms,
+                "terminalAtMs": group.terminal_at_ms,
+                "errorCode": group.error_code,
+                "errorMessage": group.error_message,
+                "result": group.terminal_result,
+            },
+            "members": members,
+            "nextCursor": next_cursor,
+        }))
+    }
+
+    async fn jobs_status_page(&self, body: &CaptureStatusRequest) -> Result<serde_json::Value> {
+        let query = serde_json::json!({
+            "instance": body.instance,
+            "states": body.states,
+        });
+        let before = self.cursors.job_before(&query, body.cursor.as_deref())?;
+        let requested = usize::from(body.limit);
+        // Read one additional durable row to decide whether a stable continuation exists.  The
+        // catalog's descending (acceptedAt,captureId) tuple keeps rows inserted after page one
+        // out of every continuation without retaining an unbounded process-local job snapshot.
+        let mut jobs = self
+            .catalog
+            .jobs_page(
+                body.instance.clone(),
+                body.states.clone(),
+                before,
+                requested.saturating_add(1),
+            )
+            .await?;
+        let has_next = jobs.len() > requested;
+        if has_next {
+            jobs.truncate(requested);
+        }
+        let next_cursor = if has_next {
+            let last = jobs.last().ok_or_else(|| {
+                crate::CameraError::Catalog(
+                    "paged capture-status query reported a continuation without a row".to_string(),
+                )
+            })?;
+            Some(
+                self.cursors
+                    .next_job_cursor(&query, (last.accepted_at_ms, last.capture_id.clone()))?,
+            )
+        } else {
+            None
+        };
+        Ok(serde_json::json!({
+            "jobs": jobs.iter().map(job_status_json).collect::<Vec<_>>(),
+            "nextCursor": next_cursor,
+        }))
+    }
+
+    /// Applies one already pre-commit-validated configuration generation without exposing a
+    /// mixed roster.  All fallible preparation happens before the registry/config swap.  Existing
+    /// compatible dispatchers retain their durable queued work; removal, disablement, or backend
+    /// replacement terminalizes queued work with the exact reload-interruption envelope.
+    pub async fn apply_reloaded_config(
+        self: &Arc<Self>,
+        replacement: AdapterConfig,
+        apps: BTreeMap<String, Arc<AppFacade>>,
+        events: BTreeMap<String, EventsFacade>,
+    ) -> Result<crate::registry::RegistryDiff> {
+        if self.reloading.swap(true, Ordering::AcqRel) {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::CameraUnavailable,
+                "a configuration replacement is already draining camera work",
+            ));
+        }
+        let result = self
+            .apply_reloaded_config_inner(replacement, apps, events)
+            .await;
+        self.reloading.store(false, Ordering::Release);
+        result
+    }
+
+    async fn apply_reloaded_config_inner(
+        self: &Arc<Self>,
+        replacement: AdapterConfig,
+        apps: BTreeMap<String, Arc<AppFacade>>,
+        events: BTreeMap<String, EventsFacade>,
+    ) -> Result<crate::registry::RegistryDiff> {
+        let _reload = self.reload_gate.lock().await;
+        self.backend_context.validate_config(&replacement)?;
+        let previous = self.config_snapshot()?;
+        if previous.global.state.directory != replacement.global.state.directory
+            || previous.global.output.root_directory != replacement.global.output.root_directory
+            || previous.global.output.directory_mode != replacement.global.output.directory_mode
+            || previous.global.output.file_mode != replacement.global.output.file_mode
+        {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::InvalidRequest,
+                "state/output root security settings require component restart",
+            ));
+        }
+
+        let replacement_by_id = replacement
+            .instances
+            .iter()
+            .map(|camera| (camera.id.as_str(), camera))
+            .collect::<BTreeMap<_, _>>();
+        // Queued work is compatible only when its backend *kind* remains the same.  A changed
+        // endpoint/selector/credential reference still requires a new live session, but the
+        // immutable accepted job profile remains executable by the same backend contract.
+        let incompatible = previous
+            .instances
+            .iter()
+            .filter_map(|old| match replacement_by_id.get(old.id.as_str()) {
+                Some(new)
+                    if new.enabled && old.enabled && old.backend.kind() == new.backend.kind() =>
+                {
+                    None
+                }
+                _ => Some(old.id.clone()),
+            })
+            .collect::<Vec<_>>();
+        // ONVIF protocol clients retain the global network and HTTP/XML policy that existed when
+        // their session was constructed.  A policy reload therefore retires otherwise unchanged
+        // ONVIF sessions so the next connection cannot keep probing on an old interface set or
+        // applying stale security limits.  Sim and GenICam sessions have no such global policy
+        // dependency and remain live when their backend settings are unchanged.
+        let onvif_runtime_policy_changed = previous.global.discovery.eligible_interfaces
+            != replacement.global.discovery.eligible_interfaces
+            || previous.global.security.max_header_bytes
+                != replacement.global.security.max_header_bytes
+            || previous.global.security.max_decompression_ratio
+                != replacement.global.security.max_decompression_ratio
+            || previous.global.security.allow_basic_over_plaintext
+                != replacement.global.security.allow_basic_over_plaintext;
+        let restarting = previous
+            .instances
+            .iter()
+            .filter_map(|old| match replacement_by_id.get(old.id.as_str()) {
+                Some(new)
+                    if old.enabled
+                        && new.enabled
+                        && old.backend == new.backend
+                        && !(onvif_runtime_policy_changed
+                            && old.backend.kind() == crate::model::BackendKind::OnvifRtsp) =>
+                {
+                    None
+                }
+                _ => Some(old.id.clone()),
+            })
+            .collect::<Vec<_>>();
+
+        // Build every new runtime object before changing the published registry.  An absent
+        // facade is a real initialization failure, not permission to install a partial roster.
+        let existing_engine_ids = self
+            .engines
+            .read()
+            .map_err(|_| {
+                crate::CameraError::Catalog("camera engine map is unavailable".to_string())
+            })?
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut added_engines = Vec::new();
+        let mut added_dispatchers = Vec::new();
+        let mut added_events = Vec::new();
+        for camera in &replacement.instances {
+            if existing_engine_ids.contains(&camera.id) {
+                continue;
+            }
+            let app = apps.get(&camera.id).cloned().ok_or_else(|| {
+                crate::CameraError::Catalog(format!(
+                    "missing application facade for reloaded camera '{}'",
+                    camera.id
+                ))
+            })?;
+            let event = events.get(&camera.id).cloned().ok_or_else(|| {
+                crate::CameraError::Catalog(format!(
+                    "missing events facade for reloaded camera '{}'",
+                    camera.id
+                ))
+            })?;
+            added_engines.push((camera.id.clone(), self.new_engine(app)));
+            added_events.push((camera.id.clone(), event));
+            added_dispatchers.push((
+                camera.id.clone(),
+                Arc::new(SupervisorDispatcher::new(
+                    camera.id.clone(),
+                    replacement.global.limits.max_queued_captures_per_camera,
+                )?),
+            ));
+        }
+        for instance in &incompatible {
+            self.interrupt_reload_queued(instance).await?;
+        }
+
+        let diff = self.registry.apply_validated_config(&replacement)?;
+        {
+            let mut engines = self.engines.write().map_err(|_| {
+                crate::CameraError::Catalog("camera engine map is unavailable".to_string())
+            })?;
+            for (instance, engine) in added_engines {
+                engines.insert(instance, engine);
+            }
+        }
+        {
+            let mut dispatchers = self.dispatchers.write().map_err(|_| {
+                crate::CameraError::Catalog("camera dispatcher map is unavailable".to_string())
+            })?;
+            for (instance, dispatcher) in added_dispatchers {
+                dispatchers.insert(instance, dispatcher);
+            }
+        }
+        {
+            let mut runtime_events = self.events.write().map_err(|_| {
+                crate::CameraError::Catalog("camera events facade map is unavailable".to_string())
+            })?;
+            // The listener supplies fresh facades for all retained instances so their core
+            // configuration snapshot stays current; tests and internal callers may omit
+            // retained entries, in which case the established facade remains valid.  Newly
+            // added cameras were required above and are therefore never installed without an
+            // event publishing path.
+            for (instance, event) in events {
+                if replacement_by_id.contains_key(instance.as_str()) {
+                    runtime_events.insert(instance, event);
+                }
+            }
+            for (instance, event) in added_events {
+                runtime_events.insert(instance, event);
+            }
+        }
+        {
+            let mut config = self.config.write().map_err(|_| {
+                crate::CameraError::Catalog("runtime configuration lock is unavailable".to_string())
+            })?;
+            *config = replacement.clone();
+        }
+
+        // Schedule plans are immutable.  Canceling the prior generation before constructing the
+        // new plans prevents a schedule-only reload from admitting an old cron/profile after the
+        // registry generation has changed.
+        self.restart_schedulers()?;
+        self.restart_periodic_discovery()?;
+
+        let drain_timeout =
+            Duration::from_millis(replacement.global.timeouts.reload_drain_timeout_ms);
+        self.wait_for_active_jobs(&restarting, drain_timeout)
+            .await?;
+
+        // Retire connecting, backing-off, and live supervisor generations alike.  The wait keeps
+        // an old cleanup path from deleting a freshly published actor map entry for the same ID.
+        self.replace_supervisors(&restarting, drain_timeout).await?;
+
+        // New supervisors are started only after the full swap and old-generation retirement.
+        for instance in &diff.added {
+            if let Ok(camera) = self.registry.camera_config(instance) {
+                if camera.enabled {
+                    let engine = self.engine(instance)?;
+                    self.start_supervisor(instance.clone(), engine)?;
+                }
+            }
+        }
+        for instance in restarting.iter().filter(|instance| {
+            !diff.removed.contains(instance)
+                && self
+                    .registry
+                    .camera_config(instance)
+                    .is_ok_and(|camera| camera.enabled)
+        }) {
+            let engine = self.engine(instance)?;
+            self.start_supervisor(instance.clone(), engine)?;
+        }
+        if !diff.removed.is_empty() {
+            self.engines
+                .write()
+                .map_err(|_| {
+                    crate::CameraError::Catalog("camera engine map is unavailable".to_string())
+                })?
+                .retain(|instance, _| !diff.removed.contains(instance));
+            self.dispatchers
+                .write()
+                .map_err(|_| {
+                    crate::CameraError::Catalog("camera dispatcher map is unavailable".to_string())
+                })?
+                .retain(|instance, _| !diff.removed.contains(instance));
+            self.events
+                .write()
+                .map_err(|_| {
+                    crate::CameraError::Catalog(
+                        "camera events facade map is unavailable".to_string(),
+                    )
+                })?
+                .retain(|instance, _| !diff.removed.contains(instance));
+            self.supervisor_cancellations
+                .write()
+                .map_err(|_| {
+                    crate::CameraError::Catalog(
+                        "supervisor cancellation map is unavailable".to_string(),
+                    )
+                })?
+                .retain(|instance, _| !diff.removed.contains(instance));
+            self.supervisor_finished
+                .write()
+                .map_err(|_| {
+                    crate::CameraError::Catalog(
+                        "supervisor completion map is unavailable".to_string(),
+                    )
+                })?
+                .retain(|instance, _| !diff.removed.contains(instance));
+            if let Ok(mut sessions) = self.session_cancellations.write() {
+                sessions.retain(|instance, _| !diff.removed.contains(instance));
+            }
+        }
+        Ok(diff)
+    }
+
+    async fn wait_for_active_jobs(&self, instances: &[String], timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let mut any_active = false;
+            for instance in instances {
+                if self.has_active_job(instance).await? {
+                    any_active = true;
+                    break;
+                }
+            }
+            if !any_active || tokio::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Cancels complete supervisor generations, not merely live actors.  This covers a reload
+    /// arriving while a backend is connecting or sleeping in exponential backoff.
+    async fn replace_supervisors(&self, instances: &[String], timeout: Duration) -> Result<()> {
+        let cancellations = self
+            .supervisor_cancellations
+            .read()
+            .map_err(|_| {
+                crate::CameraError::Catalog(
+                    "supervisor cancellation map is unavailable".to_string(),
+                )
+            })?
+            .iter()
+            .filter(|(instance, _)| instances.contains(*instance))
+            .map(|(_, cancellation)| cancellation.clone())
+            .collect::<Vec<_>>();
+        for cancellation in cancellations {
+            cancellation.cancel();
+        }
+        // A live actor receives the supervisor child token above.  Retaining the direct signal is
+        // useful for an already-dispatched control operation which owns its own child token.
+        if let Ok(sessions) = self.session_cancellations.read() {
+            for (instance, cancellation) in sessions.iter() {
+                if instances.contains(instance) {
+                    cancellation.cancel();
+                }
+            }
+        }
+
+        let completed = self
+            .supervisor_finished
+            .read()
+            .map_err(|_| {
+                crate::CameraError::Catalog("supervisor completion map is unavailable".to_string())
+            })?
+            .iter()
+            .filter(|(instance, _)| instances.contains(*instance))
+            .map(|(_, finished)| finished.clone())
+            .collect::<Vec<_>>();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if completed.iter().all(CancellationToken::is_cancelled) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(crate::CameraError::rejected(
+                    crate::ErrorCode::CameraUnavailable,
+                    "camera supervisor did not stop within reloadDrainTimeoutMs",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn has_active_job(&self, instance: &str) -> Result<bool> {
+        let states = vec![
+            crate::model::JobState::Acquiring,
+            crate::model::JobState::Encoding,
+            crate::model::JobState::Persisting,
+        ];
+        Ok(!self
+            .catalog
+            .jobs_page(Some(instance.to_owned()), states, None, 1)
+            .await?
+            .is_empty())
+    }
+
+    async fn interrupt_reload_queued(&self, instance: &str) -> Result<()> {
+        let mut before = None;
+        loop {
+            let page = self
+                .catalog
+                .jobs_page(
+                    Some(instance.to_owned()),
+                    vec![
+                        crate::model::JobState::Accepted,
+                        crate::model::JobState::Queued,
+                    ],
+                    before.clone(),
+                    1_000,
+                )
+                .await?;
+            let Some(last) = page.last() else {
+                return Ok(());
+            };
+            for record in &page {
+                self.engine(instance)?
+                    .interrupt_for_reload(record.clone())
+                    .await?;
+            }
+            if page.len() < 1_000 {
+                return Ok(());
+            }
+            before = Some((last.accepted_at_ms, last.capture_id.clone()));
+        }
+    }
+
+    /// Starts cooperative shutdown.  Pending outbox rows remain durable; tasks are joined only
+    /// within the configured grace period so the process cannot hang behind a native backend.
+    pub async fn shutdown(&self) {
+        self.readiness.begin_shutdown();
+        self.cancellation.cancel();
+        let grace = match self.config_snapshot() {
+            Ok(config) => Duration::from_millis(config.global.timeouts.shutdown_grace_ms),
+            Err(_) => Duration::from_secs(30),
+        };
+        let tasks = self
+            .tasks
+            .lock()
+            .map(|mut tasks| std::mem::take(&mut *tasks));
+        let Ok(tasks) = tasks else {
+            return;
+        };
+        let join = async move {
+            for task in tasks {
+                let _ = task.await;
+            }
+        };
+        let _ = tokio::time::timeout(grace, join).await;
+    }
+
+    async fn refresh_storage_pressure(&self) -> Option<StoragePressureSnapshot> {
+        let monitor = self.storage_pressure.clone()?;
+        let snapshot = monitor.assess().await;
+        self.readiness
+            .set_state_storage_available(snapshot.state_available());
+        publish_storage_alarm(
+            self.outbox_events.clone(),
+            self.storage_alarm.as_ref(),
+            &snapshot,
+        )
+        .await;
+        Some(snapshot)
+    }
+
+    async fn ensure_storage_capacity(&self) -> Result<()> {
+        let Some(snapshot) = self.refresh_storage_pressure().await else {
+            return Ok(());
+        };
+        if snapshot.rejects_new_captures() {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::StoragePressure,
+                "configured output or state storage cannot safely admit a new capture",
+            ));
+        }
+        Ok(())
+    }
+
+    fn start_storage_pressure_monitor(self: &Arc<Self>) -> Result<()> {
+        let runtime = Arc::clone(self);
+        let cancellation = self.cancellation.clone();
+        self.spawn_task(async move {
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => return,
+                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+                let _ = runtime.refresh_storage_pressure().await;
+            }
+        })
+    }
+
+    fn start_outbox(
+        self: &Arc<Self>,
+        messaging: Arc<dyn edgecommons::messaging::MessagingService>,
+    ) -> Result<()> {
+        let config = self.config_snapshot()?;
+        let publisher = OutboxPublisher::new(
+            Arc::new(self.catalog.clone()),
+            Arc::new(EdgeCommonsConfirmedPublisher::new(messaging)),
+            Duration::from_secs(10),
+            Duration::from_millis(250),
+            config.global.state.max_result_records,
+        )?;
+        let events = self.outbox_events.clone().ok_or_else(|| {
+            crate::CameraError::Catalog(
+                "missing component events facade for outbox health".to_string(),
+            )
+        })?;
+        let readiness = self.readiness.clone();
+        let watchers = OutboxHealthWatchers {
+            pressure: publisher.pressure(),
+            durability: publisher.durability(),
+            catalog_availability: self.catalog.availability(),
+        };
+        let catalog = self.catalog.clone();
+        let storage_pressure = self.storage_pressure.clone();
+        let storage_alarm = Arc::clone(&self.storage_alarm);
+        let observer_cancellation = self.cancellation.clone();
+        self.spawn_task(async move {
+            Self::observe_outbox_health(
+                watchers,
+                catalog,
+                events,
+                storage_pressure,
+                storage_alarm,
+                readiness,
+                observer_cancellation,
+            )
+            .await;
+        })?;
+
+        let cancellation = self.cancellation.clone();
+        self.spawn_task(async move {
+            if let Err(error) = publisher.run(cancellation).await {
+                tracing::error!(error = %error, "camera outbox worker stopped unexpectedly");
+            }
+        })
+    }
+
+    async fn observe_outbox_health(
+        mut watchers: OutboxHealthWatchers,
+        catalog: Catalog,
+        events: EventsFacade,
+        storage_pressure: Option<StoragePressureMonitor>,
+        storage_alarm: Arc<Mutex<StorageAlarmState>>,
+        readiness: RuntimeReadiness,
+        cancellation: CancellationToken,
+    ) {
+        let mut alarms = OutboxAlarmState::default();
+        let mut catalog_unavailable = !watchers
+            .catalog_availability
+            .borrow()
+            .state_capacity_available;
+        let mut recovery_probe = tokio::time::interval(Duration::from_secs(1));
+        recovery_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                changed = watchers.pressure.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let current = watchers.pressure.borrow_and_update().clone();
+                    if let Some(transition) = alarms.transition(&current) {
+                        let result = match transition {
+                            OutboxAlarmTransition::Raise(context) => events.raise_alarm(
+                                Severity::Warning,
+                                "message-delivery-delayed",
+                                Some("durable terminal-message delivery is delayed".to_string()),
+                                Some(context),
+                            ).await,
+                            OutboxAlarmTransition::Clear(context) => events.clear_alarm(
+                                Severity::Warning,
+                                "message-delivery-delayed",
+                                Some(context),
+                            ).await,
+                        };
+                        if let Err(error) = result {
+                            tracing::warn!(error = %error, "failed to publish outbox delivery-health alarm");
+                        }
+                    }
+                }
+                changed = watchers.durability.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let current = *watchers.durability.borrow_and_update();
+                    readiness.set_outbox_available(current.state_capacity_available);
+                }
+                changed = watchers.catalog_availability.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let current = *watchers.catalog_availability.borrow_and_update();
+                    catalog_unavailable = !current.state_capacity_available;
+                    readiness.set_catalog_available(current.state_capacity_available);
+                    if current.disk_full {
+                        if let Some(monitor) = storage_pressure.as_ref() {
+                            let snapshot = monitor.assess().await;
+                            readiness.set_state_storage_available(snapshot.state_available());
+                            publish_storage_alarm(
+                                Some(events.clone()),
+                                storage_alarm.as_ref(),
+                                &snapshot,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                _ = recovery_probe.tick(), if catalog_unavailable => {
+                    if catalog.probe_commit().await.is_err() {
+                        tracing::warn!("catalog durable-state recovery probe did not commit");
+                    }
+                }
+            }
+        }
+    }
+
+    fn start_supervisors(self: &Arc<Self>) -> Result<()> {
+        for camera in self.config_snapshot()?.instances {
+            if !camera.enabled {
+                continue;
+            }
+            let engine = self.engine(&camera.id)?;
+            self.start_supervisor(camera.id, engine)?;
+        }
+        Ok(())
+    }
+
+    /// Starts one isolated supervisor generation.  The child cancellation token propagates the
+    /// process shutdown token but can also retire this generation during a per-camera reload.
+    fn start_supervisor(self: &Arc<Self>, instance: String, engine: JobEngine) -> Result<()> {
+        let cancellation = self.cancellation.child_token();
+        let finished = CancellationToken::new();
+        let previous = self
+            .supervisor_cancellations
+            .write()
+            .map_err(|_| {
+                crate::CameraError::Catalog(
+                    "supervisor cancellation map is unavailable".to_string(),
+                )
+            })?
+            .insert(instance.clone(), cancellation.clone());
+        if let Some(previous) = previous {
+            previous.cancel();
+        }
+        self.supervisor_finished
+            .write()
+            .map_err(|_| {
+                crate::CameraError::Catalog("supervisor completion map is unavailable".to_string())
+            })?
+            .insert(instance.clone(), finished.clone());
+        let runtime = Arc::clone(self);
+        self.spawn_task(async move {
+            runtime
+                .run_supervisor(instance, engine, cancellation, finished)
+                .await;
+        })
+    }
+
+    fn start_schedulers(self: &Arc<Self>) -> Result<()> {
+        for camera in self.config_snapshot()?.instances {
+            if !camera.enabled {
+                continue;
+            }
+            for schedule in camera.schedules.iter().filter(|schedule| schedule.enabled) {
+                let plan = SchedulePlan::compile(camera.id.clone(), schedule)?;
+                self.start_schedule_plan(plan)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn start_schedule_plan(self: &Arc<Self>, plan: SchedulePlan) -> Result<()> {
+        let key = plan.key_parts();
+        let cancellation = CancellationToken::new();
+        let previous = self
+            .scheduler_cancellations
+            .write()
+            .map_err(|_| {
+                crate::CameraError::Catalog("schedule task map is unavailable".to_string())
+            })?
+            .insert(key, cancellation.clone());
+        if let Some(previous) = previous {
+            previous.cancel();
+        }
+        let runtime = Arc::clone(self);
+        self.spawn_task(async move {
+            runtime.run_schedule(plan, cancellation).await;
+        })
+    }
+
+    fn restart_schedulers(self: &Arc<Self>) -> Result<()> {
+        let cancellations = self
+            .scheduler_cancellations
+            .write()
+            .map_err(|_| {
+                crate::CameraError::Catalog("schedule task map is unavailable".to_string())
+            })?
+            .drain()
+            .map(|(_, cancellation)| cancellation)
+            .collect::<Vec<_>>();
+        for cancellation in cancellations {
+            cancellation.cancel();
+        }
+        self.start_schedulers()
+    }
+
+    fn start_periodic_discovery(self: &Arc<Self>) -> Result<()> {
+        let config = self.config_snapshot()?;
+        if !config.global.discovery.enabled {
+            return Ok(());
+        }
+        let cancellation = self.cancellation.child_token();
+        let previous = self
+            .discovery_cancellation
+            .write()
+            .map_err(|_| {
+                crate::CameraError::Catalog("discovery cancellation is unavailable".to_string())
+            })?
+            .replace(cancellation.clone());
+        if let Some(previous) = previous {
+            previous.cancel();
+        }
+        let runtime = Arc::clone(self);
+        self.spawn_task(async move {
+            runtime.run_periodic_discovery(cancellation).await;
+        })
+    }
+
+    /// Cancels the previous discovery generation even when reporting is disabled: stale network
+    /// observations must not survive a policy disable/re-enable boundary.
+    fn restart_periodic_discovery(self: &Arc<Self>) -> Result<()> {
+        let previous = self
+            .discovery_cancellation
+            .write()
+            .map_err(|_| {
+                crate::CameraError::Catalog("discovery cancellation is unavailable".to_string())
+            })?
+            .take();
+        if let Some(previous) = previous {
+            previous.cancel();
+        }
+        if let Ok(mut cache) = self.discovery_cache.lock() {
+            cache.candidates.clear();
+        }
+        self.start_periodic_discovery()
+    }
+
+    async fn run_periodic_discovery(self: Arc<Self>, cancellation: CancellationToken) {
+        loop {
+            if cancellation.is_cancelled() || self.reloading.load(Ordering::Acquire) {
+                if cancellation.is_cancelled() {
+                    return;
+                }
+            } else {
+                let config = match self.config_snapshot() {
+                    Ok(config) => config,
+                    Err(error) => {
+                        tracing::error!(error = %error, "periodic discovery lost runtime configuration");
+                        return;
+                    }
+                };
+                if !config.global.discovery.enabled {
+                    return;
+                }
+                match self
+                    .discover_candidates(
+                        &config,
+                        None,
+                        Duration::from_millis(config.global.timeouts.connect_ms),
+                        cancellation.child_token(),
+                    )
+                    .await
+                {
+                    Ok(candidates) if !cancellation.is_cancelled() => {
+                        if let Ok(mut cache) = self.discovery_cache.lock() {
+                            cache.candidates = candidates;
+                        }
+                    }
+                    Ok(_) => return,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "bounded periodic camera discovery failed");
+                    }
+                }
+            }
+            let interval = match self.config_snapshot() {
+                Ok(config) => Duration::from_secs(config.global.discovery.interval_seconds),
+                Err(_) => return,
+            };
+            tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = self.cancellation.cancelled() => return,
+                _ = tokio::time::sleep(interval) => {}
+            }
+        }
+    }
+
+    async fn run_schedule(
+        self: Arc<Self>,
+        plan: SchedulePlan,
+        schedule_cancellation: CancellationToken,
+    ) {
+        let (instance, schedule_id) = plan.key_parts();
+        let now = chrono::Utc::now();
+        let mut last_consumed = match self
+            .catalog
+            .latest_schedule_occurrence(instance.clone(), schedule_id.clone())
+            .await
+        {
+            Ok(Some(milliseconds)) => chrono::DateTime::from_timestamp_millis(milliseconds)
+                // A corrupt-but-schema-valid out-of-range timestamp must not turn into an
+                // unbounded cron search.  Start cleanly and leave the corrupt row unavailable
+                // for re-admission because the catalog dedupe key still owns it.
+                .unwrap_or_else(|| now - chrono::Duration::seconds(1)),
+            Ok(None) => now - chrono::Duration::seconds(1),
+            Err(error) => {
+                tracing::error!(
+                    instance = %instance,
+                    schedule_id = %schedule_id,
+                    error = %error,
+                    "camera schedule could not load its durable recovery cursor"
+                );
+                return;
+            }
+        };
+        loop {
+            if self.cancellation.is_cancelled() || schedule_cancellation.is_cancelled() {
+                return;
+            }
+            if self.reloading.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = self.cancellation.cancelled() => return,
+                    _ = schedule_cancellation.cancelled() => return,
+                    _ = tokio::time::sleep(SCHEDULER_POLL_INTERVAL) => continue,
+                }
+            }
+            let now = chrono::Utc::now();
+            let overlap = match self.has_schedule_overlap(&instance, &schedule_id).await {
+                Ok(overlap) => overlap,
+                Err(error) => {
+                    tracing::warn!(
+                        instance = %instance,
+                        schedule_id = %schedule_id,
+                        error = %error,
+                        "camera schedule could not evaluate overlap"
+                    );
+                    false
+                }
+            };
+            match plan.evaluate(last_consumed, now, SCHEDULER_MISFIRE_GRACE, overlap) {
+                Ok(ScheduleDecision::NotDue) => {}
+                Ok(ScheduleDecision::SkippedMisfire { latest, consumed }) => {
+                    last_consumed = latest.intended_fire_time;
+                    tracing::info!(
+                        instance = %instance,
+                        schedule_id = %schedule_id,
+                        intended_fire_time = %latest.intended_fire_time,
+                        consumed,
+                        "camera schedule skipped a misfire"
+                    );
+                }
+                Ok(ScheduleDecision::SkippedOverlap {
+                    occurrence,
+                    consumed,
+                }) => {
+                    last_consumed = occurrence.intended_fire_time;
+                    tracing::info!(
+                        instance = %instance,
+                        schedule_id = %schedule_id,
+                        intended_fire_time = %occurrence.intended_fire_time,
+                        consumed,
+                        "camera schedule skipped an overlapping occurrence"
+                    );
+                }
+                Ok(ScheduleDecision::Admit {
+                    occurrence,
+                    consumed,
+                }) => {
+                    last_consumed = occurrence.intended_fire_time;
+                    if let Err(error) = self.submit_scheduled(&occurrence).await {
+                        // The occurrence is consumed even when capacity or the backend policy
+                        // rejects it. Repeating it would violate the scheduler's one-occurrence
+                        // guarantee; a new cron occurrence will be evaluated normally.
+                        tracing::warn!(
+                            instance = %instance,
+                            schedule_id = %schedule_id,
+                            intended_fire_time = %occurrence.intended_fire_time,
+                            consumed,
+                            error = %error,
+                            "camera schedule occurrence was not admitted"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        instance = %instance,
+                        schedule_id = %schedule_id,
+                        error = %error,
+                        "camera schedule evaluation failed"
+                    );
+                }
+            }
+            tokio::select! {
+                _ = self.cancellation.cancelled() => return,
+                _ = schedule_cancellation.cancelled() => return,
+                _ = tokio::time::sleep(SCHEDULER_POLL_INTERVAL) => {}
+            }
+        }
+    }
+
+    async fn has_schedule_overlap(&self, instance: &str, schedule_id: &str) -> Result<bool> {
+        let states = vec![
+            crate::model::JobState::Accepted,
+            crate::model::JobState::Queued,
+            crate::model::JobState::Acquiring,
+            crate::model::JobState::Encoding,
+            crate::model::JobState::Persisting,
+        ];
+        let mut before = None;
+        loop {
+            let page = self
+                .catalog
+                .jobs_page(
+                    Some(instance.to_owned()),
+                    states.clone(),
+                    before.clone(),
+                    1_000,
+                )
+                .await?;
+            if page.iter().any(|record| {
+                record.trigger.get("type")
+                    == Some(&serde_json::Value::String("schedule".to_string()))
+                    && record.trigger.get("scheduleId")
+                        == Some(&serde_json::Value::String(schedule_id.to_owned()))
+            }) {
+                return Ok(true);
+            }
+            let Some(last) = page.last() else {
+                return Ok(false);
+            };
+            if page.len() < 1_000 {
+                return Ok(false);
+            }
+            before = Some((last.accepted_at_ms, last.capture_id.clone()));
+        }
+    }
+
+    async fn emit_schedule_skipped(&self, occurrence: &ScheduleOccurrence) {
+        let event = self
+            .events
+            .read()
+            .ok()
+            .and_then(|events| events.get(&occurrence.instance).cloned());
+        if let Some(event) = event {
+            let _ = event
+                .emit(
+                    Severity::Warning,
+                    "schedule-skipped",
+                    Some("scheduled capture skipped because camera is moving".to_string()),
+                    Some(serde_json::json!({
+                        "scheduleId": occurrence.schedule_id,
+                        "intendedFireTime": occurrence.intended_fire_time,
+                        "code": "CAMERA_MOVING",
+                    })),
+                )
+                .await;
+        }
+    }
+
+    async fn submit_scheduled(&self, occurrence: &ScheduleOccurrence) -> Result<()> {
+        let config = self.config_snapshot()?;
+        let camera = self.registry.camera_config(&occurrence.instance)?;
+        if !camera.enabled {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::CameraDisabled,
+                "camera was disabled before scheduled admission",
+            ));
+        }
+        let schedule = camera
+            .schedules
+            .iter()
+            .find(|schedule| schedule.id == occurrence.schedule_id && schedule.enabled)
+            .ok_or_else(|| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::InvalidRequest,
+                    "schedule is no longer enabled for this camera",
+                )
+            })?;
+        let profile = camera
+            .capture_profiles
+            .get(&schedule.capture_profile)
+            .cloned()
+            .ok_or_else(|| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::UnknownCaptureProfile,
+                    "scheduled capture profile is not configured",
+                )
+            })?;
+        if profile
+            .capture_interlock
+            .unwrap_or(camera.ptz.capture_interlock)
+            == crate::config::CaptureInterlock::Reject
+        {
+            if let Ok(actor) = self.actor(&occurrence.instance) {
+                if matches!(
+                    actor
+                        .ptz(
+                            crate::model::PtzRequest::Status,
+                            tokio::time::Instant::now()
+                                + Duration::from_millis(config.global.timeouts.ptz_ms),
+                            &self.cancellation,
+                        )
+                        .await,
+                    Ok(crate::model::PtzResult::Status(status)) if status.moving == Some(true)
+                ) {
+                    self.emit_schedule_skipped(occurrence).await;
+                    return Ok(());
+                }
+            }
+        }
+        let accepted_at_ms = chrono::Utc::now().timestamp_millis();
+        let terminal_ms = profile
+            .timeout_ms
+            .unwrap_or(config.global.timeouts.job_terminal_ms);
+        let capture_mode = profile
+            .capture_mode
+            .unwrap_or_else(|| match &camera.backend {
+                crate::config::BackendConfig::Sim(_) => crate::model::CaptureMode::Simulated,
+                crate::config::BackendConfig::GenicamAravis(_) => {
+                    crate::model::CaptureMode::SoftwareTrigger
+                }
+                crate::config::BackendConfig::OnvifRtsp(config) => config.capture_mode,
+            });
+        let capture_id = format!("cap_{}", uuid::Uuid::now_v7());
+        let deadlines = crate::catalog::JobDeadlines {
+            terminal_at_ms: accepted_at_ms
+                .saturating_add(i64::try_from(terminal_ms).unwrap_or(i64::MAX)),
+            queue_at_ms: profile.queue_expiry_ms.map(|duration| {
+                accepted_at_ms.saturating_add(i64::try_from(duration).unwrap_or(i64::MAX))
+            }),
+            capture_at_ms: accepted_at_ms.saturating_add(
+                i64::try_from(config.global.timeouts.capture_ms).unwrap_or(i64::MAX),
+            ),
+            encode_at_ms: accepted_at_ms.saturating_add(
+                i64::try_from(config.global.timeouts.encode_ms).unwrap_or(i64::MAX),
+            ),
+            persist_at_ms: accepted_at_ms.saturating_add(
+                i64::try_from(config.global.timeouts.persist_ms).unwrap_or(i64::MAX),
+            ),
+        };
+        let relative_path = crate::storage::render_output_path(
+            &config.global.output,
+            crate::storage::OutputPathVariables {
+                camera_id: &occurrence.instance,
+                capture_id: &capture_id,
+                timestamp: chrono::Utc::now(),
+            },
+            profile.output.encoding,
+        )?;
+        let snapshot = self.registry.snapshot(&occurrence.instance)?;
+        let camera_summary = crate::messages::CameraSummary {
+            backend: snapshot.backend,
+            vendor: snapshot
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.vendor.clone()),
+            model: snapshot
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.model.clone()),
+            firmware: snapshot
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.firmware.clone()),
+            serial: snapshot
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.serial.clone()),
+        };
+        let profile_snapshot = crate::jobs::JobProfileSnapshot {
+            name: schedule.capture_profile.clone(),
+            capture: profile.clone(),
+            // The binding deliberately gives schedules a fail-fast default even when direct
+            // capture defaults to wait-until-deadline.
+            offline_policy: profile
+                .offline_policy
+                .unwrap_or(crate::config::OfflinePolicy::FailFast),
+            maximum_frame_bytes: profile
+                .maximum_frame_bytes
+                .unwrap_or(config.global.limits.max_frame_bytes_per_camera),
+            capture_mode,
+            capture_interlock: profile
+                .capture_interlock
+                .unwrap_or(camera.ptz.capture_interlock),
+            settle_ms: camera.ptz.settle_ms,
+        };
+        let trigger = crate::messages::CaptureTrigger::Schedule {
+            schedule_id: occurrence.schedule_id.clone(),
+            intended_fire_time: occurrence.intended_fire_time,
+        };
+        let correlation_id = uuid::Uuid::now_v7().to_string();
+        let canonical = serde_json::json!({
+            "scheduleId": occurrence.schedule_id,
+            "intendedFireTime": occurrence.intended_fire_time,
+            "captureProfile": schedule.capture_profile,
+            "effectiveProfile": profile_snapshot,
+            "deadlines": {
+                "terminalAtMs": deadlines.terminal_at_ms,
+                "queueAtMs": deadlines.queue_at_ms,
+                "captureAtMs": deadlines.capture_at_ms,
+                "encodeAtMs": deadlines.encode_at_ms,
+                "persistAtMs": deadlines.persist_at_ms,
+            },
+            "intendedOutput": {
+                "relativePath": relative_path.as_wire_path(),
+                "backend": snapshot.backend.as_str(),
+            },
+        });
+        let submission = crate::jobs::JobSubmission {
+            job: crate::catalog::NewJob {
+                capture_id: capture_id.clone(),
+                instance: occurrence.instance.clone(),
+                ledger_key: None,
+                request_hash: crate::idempotency::canonical_request_hash(&canonical, false)?,
+                canonical_request: canonical,
+                effective_profile: serde_json::to_value(&profile_snapshot)?,
+                deadlines: deadlines.clone(),
+                trigger: serde_json::to_value(&trigger)?,
+                origin_correlation_id: None,
+                intended_output: serde_json::json!({
+                    "relativePath": relative_path.as_wire_path(),
+                    "backend": snapshot.backend.as_str(),
+                }),
+                accepted_at_ms,
+                group_id: None,
+            },
+            spec: crate::jobs::CaptureJobSpec {
+                capture_id: capture_id.clone(),
+                instance: occurrence.instance.clone(),
+                profile: profile_snapshot,
+                resource_group: camera.resource_group.clone(),
+                relative_path,
+                deadlines,
+                accepted_at_ms,
+                trigger,
+                correlation_id,
+                metadata: serde_json::Map::new(),
+                camera: camera_summary,
+                group_size: None,
+            },
+            priority: crate::admission::CapturePriority::Scheduled,
+        };
+        self.ensure_storage_capacity().await?;
+        let outcome = self
+            .catalog
+            .accept_scheduled_job(
+                submission.job.clone(),
+                occurrence.schedule_id.clone(),
+                occurrence.intended_fire_time.timestamp_millis(),
+            )
+            .await?;
+        if matches!(outcome, crate::catalog::AcceptJobOutcome::Inserted(_)) {
+            let dispatcher = self.dispatcher(&occurrence.instance)?;
+            self.engine(&occurrence.instance)?
+                .queue_preaccepted(dispatcher.as_ref(), submission)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn spawn_task(
+        &self,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        let handle = tokio::spawn(task);
+        self.tasks
+            .lock()
+            .map_err(|_| {
+                crate::CameraError::Catalog("runtime task registry is unavailable".to_string())
+            })?
+            .push(handle);
+        Ok(())
+    }
+
+    async fn recover_install_owned(&self) -> Result<()> {
+        // Generic PTZ/reconnect/preset commands may have crossed a physical side-effect boundary
+        // before the process died. They are never replayed automatically; exact retries receive
+        // the durable PREVIOUS_OUTCOME_UNKNOWN result instead.
+        self.catalog
+            .mark_hazardous_commands_outcome_unknown(chrono::Utc::now().timestamp_millis())
+            .await?;
+        // A PERSISTING record whose install CAS won has a fully staged success envelope and can
+        // be reconciled without reconnecting any camera.  Other active states need a fresh
+        // command/runtime recovery policy; never quietly drop them during startup.
+        for record in self.catalog.recovery_jobs().await? {
+            let engine = self.engine(&record.instance)?;
+            if record.install_started {
+                let cancellation = CancellationToken::new();
+                engine
+                    .recover_install_started(record, &cancellation)
+                    .await?;
+            } else {
+                engine.interrupt_recovered(record).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_supervisor(
+        self: Arc<Self>,
+        instance: String,
+        engine: JobEngine,
+        cancellation: CancellationToken,
+        finished: CancellationToken,
+    ) {
+        self.run_supervisor_loop(instance, engine, cancellation)
+            .await;
+        finished.cancel();
+    }
+
+    async fn run_supervisor_loop(
+        self: Arc<Self>,
+        instance: String,
+        engine: JobEngine,
+        cancellation: CancellationToken,
+    ) {
+        let mut attempt = 0_u32;
+        // A reload retains the registry/watch entry but explicitly advances its generation to
+        // fence stale callbacks.  A replacement supervisor must continue from that fence rather
+        // than restart at zero, or every one of its observations would be discarded as stale.
+        let mut generation = self
+            .registry
+            .snapshot(&instance)
+            .map_or(0, |snapshot| snapshot.generation);
+        loop {
+            let runtime_config = match self.config_snapshot() {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::error!(instance = %instance, error = %error, "camera supervisor lost runtime configuration");
+                    return;
+                }
+            };
+            let camera = match self.registry.camera_config(&instance) {
+                Ok(camera) if camera.enabled => camera,
+                Ok(_) | Err(_) => return,
+            };
+            let factory = match self
+                .backend_context
+                .factory_for(&camera.backend, &runtime_config.global)
+            {
+                Ok(factory) => factory,
+                Err(error) => {
+                    let _ = self.registry.update(
+                        &instance,
+                        generation,
+                        CameraConnectionState::Backoff,
+                        None,
+                        Some(status_error(&error)),
+                        chrono::Utc::now(),
+                    );
+                    return;
+                }
+            };
+            if cancellation.is_cancelled() {
+                let _ = self.registry.update(
+                    &camera.id,
+                    generation,
+                    CameraConnectionState::Stopping,
+                    None,
+                    None,
+                    chrono::Utc::now(),
+                );
+                return;
+            }
+            generation = generation.saturating_add(1);
+            let _ = self.registry.update(
+                &camera.id,
+                generation,
+                CameraConnectionState::Connecting,
+                None,
+                None,
+                chrono::Utc::now(),
+            );
+            let permit = tokio::select! {
+                _ = cancellation.cancelled() => return,
+                permit = self.connect_gate.clone().acquire_owned() => match permit { Ok(permit) => permit, Err(_) => return },
+            };
+            let request = ConnectRequest {
+                instance_id: camera.id.clone(),
+                backend: camera.backend.clone(),
+                timeout: Duration::from_millis(runtime_config.global.timeouts.connect_ms),
+                cancellation: cancellation.child_token(),
+            };
+            let connected =
+                crate::supervisor::isolate_backend_panic(factory.connect(request)).await;
+            drop(permit);
+            let retry_class = match &connected {
+                Err(crate::CameraError::Config { .. }) => crate::supervisor::RetryClass::Permanent,
+                _ => crate::supervisor::RetryClass::Transient,
+            };
+            match connected {
+                Ok(session) => {
+                    attempt = 0;
+                    let capabilities = session.capabilities().clone();
+                    let (actor, handle) = match CameraActor::new(
+                        camera.id.clone(),
+                        session,
+                        engine.clone(),
+                        runtime_config.global.limits.max_queued_captures_per_camera,
+                        runtime_config.global.limits.max_queued_controls_per_camera,
+                    ) {
+                        Ok(pair) => pair,
+                        Err(error) => {
+                            let _ = self.registry.update(
+                                &camera.id,
+                                generation,
+                                CameraConnectionState::Backoff,
+                                None,
+                                Some(status_error(&error)),
+                                chrono::Utc::now(),
+                            );
+                            self.sleep_backoff(
+                                &camera.id,
+                                attempt,
+                                crate::supervisor::RetryClass::Permanent,
+                                &cancellation,
+                            )
+                            .await;
+                            attempt = attempt.saturating_add(1);
+                            continue;
+                        }
+                    };
+                    if let Ok(mut actors) = self.actors.write() {
+                        actors.insert(camera.id.clone(), handle.clone());
+                    }
+                    let actor_cancellation = cancellation.child_token();
+                    if let Ok(mut sessions) = self.session_cancellations.write() {
+                        sessions.insert(camera.id.clone(), actor_cancellation.clone());
+                    }
+                    let _ = self.registry.update(
+                        &camera.id,
+                        generation,
+                        CameraConnectionState::Online,
+                        Some(capabilities),
+                        None,
+                        chrono::Utc::now(),
+                    );
+                    let mut actor_task = tokio::spawn(actor.run(actor_cancellation));
+                    let dispatcher = match self.dispatcher(&camera.id) {
+                        Ok(dispatcher) => dispatcher,
+                        Err(error) => {
+                            actor_task.abort();
+                            let _ = actor_task.await;
+                            let _ = self.registry.update(
+                                &camera.id,
+                                generation,
+                                CameraConnectionState::Backoff,
+                                None,
+                                Some(status_error(&error)),
+                                chrono::Utc::now(),
+                            );
+                            continue;
+                        }
+                    };
+                    let result = loop {
+                        let _ = dispatcher.drain_into(&handle);
+                        tokio::select! {
+                            joined = &mut actor_task => break joined.map_err(|error| crate::CameraError::Backend { backend: "actor", message: format!("actor task failed: {error}") }).and_then(|result| result),
+                            _ = cancellation.cancelled() => {
+                                actor_task.abort();
+                                let _ = actor_task.await;
+                                break Ok(());
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                        }
+                    };
+                    if let Ok(mut actors) = self.actors.write() {
+                        actors.remove(&camera.id);
+                    }
+                    if let Ok(mut sessions) = self.session_cancellations.write() {
+                        sessions.remove(&camera.id);
+                    }
+                    if cancellation.is_cancelled() {
+                        return;
+                    }
+                    if let Err(error) = result {
+                        let _ = self.registry.update(
+                            &camera.id,
+                            generation,
+                            CameraConnectionState::Backoff,
+                            None,
+                            Some(status_error(&error)),
+                            chrono::Utc::now(),
+                        );
+                    }
+                }
+                Err(error) => {
+                    let _ = self.registry.update(
+                        &camera.id,
+                        generation,
+                        CameraConnectionState::Backoff,
+                        None,
+                        Some(status_error(&error)),
+                        chrono::Utc::now(),
+                    );
+                }
+            }
+            self.sleep_backoff(&camera.id, attempt, retry_class, &cancellation)
+                .await;
+            attempt = attempt.saturating_add(1);
+        }
+    }
+
+    async fn sleep_backoff(
+        &self,
+        instance: &str,
+        attempt: u32,
+        retry_class: crate::supervisor::RetryClass,
+        cancellation: &CancellationToken,
+    ) {
+        let config = match self.config_snapshot() {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::error!(instance, error = %error, "camera supervisor cannot load reconnect policy");
+                return;
+            }
+        };
+        let policy = match crate::supervisor::BackoffPolicy::new(
+            Duration::from_millis(config.global.timeouts.reconnect_backoff_min_ms),
+            Duration::from_millis(config.global.timeouts.reconnect_backoff_max_ms),
+        ) {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::error!(error = %error, "validated reconnect policy became invalid");
+                return;
+            }
+        };
+        let delay = policy.delay(instance, 1, retry_class, attempt);
+        tokio::select! {
+            _ = cancellation.cancelled() => {}
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+
+    async fn handle_deferred_capture(
+        &self,
+        request: Message,
+        deferred: DeferredReplyRegistry,
+    ) -> CommandOutcome {
+        let config = match self.config_snapshot() {
+            Ok(config) => config,
+            Err(error) => return CommandOutcome::ImmediateError(command_error(&error)),
+        };
+        let body: Result<CaptureRequest> = commands::parse_closed(request.body.clone());
+        let body = match body.and_then(|body| {
+            body.validate(config.global.limits.max_metadata_bytes)?;
+            Ok(body)
+        }) {
+            Ok(body) => body,
+            Err(error) => return CommandOutcome::ImmediateError(command_error(&error)),
+        };
+        let token = match deferred.defer(
+            &request,
+            Duration::from_millis(config.global.timeouts.max_deferred_reply_lifetime_ms),
+        ) {
+            Ok(token) => token,
+            Err(error) => {
+                return CommandOutcome::ImmediateError(CommandError::new(
+                    crate::ErrorCode::ReplyRequired.as_str(),
+                    error.message,
+                ));
+            }
+        };
+        if token.activate().is_err() {
+            return CommandOutcome::ImmediateError(CommandError::new(
+                crate::ErrorCode::BackendError.as_str(),
+                "deferred reply could not be activated",
+            ));
+        }
+        let Some(runtime) = self.self_reference.get().and_then(Weak::upgrade) else {
+            return CommandOutcome::ImmediateError(CommandError::new(
+                crate::ErrorCode::ComponentStopping.as_str(),
+                "camera runtime is not available",
+            ));
+        };
+        let correlation_id = request.header.correlation_id.clone();
+        let request_uuid = request.header.uuid.clone();
+        let continuation_token = token.clone();
+        CommandOutcome::deferred_with_continuation(token, async move {
+            runtime
+                .accept_deferred_capture(body, correlation_id, request_uuid, continuation_token)
+                .await
+                .map_err(|error| command_error(&error))
+        })
+    }
+
+    async fn accept_deferred_capture(
+        &self,
+        body: CaptureRequest,
+        correlation_id: String,
+        request_uuid: String,
+        token: DeferredReplyToken,
+    ) -> Result<()> {
+        let config = self.config_snapshot()?;
+        let instance = self
+            .registry
+            .resolve_actuation_instance(body.instance.as_deref())?;
+        let request_id = body.request_id.clone();
+        let waiter_id = format!("wait_{}", uuid::Uuid::now_v7());
+        self.waiters.prepare(
+            instance.clone(),
+            request_id.clone(),
+            waiter_id.clone(),
+            token.clone(),
+            correlation_id.clone(),
+            request_uuid.clone(),
+        )?;
+        let accepted = self
+            .submit_capture(
+                instance.clone(),
+                request_id.clone(),
+                body.capture_profile,
+                body.timeout_ms,
+                body.metadata,
+                correlation_id.clone(),
+                "sb/capture",
+                crate::admission::CapturePriority::Direct,
+            )
+            .await?;
+        let record = match accepted {
+            crate::catalog::AcceptJobOutcome::Inserted(_) => return Ok(()),
+            crate::catalog::AcceptJobOutcome::Existing(record) => record,
+            crate::catalog::AcceptJobOutcome::Conflict => {
+                let _ = self.waiters.take_pending(&instance, &request_id);
+                return Err(crate::CameraError::rejected(
+                    crate::ErrorCode::IdempotencyConflict,
+                    "requestId was already used with different immutable capture arguments",
+                ));
+            }
+        };
+        let _ = self.waiters.take_pending(
+            &record.instance,
+            record.request_id.as_deref().unwrap_or_default(),
+        );
+        if let Some(terminal) = record.terminal_result {
+            token.settle_success(Some(terminal)).await.map_err(|_| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::BackendError,
+                    "deferred reply could not be settled",
+                )
+            })?;
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        self.catalog
+            .add_waiter(crate::catalog::WaiterRecord {
+                waiter_id: waiter_id.clone(),
+                capture_id: record.capture_id.clone(),
+                correlation_id,
+                request_uuid: Some(request_uuid),
+                expires_at_ms: now.saturating_add(
+                    i64::try_from(config.global.timeouts.max_deferred_reply_lifetime_ms)
+                        .unwrap_or(i64::MAX),
+                ),
+                created_at_ms: now,
+            })
+            .await?;
+        self.waiters
+            .register(record.capture_id.clone(), waiter_id, token.clone())?;
+        if let Some(terminal) = self
+            .catalog
+            .job(record.capture_id)
+            .await?
+            .and_then(|job| job.terminal_result)
+        {
+            token.settle_success(Some(terminal)).await.map_err(|_| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::BackendError,
+                    "deferred reply could not be settled",
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn handle_deferred_group_capture(
+        &self,
+        request: Message,
+        deferred: DeferredReplyRegistry,
+    ) -> CommandOutcome {
+        let config = match self.config_snapshot() {
+            Ok(config) => config,
+            Err(error) => return CommandOutcome::ImmediateError(command_error(&error)),
+        };
+        let body: Result<GroupCaptureRequest> = commands::parse_closed(request.body.clone());
+        let body = match body.and_then(|body| {
+            body.validate(
+                config.global.limits.max_cameras_per_group,
+                config.global.limits.max_metadata_bytes,
+            )?;
+            Ok(body)
+        }) {
+            Ok(body) => body,
+            Err(error) => return CommandOutcome::ImmediateError(command_error(&error)),
+        };
+        let token = match deferred.defer(
+            &request,
+            Duration::from_millis(config.global.timeouts.max_deferred_reply_lifetime_ms),
+        ) {
+            Ok(token) => token,
+            Err(error) => {
+                return CommandOutcome::ImmediateError(CommandError::new(
+                    crate::ErrorCode::ReplyRequired.as_str(),
+                    error.message,
+                ));
+            }
+        };
+        if token.activate().is_err() {
+            return CommandOutcome::ImmediateError(CommandError::new(
+                crate::ErrorCode::BackendError.as_str(),
+                "deferred reply could not be activated",
+            ));
+        }
+        let Some(runtime) = self.self_reference.get().and_then(Weak::upgrade) else {
+            return CommandOutcome::ImmediateError(CommandError::new(
+                crate::ErrorCode::ComponentStopping.as_str(),
+                "camera runtime is not available",
+            ));
+        };
+        let correlation_id = request.header.correlation_id.clone();
+        let continuation_token = token.clone();
+        CommandOutcome::deferred_with_continuation(token, async move {
+            runtime
+                .submit_group(
+                    body,
+                    correlation_id,
+                    crate::admission::CapturePriority::Direct,
+                    Some(continuation_token),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| command_error(&error))
+        })
+    }
+}
+
+#[async_trait]
+impl CameraCommandService for CameraRuntime {
+    async fn handle_camera_command(
+        &self,
+        verb: &'static str,
+        request: Message,
+        deferred: DeferredReplyRegistry,
+    ) -> CommandOutcome {
+        if self.reloading.load(Ordering::Acquire) {
+            return CommandOutcome::ImmediateError(CommandError::new(
+                crate::ErrorCode::CameraUnavailable.as_str(),
+                "the camera adapter is draining a configuration replacement",
+            ));
+        }
+        if verb == "sb/capture" {
+            return self.handle_deferred_capture(request, deferred).await;
+        }
+        if verb == "sb/capture-group" {
+            return self.handle_deferred_group_capture(request, deferred).await;
+        }
+        let config = match self.config_snapshot() {
+            Ok(config) => config,
+            Err(error) => return CommandOutcome::ImmediateError(command_error(&error)),
+        };
+        let outcome: Result<serde_json::Value> = async {
+            match verb {
+                "sb/list" => {
+                    let body: ListRequest = commands::parse_closed(request.body.clone())?;
+                    body.validate()?;
+                    let query = serde_json::json!({
+                        "includeCapabilities": body.include_capabilities,
+                        "includeUnconfigured": body.include_unconfigured,
+                    });
+                    let initial = if body.cursor.is_none() {
+                        let cameras =
+                            self.registry
+                                .snapshots(4_096)?
+                                .into_iter()
+                                .map(|snapshot| {
+                                    if body.include_capabilities {
+                                        serde_json::to_value(snapshot).map_err(crate::CameraError::from)
+                                    } else {
+                                        Ok(serde_json::json!({
+                                            "instance": snapshot.instance,
+                                            "enabled": snapshot.enabled,
+                                            "state": snapshot.state,
+                                            "backend": snapshot.backend,
+                                        }))
+                                    }
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                        let unconfigured = if body.include_unconfigured
+                            && config.global.discovery.report_unconfigured
+                        {
+                            self.unconfigured_discoveries(&config)?
+                        } else {
+                            Vec::new()
+                        };
+                        Some((cameras, unconfigured))
+                    } else {
+                        None
+                    };
+                    let (cameras, unconfigured, next_cursor) = self.cursors.list_page(
+                        &query,
+                        body.cursor.as_deref(),
+                        initial,
+                        usize::from(body.limit),
+                    )?;
+                    Ok(serde_json::json!({
+                        "cameras": cameras,
+                        "unconfigured": unconfigured,
+                        "nextCursor": next_cursor,
+                    }))
+                }
+                "sb/discover" => {
+                    let body: DiscoverRequest = commands::parse_closed(request.body.clone())?;
+                    self.discover(body).await
+                }
+                "sb/status" => {
+                    let body: StatusRequest = commands::parse_closed(request.body.clone())?;
+                    body.validate()?;
+                    match body.instance {
+                        Some(instance) => Ok(serde_json::to_value(self.registry.snapshot(&instance)?)?),
+                        None => Ok(serde_json::json!({ "cameras": self.registry.snapshots(1_000)? })),
+                    }
+                }
+                "sb/capture-submit" => {
+                    let body: CaptureRequest = commands::parse_closed(request.body.clone())?;
+                    body.validate(config.global.limits.max_metadata_bytes)?;
+                    let instance = self.registry.resolve_actuation_instance(body.instance.as_deref())?;
+                    let accepted = self.submit_capture(
+                        instance,
+                        body.request_id,
+                        body.capture_profile,
+                        body.timeout_ms,
+                        body.metadata,
+                        request.header.correlation_id.clone(),
+                        verb,
+                        crate::admission::CapturePriority::Submitted,
+                    ).await?;
+                    let record = match accepted {
+                        crate::catalog::AcceptJobOutcome::Inserted(record)
+                        | crate::catalog::AcceptJobOutcome::Existing(record) => record,
+                        crate::catalog::AcceptJobOutcome::Conflict => return Err(crate::CameraError::rejected(
+                            crate::ErrorCode::IdempotencyConflict,
+                            "requestId was already used with different immutable capture arguments",
+                        )),
+                    };
+                    Ok(serde_json::json!({
+                        "captureId": record.capture_id,
+                        "state": record.state,
+                        "acceptedAt": chrono::DateTime::from_timestamp_millis(record.accepted_at_ms),
+                        "statusVerb": "sb/capture-status",
+                    }))
+                }
+                "sb/capture-group-submit" => {
+                    let body: GroupCaptureRequest = commands::parse_closed(request.body.clone())?;
+                    let group = self.submit_group(
+                        body,
+                        request.header.correlation_id.clone(),
+                        crate::admission::CapturePriority::Submitted,
+                        None,
+                    ).await?;
+                    Ok(serde_json::json!({
+                        "captureGroupId": group.group_id,
+                        "state": group.state,
+                        "members": group.members.iter().map(|member| serde_json::json!({
+                            "instance": member.instance,
+                            "captureId": member.capture_id,
+                            "state": member.state,
+                        })).collect::<Vec<_>>(),
+                    }))
+                }
+                "sb/capture-status" => {
+                    let body: CaptureStatusRequest = commands::parse_closed(request.body.clone())?;
+                    let limit = body.limit;
+                    let cursor = body.cursor.clone();
+                    match body.validate()? {
+                        CaptureStatusMode::Capture => {
+                            let id = body.capture_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::InvalidRequest, "captureId is required"))?;
+                            let job = self.catalog.job(id).await?.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::CaptureNotFound, "capture was not found"))?;
+                            Ok(job_status_json(&job))
+                        }
+                        CaptureStatusMode::Group => {
+                            let id = body.capture_group_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::InvalidRequest, "captureGroupId is required"))?;
+                            let group = self.catalog.group(id).await?.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::CaptureNotFound, "capture group was not found"))?;
+                            self.group_status_page(group, usize::from(limit), cursor.as_deref())
+                        }
+                        CaptureStatusMode::CameraRequest => {
+                            let instance = body.instance.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::InvalidRequest, "instance is required"))?;
+                            let request_id = body.request_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::InvalidRequest, "requestId is required"))?;
+                            let job = self.catalog.job_by_ledger(crate::catalog::LedgerKey::new(instance, "sb/capture", request_id)?).await?
+                                .ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::CaptureNotFound, "capture was not found"))?;
+                            Ok(job_status_json(&job))
+                        }
+                        CaptureStatusMode::GroupRequest => {
+                            let request_id = body.request_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::InvalidRequest, "requestId is required"))?;
+                            let group = self.catalog.group_by_ledger(crate::catalog::LedgerKey::new("main", "sb/capture-group", request_id)?).await?
+                                .ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::CaptureNotFound, "capture group was not found"))?;
+                            self.group_status_page(group, usize::from(limit), cursor.as_deref())
+                        }
+                        CaptureStatusMode::List => {
+                            self.jobs_status_page(&body).await
+                        }
+                    }
+                }
+                "sb/capture-cancel" => {
+                    let body: CancelRequest = commands::parse_closed(request.body.clone())?;
+                    self.cancel_capture(body).await
+                }
+                "sb/reconnect" => {
+                    let body: ReconnectRequest = commands::parse_closed(request.body.clone())?;
+                    self.reconnect(body).await
+                }
+                "sb/ptz" => {
+                    let body: PtzCommandRequest = commands::parse_closed(request.body.clone())?;
+                    self.perform_ptz(body).await
+                }
+                "sb/ptz-presets" => {
+                    let body: PtzPresetsRequest = commands::parse_closed(request.body.clone())?;
+                    self.perform_presets(body).await
+                }
+                _ => Err(crate::CameraError::rejected(
+                    crate::ErrorCode::UnsupportedCapability,
+                    "unsupported camera command verb",
+                )),
+            }
+        }.await;
+        match outcome {
+            Ok(value) => CommandOutcome::ImmediateSuccess(Some(value)),
+            Err(error) => CommandOutcome::ImmediateError(command_error(&error)),
+        }
+    }
+}
+
+/// Persistent bounded descriptor queue owned by a camera supervisor rather than a connection.
+///
+/// This closes the reconnect race in which a `waitUntilDeadline` or `queue` capture is accepted
+/// while its camera has no session.  A fresh actor drains descriptors only after it is online;
+/// terminal-deadline cancellation is observed and discarded before it can consume future queue
+/// capacity.
+pub struct SupervisorDispatcher {
+    inner: Arc<SupervisorDispatcherInner>,
+}
+
+struct SupervisorDispatcherInner {
+    instance: String,
+    maximum: usize,
+    used: AtomicUsize,
+    queue: Mutex<VecDeque<CaptureDescriptor>>,
+}
+
+impl SupervisorDispatcher {
+    fn new(instance: String, maximum: usize) -> Result<Self> {
+        if instance.is_empty() || maximum == 0 {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::InvalidRequest,
+                "supervisor dispatcher requires a camera instance and positive queue capacity",
+            ));
+        }
+        Ok(Self {
+            inner: Arc::new(SupervisorDispatcherInner {
+                instance,
+                maximum,
+                used: AtomicUsize::new(0),
+                queue: Mutex::new(VecDeque::new()),
+            }),
+        })
+    }
+
+    /// Forwards as many durable descriptors as the connected actor can reserve right now.
+    /// A full actor is normal; the descriptor remains owned by the supervisor and is retried
+    /// without ever re-running catalog acceptance.
+    fn drain_into(&self, actor: &CameraActorHandle) -> Result<()> {
+        let mut queue = self.inner.queue.lock().map_err(|_| {
+            crate::CameraError::Catalog("supervisor capture queue is unavailable".to_string())
+        })?;
+        queue.retain(|descriptor| {
+            let keep = !descriptor.cancellation().is_cancelled();
+            if !keep {
+                self.inner.used.fetch_sub(1, Ordering::AcqRel);
+            }
+            keep
+        });
+        loop {
+            let Some(descriptor) = queue.pop_front() else {
+                return Ok(());
+            };
+            let reservation = match actor.reserve() {
+                Ok(reservation) => reservation,
+                Err(error) if error.code() == crate::ErrorCode::QueueFull => {
+                    queue.push_front(descriptor);
+                    return Ok(());
+                }
+                Err(error) => {
+                    queue.push_front(descriptor);
+                    return Err(error);
+                }
+            };
+            reservation.commit(descriptor)?;
+            self.inner.used.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn discard_cancelled(&self) -> Result<()> {
+        let mut queue = self.inner.queue.lock().map_err(|_| {
+            crate::CameraError::Catalog("supervisor capture queue is unavailable".to_string())
+        })?;
+        queue.retain(|descriptor| {
+            let keep = !descriptor.cancellation().is_cancelled();
+            if !keep {
+                self.inner.used.fetch_sub(1, Ordering::AcqRel);
+            }
+            keep
+        });
+        Ok(())
+    }
+}
+
+impl CaptureDispatcher for SupervisorDispatcher {
+    fn reserve(&self) -> Result<Box<dyn DispatchReservation>> {
+        self.discard_cancelled()?;
+        self.inner
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                (used < self.inner.maximum).then_some(used + 1)
+            })
+            .map_err(|_| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::QueueFull,
+                    "camera capture queue is full",
+                )
+            })?;
+        Ok(Box::new(SupervisorReservation {
+            dispatcher: Arc::clone(&self.inner),
+            committed: false,
+        }))
+    }
+}
+
+struct SupervisorReservation {
+    dispatcher: Arc<SupervisorDispatcherInner>,
+    committed: bool,
+}
+
+impl DispatchReservation for SupervisorReservation {
+    fn commit(mut self: Box<Self>, descriptor: CaptureDescriptor) -> Result<()> {
+        if descriptor.instance() != self.dispatcher.instance {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::UnknownInstance,
+                "capture descriptor was dispatched to the wrong camera supervisor",
+            ));
+        }
+        self.dispatcher
+            .queue
+            .lock()
+            .map_err(|_| {
+                crate::CameraError::Catalog("supervisor capture queue is unavailable".to_string())
+            })?
+            .push_back(descriptor);
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for SupervisorReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.dispatcher.used.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn status_error(error: &crate::CameraError) -> CameraStatusError {
+    CameraStatusError {
+        code: error.code().as_str().to_string(),
+        message: command_error(error).message,
+        observed_at: chrono::Utc::now(),
+    }
+}
+
+fn job_status_json(record: &crate::catalog::JobRecord) -> serde_json::Value {
+    serde_json::json!({
+        "captureId": record.capture_id,
+        "instance": record.instance,
+        "state": record.state,
+        "acceptedAtMs": record.accepted_at_ms,
+        "terminalAtMs": record.terminal_at_ms,
+        "captureGroupId": record.group_id,
+        "errorCode": record.error_code,
+        "errorMessage": record.error_message,
+        "result": record.terminal_result,
+    })
+}
+
+/// The public aggregate keeps the design's `COMPLETED`/`PARTIAL` distinction even though the
+/// durable catalog deliberately stores only the shared job terminal state vocabulary. Member
+/// terminal bodies are reused verbatim so a direct group reply cannot diverge from durable status.
+fn group_terminal_json(record: &crate::catalog::GroupRecord) -> serde_json::Value {
+    let succeeded = record
+        .members
+        .iter()
+        .filter(|member| member.state == crate::model::JobState::Succeeded)
+        .count();
+    let state = if succeeded == record.members.len() {
+        "COMPLETED"
+    } else if succeeded == 0 {
+        "FAILED"
+    } else {
+        "PARTIAL"
+    };
+    let members = record
+        .members
+        .iter()
+        .map(|member| {
+            member
+                .terminal_result
+                .clone()
+                .unwrap_or_else(|| job_status_json(member))
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "captureGroupId": record.group_id,
+        "requestId": record.request_id,
+        "state": state,
+        "members": members,
+    })
+}
+
+/// All application command verbs required by the binding design.
+pub const CAMERA_COMMAND_VERBS: [&str; 12] = [
+    "sb/list",
+    "sb/discover",
+    "sb/status",
+    "sb/capture",
+    "sb/capture-submit",
+    "sb/capture-group",
+    "sb/capture-group-submit",
+    "sb/capture-status",
+    "sb/capture-cancel",
+    "sb/reconnect",
+    "sb/ptz",
+    "sb/ptz-presets",
+];
+
+/// Performs the side-effect-free adapter half of core candidate validation.
+///
+/// The core has already parsed the candidate into a JSON document before this callback runs.
+/// This second parse applies the camera adapter's closed backend schemas and its deliberately
+/// different initial/reload policy without resolving credentials, opening files, or touching
+/// sessions. Diagnostics intentionally remain generic: candidate documents can contain secret
+/// references and a validator error is surfaced outside the adapter's redaction boundary.
+pub fn validate_configuration_candidate(
+    candidate: serde_json::Value,
+    redacted_current: Option<serde_json::Value>,
+    phase: ConfigurationValidationPhase,
+) -> edgecommons::Result<ConfigurationValidationResult> {
+    validate_configuration_candidate_with_credentials(
+        candidate,
+        redacted_current,
+        phase,
+        // This compatibility entry point cannot observe the live component services. The process
+        // entry point uses the credential-aware variant below once the initial core generation
+        // has constructed its immutable credential service.
+        true,
+    )
+}
+
+/// Performs candidate validation with the availability of the immutable credential service.
+///
+/// A core credential service is constructed only for the initial generation. A reload must
+/// therefore reject an ONVIF secret reference when that service was absent at startup, rather
+/// than accepting the generation and discovering the failure after core configuration committed.
+pub fn validate_configuration_candidate_with_credentials(
+    candidate: serde_json::Value,
+    redacted_current: Option<serde_json::Value>,
+    phase: ConfigurationValidationPhase,
+    credential_service_available: bool,
+) -> edgecommons::Result<ConfigurationValidationResult> {
+    let core = match Config::from_value(COMPONENT_NAME, "candidate", candidate) {
+        Ok(config) => config,
+        Err(_) => {
+            return Ok(ConfigurationValidationResult::reject(
+                "CAMERA_CONFIG_INVALID",
+                "camera adapter configuration is invalid",
+            ));
+        }
+    };
+    let result = match phase {
+        ConfigurationValidationPhase::Initial => {
+            AdapterConfig::from_core_initial(&core).map(|_| ())
+        }
+        ConfigurationValidationPhase::Reload => (|| -> Result<()> {
+            let replacement = AdapterConfig::from_core_reload(&core)?;
+            if !credential_service_available
+                && replacement.instances.iter().any(|camera| {
+                    let crate::config::BackendConfig::OnvifRtsp(onvif) = &camera.backend else {
+                        return false;
+                    };
+                    onvif.credentials.is_some() || onvif.tls.ca.is_some()
+                })
+            {
+                return Err(crate::CameraError::Config {
+                    path: "component.instances[].backend".to_string(),
+                    message: "ONVIF secret references require credentials configured at component startup"
+                        .to_string(),
+                });
+            }
+            if let Some(current) = redacted_current {
+                let current =
+                    Config::from_value(COMPONENT_NAME, "current", current).map_err(|_| {
+                        crate::CameraError::Config {
+                            path: "component".to_string(),
+                            message: "current configuration could not be compared safely"
+                                .to_string(),
+                        }
+                    })?;
+                let current = AdapterConfig::from_core_reload(&current)?;
+                if current.global.state.directory != replacement.global.state.directory
+                    || current.global.output.root_directory
+                        != replacement.global.output.root_directory
+                    || current.global.output.directory_mode
+                        != replacement.global.output.directory_mode
+                    || current.global.output.file_mode != replacement.global.output.file_mode
+                {
+                    return Err(crate::CameraError::Config {
+                        path: "component.global".to_string(),
+                        message: "camera state/output root security settings require restart"
+                            .to_string(),
+                    });
+                }
+            }
+            Ok(())
+        })(),
+    };
+    match result {
+        Ok(()) => Ok(ConfigurationValidationResult::accept()),
+        Err(_) => Ok(ConfigurationValidationResult::reject(
+            "CAMERA_CONFIG_INVALID",
+            "camera adapter configuration is invalid",
+        )),
+    }
+}
+
+/// Converts one adapter error into the core command-reply shape without creating an alternate
+/// error vocabulary at the command boundary.
+#[must_use]
+pub fn command_error(error: &crate::CameraError) -> CommandError {
+    let message: String = error
+        .to_string()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(256)
+        .collect();
+    CommandError::new(error.code().as_str(), message)
+}
+
+/// Durable, protocol-neutral objects which must be valid before camera supervisor creation.
+///
+/// The resources are intentionally assembled before any backend connects. A connection failure
+/// is an ordinary per-camera lifecycle event; a state, catalog, or output failure is a startup
+/// failure and must keep component readiness false.
+pub struct StartupResources {
+    /// Deterministically resolved durable state directory.
+    pub state_directory: PathBuf,
+    /// Verified SQLite catalog and exclusive state-directory lock.
+    pub catalog: Catalog,
+    /// Capability-scoped output root.
+    pub storage: StorageRoot,
+    /// Bounded global capture/encoder/writer admission controls.
+    pub admission: AdmissionController,
+    /// Compact configured roster, including disabled cameras.
+    pub registry: Arc<CameraRegistry>,
+}
+
+/// Resolves and validates all startup resources that are independent of live camera sessions.
+///
+/// This function is deliberately all-or-nothing. It makes the adapter's initial-ready boundary
+/// testable and prevents an actor from being created before exclusive state ownership is known.
+pub async fn prepare_startup_resources(
+    config: &AdapterConfig,
+    platform: Platform,
+) -> Result<StartupResources> {
+    let state_directory =
+        resolve_state_directory(platform, config.global.state.directory.as_deref())?;
+    create_state_directory(&state_directory)?;
+
+    let storage = StorageRoot::open(&config.global.output)?;
+    storage.check_storage_pressure(StorageReservation {
+        current_bytes: config.global.limits.max_frame_bytes_per_camera,
+        other_bytes: 0,
+    })?;
+
+    let catalog = Catalog::open(CatalogOptions::new(state_directory.clone())).await?;
+    let health = catalog.health().await?;
+    if !health.integrity_ok
+        || !health.foreign_keys
+        || !health.journal_mode.eq_ignore_ascii_case("wal")
+    {
+        return Err(crate::CameraError::Catalog(
+            "catalog startup verification did not confirm required durability settings".to_string(),
+        ));
+    }
+    let admission = AdmissionController::new(
+        &config.global.limits,
+        &config.global.output,
+        Arc::new(FilesystemSpaceProbe::default()),
+    )?;
+    let registry = Arc::new(CameraRegistry::new(config)?);
+    Ok(StartupResources {
+        state_directory,
+        catalog,
+        storage,
+        admission,
+        registry,
+    })
+}
+
+fn create_state_directory(directory: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(directory).map_err(|error| {
+        crate::CameraError::Storage(format!(
+            "failed to create configured durable state directory: {error}"
+        ))
+    })?;
+    let metadata = std::fs::metadata(directory)?;
+    if !metadata.is_dir() {
+        return Err(crate::CameraError::Storage(
+            "configured durable state path is not a directory".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                crate::CameraError::Storage(format!(
+                    "failed to restrict durable state directory permissions: {error}"
+                ))
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Runtime command implementation installed only after every startup gate has passed.
+#[async_trait]
+pub trait CameraCommandService: Send + Sync + 'static {
+    /// Handles one full core command envelope and selects immediate or deferred settlement.
+    async fn handle_camera_command(
+        &self,
+        verb: &'static str,
+        request: Message,
+        deferred: DeferredReplyRegistry,
+    ) -> CommandOutcome;
+}
+
+type AppFacadeFactory = dyn Fn(&str) -> edgecommons::Result<Arc<AppFacade>> + Send + Sync;
+type EventsFacadeFactory = dyn Fn(&str) -> edgecommons::Result<EventsFacade> + Send + Sync;
+
+/// Bridges the core's post-commit configuration notification to one fully serialized adapter
+/// reload.  Candidate vetoing is still performed by [`validate_configuration_candidate`] before
+/// the core replaces its snapshot; this listener only applies a generation already accepted by
+/// that gate.
+pub struct RuntimeConfigListener {
+    runtime: Weak<CameraRuntime>,
+    app_factory: Arc<AppFacadeFactory>,
+    events_factory: Arc<EventsFacadeFactory>,
+}
+
+impl RuntimeConfigListener {
+    /// Creates a listener whose factory obtains instance-scoped `app()` facades from the current
+    /// core snapshot, including cameras added by a later reload.
+    #[must_use]
+    pub fn new(
+        runtime: Weak<CameraRuntime>,
+        app_factory: Arc<AppFacadeFactory>,
+        events_factory: Arc<EventsFacadeFactory>,
+    ) -> Self {
+        Self {
+            runtime,
+            app_factory,
+            events_factory,
+        }
+    }
+}
+
+#[async_trait]
+impl ConfigurationChangeListener for RuntimeConfigListener {
+    async fn on_configuration_change(&self, config: Arc<Config>) -> bool {
+        let Some(runtime) = self.runtime.upgrade() else {
+            return true;
+        };
+        let replacement = match AdapterConfig::from_core_reload(&config) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::error!(error = %error, "accepted core configuration was invalid for camera runtime");
+                return false;
+            }
+        };
+        let mut apps = BTreeMap::new();
+        let mut events = BTreeMap::new();
+        for camera in &replacement.instances {
+            match (self.app_factory)(&camera.id) {
+                Ok(app) => {
+                    apps.insert(camera.id.clone(), app);
+                }
+                Err(error) => {
+                    tracing::error!(instance = %camera.id, error = %error, "could not construct application facade for reloaded camera");
+                    return false;
+                }
+            }
+            match (self.events_factory)(&camera.id) {
+                Ok(event) => {
+                    events.insert(camera.id.clone(), event);
+                }
+                Err(error) => {
+                    tracing::error!(instance = %camera.id, error = %error, "could not construct events facade for reloaded camera");
+                    return false;
+                }
+            }
+        }
+        if let Err(error) = runtime
+            .apply_reloaded_config(replacement, apps, events)
+            .await
+        {
+            tracing::error!(error = %error, "camera runtime rejected an accepted configuration generation");
+            return false;
+        }
+        true
+    }
+}
+
+/// A pre-registered, swap-once command router.
+///
+/// The router is installed into the core inbox before its acknowledged subscription begins. It
+/// then receives its runtime delegate exactly once. This ensures an early request can never
+/// bypass durable-startup gates or observe a partially initialized map of camera actors.
+pub struct RuntimeCommandRouter {
+    service: RwLock<Option<Arc<dyn CameraCommandService>>>,
+    stopping: AtomicBool,
+}
+
+impl RuntimeCommandRouter {
+    /// Creates an empty router that rejects work until a complete runtime is installed.
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            service: RwLock::new(None),
+            stopping: AtomicBool::new(false),
+        })
+    }
+
+    /// Registers every required adapter verb before the core subscribes to the command filter.
+    ///
+    /// A registration failure is fatal to component construction; a partial command surface is
+    /// never exposed as active.
+    pub fn register(self: &Arc<Self>, inbox: &CommandInbox) -> edgecommons::Result<()> {
+        for verb in CAMERA_COMMAND_VERBS {
+            let router = Arc::clone(self);
+            inbox.register_outcome(
+                verb,
+                outcome_handler(move |request, deferred| {
+                    let router = Arc::clone(&router);
+                    async move { router.dispatch(verb, request, deferred).await }
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Makes one fully initialized runtime visible to the already-active command plane.
+    ///
+    /// Replacing a live delegate would make a reload command race the old/new durable state;
+    /// reload is coordinated inside the delegate instead.
+    pub fn install(&self, service: Arc<dyn CameraCommandService>) -> Result<()> {
+        let mut slot = self.service.write().map_err(|_| {
+            crate::CameraError::Catalog("command router lock is unavailable".to_string())
+        })?;
+        if slot.is_some() {
+            return Err(crate::CameraError::Catalog(
+                "camera command runtime was installed more than once".to_string(),
+            ));
+        }
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::ComponentStopping,
+                "component shutdown began before command runtime installation",
+            ));
+        }
+        *slot = Some(service);
+        Ok(())
+    }
+
+    /// Permanently stops new command delegation before runtime shutdown starts.
+    pub fn begin_shutdown(&self) {
+        self.stopping.store(true, Ordering::Release);
+    }
+
+    async fn dispatch(
+        &self,
+        verb: &'static str,
+        request: Message,
+        deferred: DeferredReplyRegistry,
+    ) -> CommandOutcome {
+        if self.stopping.load(Ordering::Acquire) {
+            return CommandOutcome::ImmediateError(CommandError::new(
+                "COMPONENT_STOPPING",
+                "the camera adapter is shutting down",
+            ));
+        }
+        let service = match self.service.read() {
+            Ok(slot) => slot.clone(),
+            Err(_) => {
+                return CommandOutcome::ImmediateError(CommandError::new(
+                    "BACKEND_ERROR",
+                    "the camera command router is unavailable",
+                ));
+            }
+        };
+        match service {
+            Some(service) => service.handle_camera_command(verb, request, deferred).await,
+            None => CommandOutcome::ImmediateError(CommandError::new(
+                "CAMERA_UNAVAILABLE",
+                "the camera adapter is still starting",
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::json;
+
+    use super::*;
+
+    struct CountingService(AtomicUsize);
+
+    #[async_trait]
+    impl CameraCommandService for CountingService {
+        async fn handle_camera_command(
+            &self,
+            verb: &'static str,
+            _request: Message,
+            _deferred: DeferredReplyRegistry,
+        ) -> CommandOutcome {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            CommandOutcome::ImmediateSuccess(Some(json!({ "verb": verb })))
+        }
+    }
+
+    // Full inbox activation is covered by the core contract suite. This focused test locks the
+    // router's startup/shutdown hand-off without needing a broker-backed Message fixture.
+    #[test]
+    fn install_is_single_assignment_and_shutdown_is_latched() {
+        let router = RuntimeCommandRouter::new();
+        router
+            .install(Arc::new(CountingService(AtomicUsize::new(0))))
+            .unwrap();
+        assert!(
+            router
+                .install(Arc::new(CountingService(AtomicUsize::new(0))))
+                .is_err()
+        );
+        router.begin_shutdown();
+        assert!(
+            router
+                .install(Arc::new(CountingService(AtomicUsize::new(0))))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn command_errors_keep_the_adapter_catalog_code_and_bound_the_detail() {
+        let error = crate::CameraError::rejected(
+            crate::ErrorCode::QueueFull,
+            format!("queue unavailable\n{}", "x".repeat(512)),
+        );
+        let command = command_error(&error);
+        assert_eq!(command.code, "QUEUE_FULL");
+        assert!(!command.message.contains('\n'));
+        assert!(command.message.len() <= 256);
+    }
+
+    #[test]
+    fn retained_snapshot_cursor_is_opaque_query_bound_and_stable() {
+        let cursors = CursorStore::default();
+        let query = json!({ "includeCapabilities": true, "includeUnconfigured": false });
+        let values = vec![json!({ "instance": "a" }), json!({ "instance": "b" })];
+        let (first, cursor, _) = cursors
+            .snapshot_page("list", &query, None, Some(values), None, 1)
+            .unwrap();
+        assert_eq!(first, vec![json!({ "instance": "a" })]);
+        let cursor = cursor.expect("a second page must retain a cursor");
+        assert!(cursor.starts_with("cur_"));
+
+        let (second, final_cursor, _) = cursors
+            .snapshot_page("list", &query, Some(&cursor), None, None, 1)
+            .unwrap();
+        assert_eq!(second, vec![json!({ "instance": "b" })]);
+        assert!(final_cursor.is_none());
+
+        let changed_query = json!({ "includeCapabilities": false, "includeUnconfigured": false });
+        assert_eq!(
+            cursors
+                .snapshot_page("list", &changed_query, Some(&cursor), None, None, 1)
+                .unwrap_err()
+                .code(),
+            crate::ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn list_cursor_retains_configured_and_unconfigured_pages_together() {
+        let cursors = CursorStore::default();
+        let query = json!({ "includeCapabilities": false, "includeUnconfigured": true });
+        let (cameras, unconfigured, next) = cursors
+            .list_page(
+                &query,
+                None,
+                Some((
+                    vec![json!({ "instance": "camera-a" }), json!({ "instance": "camera-b" })],
+                    vec![json!({ "backend": "onvif-rtsp", "selector": { "endpointReference": "urn:camera:new" } })],
+                )),
+                2,
+            )
+            .unwrap();
+        assert_eq!(cameras.len(), 2);
+        assert!(unconfigured.is_empty());
+        let next = next.expect("unconfigured observation must remain in the same snapshot");
+
+        let (cameras, unconfigured, final_cursor) =
+            cursors.list_page(&query, Some(&next), None, 2).unwrap();
+        assert!(cameras.is_empty());
+        assert_eq!(unconfigured.len(), 1);
+        assert!(final_cursor.is_none());
+        assert!(
+            cursors
+                .list_page(
+                    &json!({ "includeCapabilities": false, "includeUnconfigured": false }),
+                    Some(&next),
+                    None,
+                    2,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn retained_discovery_hides_only_matching_stable_configured_selectors() {
+        let camera = crate::config::CameraConfig {
+            id: "camera-a".to_string(),
+            enabled: true,
+            resource_group: None,
+            backend: crate::config::BackendConfig::GenicamAravis(
+                crate::config::GenicamBackendConfig {
+                    selector: crate::config::GenicamSelector {
+                        serial: Some("SN-42".to_string()),
+                        mac: None,
+                        device_id: None,
+                        ip: None,
+                    },
+                    transport: crate::config::GenicamTransport::Auto,
+                    interface: None,
+                    packet_size: None,
+                    packet_delay_ns: None,
+                    buffer_count: None,
+                    feature_overrides: BTreeMap::new(),
+                },
+            ),
+            default_capture_profile: "main".to_string(),
+            capture_profiles: BTreeMap::new(),
+            schedules: Vec::new(),
+            ptz: crate::config::PtzConfig::default(),
+        };
+        let matching = DiscoveryCandidate {
+            backend: crate::model::BackendKind::GenicamAravis,
+            selector: json!({ "serial": "SN-42" }),
+            vendor: None,
+            model: None,
+            capabilities: json!({}),
+        };
+        let other = DiscoveryCandidate {
+            selector: json!({ "serial": "SN-43" }),
+            ..matching.clone()
+        };
+        assert!(candidate_is_configured(
+            &matching,
+            std::slice::from_ref(&camera)
+        ));
+        assert!(!candidate_is_configured(&other, &[camera]));
+    }
+
+    #[test]
+    fn retained_cursor_expiry_and_kind_confusion_fail_closed() {
+        let cursors = CursorStore::default();
+        let query = json!({ "instance": "camera-a" });
+        let (_, cursor, _) = cursors
+            .snapshot_page(
+                "ptz-presets",
+                &query,
+                None,
+                Some(vec![json!({ "token": "one" }), json!({ "token": "two" })]),
+                None,
+                1,
+            )
+            .unwrap();
+        let cursor = cursor.expect("a second page must retain a cursor");
+        assert!(
+            cursors
+                .snapshot_page("list", &query, Some(&cursor), None, None, 1)
+                .is_err()
+        );
+        {
+            let mut entries = cursors.lock().unwrap();
+            let entry = entries.entries.get_mut(&cursor).unwrap();
+            entry.expires_at = std::time::Instant::now() - Duration::from_secs(1);
+        }
+        assert!(
+            cursors
+                .snapshot_page("ptz-presets", &query, Some(&cursor), None, None, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn job_cursor_binds_filters_and_preserves_typed_tuple() {
+        let cursors = CursorStore::default();
+        let query = json!({ "instance": "camera-a", "states": ["FAILED"] });
+        let cursor = cursors
+            .next_job_cursor(&query, (1234, "cap_1".to_string()))
+            .unwrap();
+        assert_eq!(
+            cursors.job_before(&query, Some(&cursor)).unwrap(),
+            Some((1234, "cap_1".to_string()))
+        );
+        assert!(
+            cursors
+                .job_before(
+                    &json!({ "instance": "camera-b", "states": ["FAILED"] }),
+                    Some(&cursor)
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn delayed_outbox_alarm_transitions_once_and_keeps_context_bounded() {
+        let mut state = OutboxAlarmState::default();
+        let delayed = OutboxPressure {
+            pending: 101,
+            oldest_age_ms: 61_000,
+            max_attempts: 4,
+            delayed: true,
+            escalated: false,
+            last_error: Some("transport confirmation failed or remained ambiguous".to_string()),
+        };
+        let Some(OutboxAlarmTransition::Raise(context)) = state.transition(&delayed) else {
+            panic!("a delayed outbox must raise exactly one alarm");
+        };
+        assert_eq!(context["pending"], 101);
+        assert_eq!(context["oldestAgeMs"], 61_000);
+        assert_eq!(context["maxAttempts"], 4);
+        assert_eq!(
+            context["lastError"],
+            "transport confirmation failed or remained ambiguous"
+        );
+        assert!(state.transition(&delayed).is_none());
+
+        let cleared = OutboxPressure::default();
+        let Some(OutboxAlarmTransition::Clear(context)) = state.transition(&cleared) else {
+            panic!("a recovered outbox must clear its stateful alarm");
+        };
+        assert_eq!(
+            context,
+            json!({
+                "pending": 0,
+                "oldestAgeMs": 0,
+                "maxAttempts": 0,
+            })
+        );
+        assert!(state.transition(&cleared).is_none());
+    }
+
+    #[test]
+    fn storage_low_alarm_is_deduplicated_and_clears_only_after_every_root_recovers() {
+        let pressured_output = StoragePressureSnapshot {
+            output: RootPressure {
+                root: PathBuf::from("/configured/output"),
+                free_bytes: Some(99),
+                free_percent: Some(9),
+                pressured: true,
+                readable: true,
+            },
+            state: RootPressure {
+                root: PathBuf::from("/configured/state"),
+                free_bytes: Some(900),
+                free_percent: Some(90),
+                pressured: false,
+                readable: true,
+            },
+        };
+        let mut alarms = StorageAlarmState::default();
+        let Some(StorageAlarmTransition::Raise(context)) = alarms.transition(&pressured_output)
+        else {
+            panic!("a configured output floor violation must raise storage-low");
+        };
+        assert_eq!(context.root, "/configured/output");
+        assert_eq!(context.free_bytes, Some(99));
+        assert_eq!(context.free_percent, Some(9));
+        assert!(alarms.transition(&pressured_output).is_none());
+
+        let recovered = StoragePressureSnapshot {
+            output: RootPressure {
+                free_bytes: Some(900),
+                free_percent: Some(90),
+                pressured: false,
+                ..pressured_output.output.clone()
+            },
+            state: pressured_output.state.clone(),
+        };
+        let Some(StorageAlarmTransition::Clear(context)) = alarms.transition(&recovered) else {
+            panic!("the stateful storage-low condition must clear after both roots recover");
+        };
+        assert_eq!(context.root, "/configured/output");
+        assert!(alarms.transition(&recovered).is_none());
+    }
+
+    #[test]
+    fn outbox_recovery_cannot_make_readiness_true_before_startup_or_after_shutdown() {
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&updates);
+        let readiness = RuntimeReadiness::new(Arc::new(move |ready| {
+            recorded.lock().unwrap().push(ready);
+        }));
+
+        readiness.set_outbox_available(false);
+        readiness.set_outbox_available(true);
+        assert_eq!(*updates.lock().unwrap(), vec![false, false]);
+
+        readiness.complete_startup();
+        readiness.begin_shutdown();
+        readiness.set_outbox_available(false);
+        readiness.set_outbox_available(true);
+        assert_eq!(
+            *updates.lock().unwrap(),
+            vec![false, false, true, false, false, false]
+        );
+    }
+
+    #[test]
+    fn catalog_and_outbox_durability_are_independent_readiness_gates() {
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&updates);
+        let readiness = RuntimeReadiness::new(Arc::new(move |ready| {
+            recorded.lock().unwrap().push(ready);
+        }));
+
+        readiness.complete_startup();
+        readiness.set_catalog_available(false);
+        readiness.set_outbox_available(false);
+        readiness.set_catalog_available(true);
+        readiness.set_outbox_available(true);
+
+        assert_eq!(
+            *updates.lock().unwrap(),
+            vec![true, false, false, false, true]
+        );
+    }
+
+    fn reload_config(root_directory: &str) -> serde_json::Value {
+        json!({
+            "component": {
+                "global": { "output": { "rootDirectory": root_directory } },
+                "instances": [{
+                    "id": "camera-a",
+                    "backend": { "type": "sim" },
+                    "defaultCaptureProfile": "main",
+                    "captureProfiles": { "main": { "output": { "encoding": "jpeg" } } }
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn reload_validator_rejects_restart_only_output_root_without_touching_runtime() {
+        let current = reload_config("C:/captures-a");
+        let candidate = reload_config("C:/captures-b");
+        let result = validate_configuration_candidate(
+            candidate,
+            Some(current),
+            ConfigurationValidationPhase::Reload,
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            ConfigurationValidationResult::Reject { code, .. } if code == "CAMERA_CONFIG_INVALID"
+        ));
+    }
+
+    #[test]
+    fn reload_validator_accepts_schedule_only_generation() {
+        let current = reload_config("C:/captures-a");
+        let mut candidate = current.clone();
+        candidate["component"]["instances"][0]["schedules"] = json!([{
+            "id": "minute",
+            "cron": "0 * * * * *",
+            "timezone": "UTC",
+            "captureProfile": "main"
+        }]);
+        assert_eq!(
+            validate_configuration_candidate(
+                candidate,
+                Some(current),
+                ConfigurationValidationPhase::Reload,
+            )
+            .unwrap(),
+            ConfigurationValidationResult::Accept
+        );
+    }
+
+    #[test]
+    fn reload_validator_vetoes_onvif_secret_when_startup_has_no_credential_service() {
+        let current = reload_config("C:/captures-a");
+        let mut candidate = current.clone();
+        candidate["component"]["instances"][0]["backend"] = json!({
+            "type": "onvif-rtsp",
+            "deviceServiceUrl": "https://camera.example.test/onvif/device_service",
+            "credentials": { "$secret": "camera/login" },
+            "mediaProfile": "primary"
+        });
+
+        let result = validate_configuration_candidate_with_credentials(
+            candidate,
+            Some(current),
+            ConfigurationValidationPhase::Reload,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            ConfigurationValidationResult::Reject { code, .. } if code == "CAMERA_CONFIG_INVALID"
+        ));
+    }
+
+    #[cfg(test)]
+    mod simulator_runtime {
+        use std::{
+            path::Path,
+            sync::{Arc, Mutex},
+        };
+
+        use edgecommons::{messaging::MessageBuilder, prelude::EdgeCommonsBuilder};
+        use tempfile::TempDir;
+
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::{TcpListener, TcpStream},
+        };
+
+        use super::*;
+
+        type RecordedMqttPublishes = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+        struct TestTerminalEncoder;
+
+        impl crate::jobs::TerminalEnvelopeEncoder for TestTerminalEncoder {
+            fn encode(
+                &self,
+                terminal: &crate::messages::TerminalMessage,
+                created_at_ms: i64,
+            ) -> Result<crate::catalog::NewOutboxMessage> {
+                let message =
+                    edgecommons::messaging::MessageBuilder::new(terminal.header_name(), "1.0")
+                        .correlation_id(terminal.correlation_id())
+                        .structured_payload(terminal.body_value()?)
+                        .build();
+                crate::catalog::NewOutboxMessage::from_message(
+                    terminal.body().event_id.clone(),
+                    "terminal",
+                    format!("ecv1/test/camera-adapter/main/app/{}", terminal.channel()),
+                    &message,
+                    created_at_ms,
+                    created_at_ms,
+                )
+            }
+        }
+
+        fn core_config_value(root: &Path, cameras: &[&str], schedules: bool) -> serde_json::Value {
+            let root = root.to_string_lossy();
+            let instances = cameras
+                .iter()
+                .map(|id| {
+                    let mut camera = json!({
+                        "id": id,
+                        "backend": { "type": "sim" },
+                        "defaultCaptureProfile": "main",
+                        "captureProfiles": { "main": { "output": { "encoding": "jpeg" } } }
+                    });
+                    if schedules && *id == "camera-a" {
+                        camera["schedules"] = json!([{
+                            "id": "minute",
+                            "cron": "0 * * * * *",
+                            "timezone": "UTC",
+                            "captureProfile": "main"
+                        }]);
+                    }
+                    camera
+                })
+                .collect::<Vec<_>>();
+            let raw = json!({
+                "component": {
+                    "global": { "output": { "rootDirectory": root.as_ref() } },
+                    "instances": instances,
+                }
+            });
+            raw
+        }
+
+        fn core_config(root: &Path, cameras: &[&str], schedules: bool) -> Config {
+            Config::from_value(
+                COMPONENT_NAME,
+                "gw-01",
+                core_config_value(root, cameras, schedules),
+            )
+            .unwrap()
+        }
+
+        fn config(root: &Path, cameras: &[&str], schedules: bool) -> AdapterConfig {
+            AdapterConfig::from_core_reload(&core_config(root, cameras, schedules)).unwrap()
+        }
+
+        async fn runtime(config: AdapterConfig, directory: &TempDir) -> Arc<CameraRuntime> {
+            runtime_with_storage_pressure(config, directory, None).await
+        }
+
+        async fn runtime_with_storage_pressure(
+            config: AdapterConfig,
+            directory: &TempDir,
+            storage_pressure: Option<StoragePressureMonitor>,
+        ) -> Arc<CameraRuntime> {
+            let state = directory.path().join("state");
+            std::fs::create_dir_all(&state).unwrap();
+            let storage = StorageRoot::open(&config.global.output).unwrap();
+            let catalog = Catalog::open(CatalogOptions::new(state)).await.unwrap();
+            let admission = AdmissionController::new(
+                &config.global.limits,
+                &config.global.output,
+                Arc::new(FilesystemSpaceProbe::default()),
+            )
+            .unwrap();
+            let registry = Arc::new(CameraRegistry::new(&config).unwrap());
+            let waiters = Arc::new(RuntimeJobHooks::new(catalog.clone()));
+            let mut engines = BTreeMap::new();
+            let mut dispatchers = BTreeMap::new();
+            for camera in &config.instances {
+                engines.insert(
+                    camera.id.clone(),
+                    JobEngine::new(
+                        catalog.clone(),
+                        admission.clone(),
+                        storage.clone(),
+                        Arc::new(TestTerminalEncoder),
+                        Arc::clone(&waiters) as Arc<dyn JobHooks>,
+                    )
+                    .with_acceptance_hook(Arc::clone(&waiters) as Arc<dyn AcceptanceHook>),
+                );
+                dispatchers.insert(
+                    camera.id.clone(),
+                    Arc::new(
+                        SupervisorDispatcher::new(
+                            camera.id.clone(),
+                            config.global.limits.max_queued_captures_per_camera,
+                        )
+                        .unwrap(),
+                    ),
+                );
+            }
+            let runtime = Arc::new(CameraRuntime {
+                config: RwLock::new(config),
+                backend_context: BackendRuntimeContext::new(None),
+                catalog,
+                admission,
+                storage,
+                registry,
+                engines: RwLock::new(engines),
+                events: RwLock::new(BTreeMap::new()),
+                outbox_events: None,
+                storage_pressure,
+                storage_alarm: Arc::new(Mutex::new(StorageAlarmState::default())),
+                readiness: RuntimeReadiness::noop(),
+                actors: Arc::new(RwLock::new(HashMap::new())),
+                supervisor_cancellations: Arc::new(RwLock::new(HashMap::new())),
+                supervisor_finished: Arc::new(RwLock::new(HashMap::new())),
+                session_cancellations: Arc::new(RwLock::new(HashMap::new())),
+                scheduler_cancellations: RwLock::new(HashMap::new()),
+                discovery_cancellation: RwLock::new(None),
+                discovery_cache: Mutex::new(DiscoveryCache::default()),
+                dispatchers: RwLock::new(dispatchers),
+                cancellation: CancellationToken::new(),
+                tasks: Mutex::new(Vec::new()),
+                connect_gate: Arc::new(Semaphore::new(1)),
+                waiters,
+                cursors: CursorStore::default(),
+                reload_gate: tokio::sync::Mutex::new(()),
+                reloading: AtomicBool::new(false),
+                self_reference: OnceLock::new(),
+            });
+            let _ = runtime.self_reference.set(Arc::downgrade(&runtime));
+            runtime
+        }
+
+        struct LowSpaceProbe;
+
+        #[async_trait::async_trait]
+        impl crate::admission::DiskSpaceProbe for LowSpaceProbe {
+            async fn space(&self, _path: &std::path::Path) -> Result<crate::admission::DiskSpace> {
+                Ok(crate::admission::DiskSpace {
+                    available_bytes: 0,
+                    total_bytes: 1_000,
+                })
+            }
+        }
+
+        struct ToggleSpaceProbe {
+            pressured: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::admission::DiskSpaceProbe for ToggleSpaceProbe {
+            async fn space(&self, _path: &std::path::Path) -> Result<crate::admission::DiskSpace> {
+                let available_bytes = if self.pressured.load(std::sync::atomic::Ordering::Acquire) {
+                    0
+                } else {
+                    20_000_000_000
+                };
+                Ok(crate::admission::DiskSpace {
+                    available_bytes,
+                    total_bytes: 40_000_000_000,
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn storage_pressure_rejects_fresh_capture_before_a_ledger_or_job_is_committed() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-a"], false);
+            let monitor = StoragePressureMonitor::new(
+                configuration.global.output.root_directory.clone(),
+                directory.path().join("state"),
+                &configuration.global.output,
+                Arc::new(LowSpaceProbe),
+            );
+            let runtime =
+                runtime_with_storage_pressure(configuration, &directory, Some(monitor)).await;
+
+            let error = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "storage-pressure-fresh".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "storage-pressure-test".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), crate::ErrorCode::StoragePressure);
+            assert!(
+                runtime
+                    .catalog
+                    .job_by_ledger(
+                        crate::catalog::LedgerKey::new(
+                            "camera-a",
+                            "sb/capture-submit",
+                            "storage-pressure-fresh",
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "storage pressure must reject before creating an idempotency ledger or job"
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn storage_pressure_rejects_fresh_groups_but_exact_group_retries_remain_replayable() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+            let pressured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let monitor = StoragePressureMonitor::new(
+                configuration.global.output.root_directory.clone(),
+                directory.path().join("state"),
+                &configuration.global.output,
+                Arc::new(ToggleSpaceProbe {
+                    pressured: Arc::clone(&pressured),
+                }),
+            );
+            let runtime =
+                runtime_with_storage_pressure(configuration, &directory, Some(monitor)).await;
+            let request = GroupCaptureRequest {
+                request_id: "storage-group-existing".to_string(),
+                instances: vec!["camera-a".to_string(), "camera-b".to_string()],
+                capture_profile: None,
+                profile_overrides: BTreeMap::new(),
+                timeout_ms: None,
+                metadata: serde_json::Map::new(),
+            };
+            let accepted = runtime
+                .submit_group(
+                    request.clone(),
+                    "storage-group-original-correlation".to_string(),
+                    crate::admission::CapturePriority::Submitted,
+                    None,
+                )
+                .await
+                .unwrap();
+            pressured.store(true, std::sync::atomic::Ordering::Release);
+
+            let replay = runtime
+                .submit_group(
+                    request.clone(),
+                    "storage-group-retry-correlation".to_string(),
+                    crate::admission::CapturePriority::Submitted,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(replay.group_id, accepted.group_id);
+            assert_eq!(
+                replay.origin_correlation_id.as_deref(),
+                Some("storage-group-original-correlation"),
+                "pressure must not erase the durable result of an exact group retry"
+            );
+
+            let mut changed = request.clone();
+            changed.timeout_ms = Some(30_000);
+            assert_eq!(
+                runtime
+                    .submit_group(
+                        changed,
+                        "storage-group-conflict-correlation".to_string(),
+                        crate::admission::CapturePriority::Submitted,
+                        None,
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::IdempotencyConflict
+            );
+            let fresh = GroupCaptureRequest {
+                request_id: "storage-group-fresh".to_string(),
+                ..request
+            };
+            assert_eq!(
+                runtime
+                    .submit_group(
+                        fresh,
+                        "storage-group-fresh-correlation".to_string(),
+                        crate::admission::CapturePriority::Submitted,
+                        None,
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::StoragePressure
+            );
+            assert!(
+                runtime
+                    .catalog
+                    .group_by_ledger(
+                        crate::catalog::LedgerKey::new(
+                            "main",
+                            "sb/capture-group",
+                            "storage-group-fresh",
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "storage pressure must reject a fresh group before durable acceptance"
+            );
+            runtime.shutdown().await;
+        }
+
+        async fn spawn_recording_mqtt_broker() -> (u16, RecordedMqttPublishes) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let publishes = Arc::new(Mutex::new(Vec::new()));
+            let recorder = Arc::clone(&publishes);
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _)) => {
+                            let recorder = Arc::clone(&recorder);
+                            tokio::spawn(async move {
+                                record_mqtt_connection(stream, recorder).await;
+                            });
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+            (port, publishes)
+        }
+
+        async fn record_mqtt_connection(mut stream: TcpStream, publishes: RecordedMqttPublishes) {
+            while let Some((header, payload)) = read_mqtt_packet(&mut stream).await {
+                match header >> 4 {
+                    1 => {
+                        if stream.write_all(&[0x20, 0x02, 0x00, 0x00]).await.is_err() {
+                            return;
+                        }
+                    }
+                    8 => {
+                        if payload.len() < 2
+                            || stream
+                                .write_all(&[0x90, 0x03, payload[0], payload[1], 0x00])
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    3 => {
+                        let Some((topic, bytes, packet_id)) =
+                            mqtt_publish_payload(header, &payload)
+                        else {
+                            return;
+                        };
+                        publishes.lock().unwrap().push((topic, bytes));
+                        if let Some(packet_id) = packet_id {
+                            if stream
+                                .write_all(&[0x40, 0x02, packet_id[0], packet_id[1]])
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    12 => {
+                        if stream.write_all(&[0xD0, 0x00]).await.is_err() {
+                            return;
+                        }
+                    }
+                    14 => return,
+                    _ => {}
+                }
+            }
+        }
+
+        async fn read_mqtt_packet(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
+            let mut header = [0_u8; 1];
+            stream.read_exact(&mut header).await.ok()?;
+            let mut remaining = 0_usize;
+            let mut multiplier = 1_usize;
+            loop {
+                let mut byte = [0_u8; 1];
+                stream.read_exact(&mut byte).await.ok()?;
+                remaining = remaining.checked_add(usize::from(byte[0] & 0x7f) * multiplier)?;
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+                multiplier = multiplier.checked_mul(128)?;
+                if multiplier > 128_usize.pow(4) {
+                    return None;
+                }
+            }
+            let mut payload = vec![0_u8; remaining];
+            stream.read_exact(&mut payload).await.ok()?;
+            Some((header[0], payload))
+        }
+
+        fn mqtt_publish_payload(
+            header: u8,
+            payload: &[u8],
+        ) -> Option<(String, Vec<u8>, Option<[u8; 2]>)> {
+            let topic_length = usize::from(u16::from_be_bytes(payload.get(..2)?.try_into().ok()?));
+            let topic_end = 2_usize.checked_add(topic_length)?;
+            let topic = std::str::from_utf8(payload.get(2..topic_end)?)
+                .ok()?
+                .to_string();
+            let qos = (header >> 1) & 0b11;
+            let (body_start, packet_id) = if qos == 0 {
+                (topic_end, None)
+            } else {
+                let packet_id = payload
+                    .get(topic_end..topic_end.checked_add(2)?)?
+                    .try_into()
+                    .ok()?;
+                (topic_end.checked_add(2)?, Some(packet_id))
+            };
+            Some((topic, payload.get(body_start..)?.to_vec(), packet_id))
+        }
+
+        #[cfg(all(feature = "standalone", feature = "onvif"))]
+        async fn facade_core(directory: &TempDir, port: u16) -> Arc<edgecommons::EdgeCommons> {
+            facade_core_with_router(directory, port, None).await
+        }
+
+        /// Builds the loopback core fixture, optionally configuring the adapter router before
+        /// the core command inbox can subscribe. This keeps the startup race test faithful to
+        /// the binary's construction order rather than registering test handlers after startup.
+        #[cfg(all(feature = "standalone", feature = "onvif"))]
+        async fn facade_core_with_router(
+            directory: &TempDir,
+            port: u16,
+            router: Option<Arc<RuntimeCommandRouter>>,
+        ) -> Arc<edgecommons::EdgeCommons> {
+            let component_config = directory.path().join("facade-core-config.json");
+            let messaging_config = directory.path().join("facade-core-messaging.json");
+            std::fs::write(
+                &component_config,
+                serde_json::to_vec(&json!({
+                    "component": {
+                        "instances": [
+                            { "id": "camera-a" },
+                            { "id": "camera-b" },
+                            { "id": "camera-c" }
+                        ]
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                &messaging_config,
+                serde_json::to_vec(&json!({
+                    "messaging": {
+                        "local": {
+                            "host": "127.0.0.1",
+                            "port": port,
+                            "clientId": format!("camera-adapter-runtime-events-{}", uuid::Uuid::now_v7())
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let builder = EdgeCommonsBuilder::new(COMPONENT_NAME)
+                .args(vec![
+                    "camera-adapter-runtime-events".into(),
+                    "--platform".into(),
+                    "HOST".into(),
+                    "--transport".into(),
+                    "MQTT".into(),
+                    messaging_config.into_os_string(),
+                    "--config".into(),
+                    "FILE".into(),
+                    component_config.into_os_string(),
+                    "--thing".into(),
+                    "camera-adapter-runtime-events".into(),
+                ])
+                .initial_ready(false);
+            let builder = match router {
+                Some(router) => builder.configure_commands(move |inbox| router.register(inbox)),
+                None => builder,
+            };
+            Arc::new(
+                builder
+                    .build()
+                    .await
+                    .expect("in-process MQTT fixture must build EdgeCommons facades"),
+            )
+        }
+
+        async fn command_deferred_registry(
+            directory: &TempDir,
+            port: u16,
+        ) -> (Arc<edgecommons::EdgeCommons>, DeferredReplyRegistry) {
+            let component_config = directory.path().join("command-e2e-config.json");
+            let messaging_config = directory.path().join("command-e2e-messaging.json");
+            std::fs::write(&component_config, br#"{"component":{}}"#).unwrap();
+            let client_id = format!("camera-adapter-command-e2e-{}", uuid::Uuid::now_v7());
+            std::fs::write(
+                &messaging_config,
+                serde_json::to_vec(&json!({
+                    "messaging": {
+                        "local": {
+                            "host": "127.0.0.1",
+                            "port": port,
+                            "clientId": client_id
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let args = vec![
+                "camera-adapter-command-e2e".into(),
+                "--platform".into(),
+                "HOST".into(),
+                "--transport".into(),
+                "MQTT".into(),
+                messaging_config.into_os_string(),
+                "--config".into(),
+                "FILE".into(),
+                component_config.into_os_string(),
+                "--thing".into(),
+                "camera-adapter-command-e2e".into(),
+            ];
+            let app = Arc::new(
+                EdgeCommonsBuilder::new(COMPONENT_NAME)
+                    .args(args)
+                    .initial_ready(false)
+                    .build()
+                    .await
+                    .expect("loopback EMQX command-inbox fixture must start"),
+            );
+            let deferred = app
+                .commands()
+                .expect("MQTT transport creates the command inbox")
+                .deferred_replies();
+            (app, deferred)
+        }
+
+        fn command_message(verb: &str, suffix: &str, body: serde_json::Value) -> Message {
+            MessageBuilder::new(verb, "1.0")
+                .correlation_id(format!("command-e2e-correlation-{suffix}"))
+                .reply_to("camera-adapter-command-e2e/replies")
+                .structured_payload(body)
+                .build()
+        }
+
+        fn immediate_success(outcome: CommandOutcome) -> serde_json::Value {
+            match outcome {
+                CommandOutcome::ImmediateSuccess(Some(value)) => value,
+                other => panic!("expected immediate command success, got {other:?}"),
+            }
+        }
+
+        fn queued_job(config: &AdapterConfig, capture_id: &str) -> crate::catalog::NewJob {
+            let camera = config
+                .instances
+                .iter()
+                .find(|camera| camera.id == "camera-b")
+                .unwrap();
+            let profile = camera.capture_profiles.get("main").unwrap().clone();
+            let profile = crate::jobs::JobProfileSnapshot {
+                name: "main".to_string(),
+                capture: profile,
+                offline_policy: crate::config::OfflinePolicy::WaitUntilDeadline,
+                maximum_frame_bytes: config.global.limits.max_frame_bytes_per_camera,
+                capture_mode: crate::model::CaptureMode::Simulated,
+                capture_interlock: camera.ptz.capture_interlock,
+                settle_ms: camera.ptz.settle_ms,
+            };
+            let now = chrono::Utc::now().timestamp_millis();
+            let trigger = crate::messages::CaptureTrigger::Command {
+                request_id: "reload-queued".to_string(),
+            };
+            let canonical = json!({ "requestId": "reload-queued", "metadata": {} });
+            crate::catalog::NewJob {
+                capture_id: capture_id.to_string(),
+                instance: "camera-b".to_string(),
+                ledger_key: Some(
+                    crate::catalog::LedgerKey::new("camera-b", "sb/capture", "reload-queued")
+                        .unwrap(),
+                ),
+                request_hash: crate::idempotency::canonical_request_hash(&canonical, false)
+                    .unwrap(),
+                canonical_request: canonical,
+                effective_profile: serde_json::to_value(profile).unwrap(),
+                deadlines: crate::catalog::JobDeadlines {
+                    terminal_at_ms: now + 60_000,
+                    queue_at_ms: None,
+                    capture_at_ms: now + 30_000,
+                    encode_at_ms: now + 30_000,
+                    persist_at_ms: now + 30_000,
+                },
+                trigger: serde_json::to_value(trigger).unwrap(),
+                origin_correlation_id: Some("correlation".to_string()),
+                intended_output: json!({ "relativePath": "camera-b/cap.jpg", "backend": "sim" }),
+                accepted_at_ms: now,
+                group_id: None,
+            }
+        }
+
+        async fn wait_for_online(runtime: &CameraRuntime, instance: &str) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                if runtime
+                    .registry
+                    .snapshot(instance)
+                    .is_ok_and(|snapshot| snapshot.state == CameraConnectionState::Online)
+                {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "simulator supervisor did not reach ONLINE"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn wait_for_terminal(
+            runtime: &CameraRuntime,
+            capture_id: &str,
+        ) -> crate::catalog::JobRecord {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(record) = runtime.catalog.job(capture_id).await.unwrap() {
+                    if record.state.is_terminal() {
+                        return record;
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "simulator capture did not reach a terminal state"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        #[cfg(all(feature = "standalone", feature = "onvif"))]
+        async fn wait_for_group_terminal(
+            runtime: &CameraRuntime,
+            group_id: &str,
+        ) -> crate::catalog::GroupRecord {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(record) = runtime.catalog.group(group_id).await.unwrap() {
+                    if record.state.is_terminal() {
+                        return record;
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "simulator capture group did not reach a terminal state"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        #[cfg(all(feature = "standalone", feature = "onvif"))]
+        async fn wait_for_recorded_reply(
+            publishes: &RecordedMqttPublishes,
+            first_index: usize,
+        ) -> Message {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let reply = publishes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .skip(first_index)
+                    .find(|(topic, _)| topic == "camera-adapter-command-e2e/replies")
+                    .map(|(_, bytes)| Message::from_slice(bytes).unwrap());
+                if let Some(reply) = reply {
+                    return reply;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "deferred command did not publish a reply to its guarded reply topic"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn simulator_runtime_exercises_capture_status_ptz_and_reconnect_idempotency() {
+            let directory = TempDir::new().unwrap();
+            let mut config = config(directory.path(), &["camera-a"], false);
+            let crate::config::BackendConfig::Sim(sim) = &mut config.instances[0].backend else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.capture_delay_ms = 1;
+            sim.ptz.supported = true;
+            config.instances[0].ptz.enabled = true;
+            let runtime = runtime(config, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "runtime-e2e-capture".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "runtime-e2e-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let capture_id = match accepted {
+                crate::catalog::AcceptJobOutcome::Inserted(record) => record.capture_id,
+                other => panic!("expected newly accepted capture, got {other:?}"),
+            };
+            let terminal = wait_for_terminal(&runtime, &capture_id).await;
+            assert_eq!(terminal.state, crate::model::JobState::Succeeded);
+            assert!(terminal.terminal_result.is_some());
+
+            let status = runtime
+                .jobs_status_page(&CaptureStatusRequest {
+                    capture_id: None,
+                    capture_group_id: None,
+                    instance: Some("camera-a".to_string()),
+                    request_id: None,
+                    states: vec![crate::model::JobState::Succeeded],
+                    limit: 1,
+                    cursor: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(status["jobs"].as_array().unwrap().len(), 1);
+            assert_eq!(status["jobs"][0]["captureId"], capture_id);
+
+            let ptz: PtzCommandRequest = commands::parse_closed(json!({
+                "operation": "relative",
+                "instance": "camera-a",
+                "requestId": "runtime-e2e-ptz",
+                "translation": { "pan": 0.1, "tilt": 0.0, "zoom": 0.0 }
+            }))
+            .unwrap();
+            let first_ptz = runtime.perform_ptz(ptz.clone()).await.unwrap();
+            assert_eq!(first_ptz["state"], "COMMANDED");
+            assert_eq!(runtime.perform_ptz(ptz).await.unwrap(), first_ptz);
+
+            let first_reconnect = runtime
+                .reconnect(ReconnectRequest {
+                    instance: Some("camera-a".to_string()),
+                    request_id: "runtime-e2e-reconnect".to_string(),
+                    reason: Some("test reconnect".to_string()),
+                })
+                .await
+                .unwrap();
+            let duplicate_reconnect = runtime
+                .reconnect(ReconnectRequest {
+                    instance: Some("camera-a".to_string()),
+                    request_id: "runtime-e2e-reconnect".to_string(),
+                    reason: Some("test reconnect".to_string()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(first_reconnect, duplicate_reconnect);
+            wait_for_online(&runtime, "camera-a").await;
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn supervisor_recovers_from_a_fatal_actor_error_and_advances_generation() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            // Keep BACKOFF observable rather than relying on a scheduling race, while preserving
+            // the same bounded reconnect policy used in production.
+            configuration.global.timeouts.reconnect_backoff_min_ms = 200;
+            configuration.global.timeouts.reconnect_backoff_max_ms = 200;
+            let runtime = runtime(configuration, &directory).await;
+
+            // Accept and dispatch before a session exists, then simulate the durable invariant a
+            // crash/race could expose: the descriptor still says QUEUED but its record advanced.
+            // `CameraActor` must surface that fatal engine error to the supervisor, which must
+            // retire the actor, publish BACKOFF, and create a fresh generation rather than leave
+            // the persistent dispatcher wedged behind the failed session.
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "fatal-actor-recovery".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "fatal-actor-recovery-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let capture_id = match accepted {
+                crate::catalog::AcceptJobOutcome::Inserted(record) => record.capture_id,
+                other => panic!("expected newly accepted capture, got {other:?}"),
+            };
+            assert!(matches!(
+                runtime
+                    .catalog
+                    .compare_and_set_state(
+                        &capture_id,
+                        crate::model::JobState::Queued,
+                        crate::model::JobState::Acquiring,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    .unwrap(),
+                crate::catalog::StateCasOutcome::Changed(_)
+            ));
+
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let backoff_generation = loop {
+                let snapshot = runtime.registry.snapshot("camera-a").unwrap();
+                if snapshot.state == CameraConnectionState::Backoff {
+                    assert_eq!(
+                        snapshot
+                            .last_error
+                            .as_ref()
+                            .map(|error| error.code.as_str()),
+                        Some(crate::ErrorCode::BackendError.as_str())
+                    );
+                    assert!(
+                        !runtime.actors.read().unwrap().contains_key("camera-a"),
+                        "the failed actor must be retired before reconnecting"
+                    );
+                    break snapshot.generation;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "fatal actor error did not publish BACKOFF"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let snapshot = runtime.registry.snapshot("camera-a").unwrap();
+                if snapshot.state == CameraConnectionState::Online
+                    && snapshot.generation > backoff_generation
+                {
+                    assert!(runtime.actors.read().unwrap().contains_key("camera-a"));
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "supervisor did not establish a fresh session after fatal actor error"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn startup_recovery_interrupts_pending_jobs_and_fences_hazardous_commands() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-b"], false);
+            let runtime = runtime(configuration.clone(), &directory).await;
+
+            let pending = queued_job(&configuration, "cap-startup-recovery");
+            runtime.catalog.accept_job(pending).await.unwrap();
+            assert!(matches!(
+                runtime
+                    .catalog
+                    .queue_job(
+                        "cap-startup-recovery",
+                        chrono::Utc::now().timestamp_millis()
+                    )
+                    .await
+                    .unwrap(),
+                crate::catalog::StateCasOutcome::Changed(_)
+            ));
+
+            let key = crate::catalog::LedgerKey::new(
+                "camera-b",
+                "sb/ptz/absolute",
+                "startup-recovery-ptz",
+            )
+            .unwrap();
+            let canonical = serde_json::json!({
+                "requestId": "startup-recovery-ptz",
+                "pan": 0.2,
+                "tilt": -0.1,
+            });
+            let request_hash =
+                crate::idempotency::canonical_request_hash(&canonical, false).unwrap();
+            assert!(matches!(
+                runtime
+                    .catalog
+                    .begin_command(
+                        key.clone(),
+                        request_hash,
+                        canonical.clone(),
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    .unwrap(),
+                crate::catalog::BeginCommandOutcome::Started(_)
+            ));
+
+            runtime.recover_install_owned().await.unwrap();
+
+            let recovered = runtime
+                .catalog
+                .job("cap-startup-recovery")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.state, crate::model::JobState::Interrupted);
+            assert_eq!(
+                recovered.error_code.as_deref(),
+                Some(crate::ErrorCode::ProcessInterrupted.as_str())
+            );
+            assert!(recovered.terminal_result.is_some());
+            assert!(runtime.catalog.recovery_jobs().await.unwrap().is_empty());
+
+            let replay = runtime
+                .catalog
+                .begin_command(
+                    key,
+                    request_hash,
+                    canonical,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                replay,
+                crate::catalog::BeginCommandOutcome::Existing(record)
+                    if record.state == crate::catalog::LedgerState::OutcomeUnknown
+                        && record.reply.is_none()
+            ));
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn simulator_runtime_presets_page_and_reject_reused_keys_with_changed_arguments() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            let crate::config::BackendConfig::Sim(sim) = &mut configuration.instances[0].backend
+            else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.ptz.supported = true;
+            sim.ptz.presets_supported = true;
+            configuration.instances[0].ptz.enabled = true;
+            configuration.instances[0].ptz.allow_preset_mutation = true;
+            let runtime = runtime(configuration, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let set: PtzPresetsRequest = commands::parse_closed(json!({
+                "operation": "set",
+                "instance": "camera-a",
+                "requestId": "preset-set-1",
+                "name": "loading-bay"
+            }))
+            .unwrap();
+            let first = runtime.perform_presets(set.clone()).await.unwrap();
+            let first_token = first["token"].as_str().unwrap().to_string();
+            assert_eq!(runtime.perform_presets(set).await.unwrap(), first);
+            assert_eq!(
+                runtime
+                    .perform_presets(
+                        commands::parse_closed(json!({
+                            "operation": "set",
+                            "instance": "camera-a",
+                            "requestId": "preset-set-1",
+                            "name": "packing-line"
+                        }))
+                        .unwrap()
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::IdempotencyConflict,
+                "the same request id must never authorize a changed preset mutation"
+            );
+
+            let ptz: PtzCommandRequest = commands::parse_closed(json!({
+                "operation": "relative",
+                "instance": "camera-a",
+                "requestId": "ptz-relative-1",
+                "translation": { "pan": 0.1, "tilt": 0.0, "zoom": 0.0 }
+            }))
+            .unwrap();
+            assert_eq!(
+                runtime.perform_ptz(ptz.clone()).await.unwrap()["state"],
+                "COMMANDED"
+            );
+            assert_eq!(
+                runtime
+                    .perform_ptz(
+                        commands::parse_closed(json!({
+                            "operation": "relative",
+                            "instance": "camera-a",
+                            "requestId": "ptz-relative-1",
+                            "translation": { "pan": 0.2, "tilt": 0.0, "zoom": 0.0 }
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::IdempotencyConflict,
+                "the same request id must never authorize changed PTZ motion"
+            );
+
+            let second = runtime
+                .perform_presets(
+                    commands::parse_closed(json!({
+                        "operation": "set",
+                        "instance": "camera-a",
+                        "requestId": "preset-set-2",
+                        "name": "packing-line"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let second_token = second["token"].as_str().unwrap().to_string();
+            let first_page = runtime
+                .perform_presets(
+                    commands::parse_closed(json!({
+                        "operation": "list",
+                        "instance": "camera-a",
+                        "limit": 1
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(first_page["presets"].as_array().unwrap().len(), 1);
+            let cursor = first_page["nextCursor"].as_str().unwrap().to_string();
+            let second_page = runtime
+                .perform_presets(
+                    commands::parse_closed(json!({
+                        "operation": "list",
+                        "instance": "camera-a",
+                        "limit": 1,
+                        "cursor": cursor
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(second_page["presets"].as_array().unwrap().len(), 1);
+            assert!(second_page["nextCursor"].is_null());
+
+            assert_eq!(
+                runtime
+                    .perform_presets(
+                        commands::parse_closed(json!({
+                            "operation": "goto",
+                            "instance": "camera-a",
+                            "requestId": "preset-goto-1",
+                            "token": first_token
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()["state"],
+                "COMMANDED"
+            );
+            assert_eq!(
+                runtime
+                    .perform_presets(
+                        commands::parse_closed(json!({
+                            "operation": "remove",
+                            "instance": "camera-a",
+                            "requestId": "preset-remove-1",
+                            "token": second_token
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()["removed"],
+                true
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn simulator_runtime_exercises_the_full_ptz_and_preset_command_matrix() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            let crate::config::BackendConfig::Sim(sim) = &mut configuration.instances[0].backend
+            else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.ptz.supported = true;
+            sim.ptz.status_supported = true;
+            sim.ptz.presets_supported = true;
+            configuration.instances[0].ptz.enabled = true;
+            configuration.instances[0].ptz.allow_preset_mutation = true;
+            let runtime = runtime(configuration, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let absolute: PtzCommandRequest = commands::parse_closed(json!({
+                "operation": "absolute",
+                "instance": "camera-a",
+                "requestId": "ptz-absolute-matrix",
+                "position": { "pan": 0.2, "tilt": -0.1, "zoom": 0.3 },
+                "speed": { "pan": 0.5, "tilt": 0.4, "zoom": 0.3 }
+            }))
+            .unwrap();
+            let absolute_reply = runtime.perform_ptz(absolute.clone()).await.unwrap();
+            assert_eq!(absolute_reply["operation"], "absolute");
+            assert_eq!(absolute_reply["state"], "COMMANDED");
+            assert_eq!(
+                runtime.perform_ptz(absolute).await.unwrap(),
+                absolute_reply,
+                "an exact absolute PTZ retry must replay its retained result"
+            );
+            assert_eq!(
+                runtime
+                    .perform_ptz(
+                        commands::parse_closed(json!({
+                            "operation": "absolute",
+                            "instance": "camera-a",
+                            "requestId": "ptz-absolute-matrix",
+                            "position": { "pan": 0.3, "tilt": -0.1, "zoom": 0.3 }
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::IdempotencyConflict
+            );
+
+            let relative: PtzCommandRequest = commands::parse_closed(json!({
+                "operation": "relative",
+                "instance": "camera-a",
+                "requestId": "ptz-relative-matrix",
+                "translation": { "pan": 0.1, "tilt": 0.2, "zoom": -0.1 },
+                "speed": { "pan": 0.6, "tilt": 0.5, "zoom": 0.4 }
+            }))
+            .unwrap();
+            assert_eq!(
+                runtime.perform_ptz(relative).await.unwrap()["state"],
+                "COMMANDED"
+            );
+
+            let continuous: PtzCommandRequest = commands::parse_closed(json!({
+                "operation": "continuous",
+                "instance": "camera-a",
+                "requestId": "ptz-continuous-matrix",
+                "velocity": { "pan": 0.5, "tilt": 0.0, "zoom": 0.0 },
+                "timeoutMs": 100
+            }))
+            .unwrap();
+            assert_eq!(
+                runtime.perform_ptz(continuous).await.unwrap()["state"],
+                "COMMANDED"
+            );
+            let moving = runtime
+                .perform_ptz(
+                    commands::parse_closed(json!({
+                        "operation": "status",
+                        "instance": "camera-a"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(moving["available"], true);
+            assert_eq!(moving["moving"], true);
+
+            let stop: PtzCommandRequest = commands::parse_closed(json!({
+                "operation": "stop",
+                "instance": "camera-a",
+                "requestId": "ptz-stop-matrix",
+                "axes": ["pan", "zoom"]
+            }))
+            .unwrap();
+            assert_eq!(
+                runtime.perform_ptz(stop).await.unwrap()["state"],
+                "COMMANDED"
+            );
+            let stopped = runtime
+                .perform_ptz(
+                    commands::parse_closed(json!({
+                        "operation": "status",
+                        "instance": "camera-a"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(stopped["moving"], false);
+
+            let home: PtzCommandRequest = commands::parse_closed(json!({
+                "operation": "home",
+                "instance": "camera-a",
+                "requestId": "ptz-home-matrix"
+            }))
+            .unwrap();
+            assert_eq!(
+                runtime.perform_ptz(home).await.unwrap()["state"],
+                "COMMANDED"
+            );
+
+            let set: PtzPresetsRequest = commands::parse_closed(json!({
+                "operation": "set",
+                "instance": "camera-a",
+                "requestId": "preset-matrix-set",
+                "name": "matrix-home"
+            }))
+            .unwrap();
+            let set_reply = runtime.perform_presets(set.clone()).await.unwrap();
+            let token = set_reply["token"].as_str().unwrap().to_string();
+            assert_eq!(runtime.perform_presets(set).await.unwrap(), set_reply);
+            assert_eq!(
+                runtime
+                    .perform_presets(
+                        commands::parse_closed(json!({
+                            "operation": "set",
+                            "instance": "camera-a",
+                            "requestId": "preset-matrix-set",
+                            "name": "matrix-other"
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::IdempotencyConflict
+            );
+            assert_eq!(
+                runtime
+                    .perform_presets(
+                        commands::parse_closed(json!({
+                            "operation": "goto",
+                            "instance": "camera-a",
+                            "requestId": "preset-matrix-goto",
+                            "token": token
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()["state"],
+                "COMMANDED"
+            );
+            let listed = runtime
+                .perform_presets(
+                    commands::parse_closed(json!({
+                        "operation": "list",
+                        "instance": "camera-a",
+                        "limit": 10
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(listed["presets"].as_array().unwrap().len(), 1);
+            let remove: PtzPresetsRequest = commands::parse_closed(json!({
+                "operation": "remove",
+                "instance": "camera-a",
+                "requestId": "preset-matrix-remove",
+                "token": token
+            }))
+            .unwrap();
+            let removed = runtime.perform_presets(remove.clone()).await.unwrap();
+            assert_eq!(removed["removed"], true);
+            assert_eq!(runtime.perform_presets(remove).await.unwrap(), removed);
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn simulator_runtime_discovery_and_capture_status_use_stable_bounded_pages() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            configuration.global.discovery.enabled = true;
+            let crate::config::BackendConfig::Sim(sim) = &mut configuration.instances[0].backend
+            else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.capture_delay_ms = 1;
+            let runtime = runtime(configuration, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let discovery = runtime
+                .discover(DiscoverRequest {
+                    backends: Vec::new(),
+                    timeout_ms: 100,
+                    limit: 1,
+                    cursor: None,
+                })
+                .await
+                .unwrap();
+            assert!(discovery["candidates"].as_array().unwrap().is_empty());
+            assert!(discovery["completedAt"].is_string());
+            assert!(discovery["nextCursor"].is_null());
+
+            for request_id in ["status-page-a", "status-page-b"] {
+                let accepted = runtime
+                    .submit_capture(
+                        "camera-a".to_string(),
+                        request_id.to_string(),
+                        None,
+                        None,
+                        serde_json::Map::new(),
+                        format!("status-page-correlation-{request_id}"),
+                        "sb/capture-submit",
+                        crate::admission::CapturePriority::Submitted,
+                    )
+                    .await
+                    .unwrap();
+                let capture_id = match accepted {
+                    crate::catalog::AcceptJobOutcome::Inserted(record) => record.capture_id,
+                    other => panic!("expected new status-page job, got {other:?}"),
+                };
+                assert_eq!(
+                    wait_for_terminal(&runtime, &capture_id).await.state,
+                    crate::model::JobState::Succeeded
+                );
+            }
+
+            let first = runtime
+                .jobs_status_page(&CaptureStatusRequest {
+                    capture_id: None,
+                    capture_group_id: None,
+                    instance: Some("camera-a".to_string()),
+                    request_id: None,
+                    states: vec![crate::model::JobState::Succeeded],
+                    limit: 1,
+                    cursor: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(first["jobs"].as_array().unwrap().len(), 1);
+            let cursor = first["nextCursor"].as_str().unwrap().to_string();
+            let second = runtime
+                .jobs_status_page(&CaptureStatusRequest {
+                    capture_id: None,
+                    capture_group_id: None,
+                    instance: Some("camera-a".to_string()),
+                    request_id: None,
+                    states: vec![crate::model::JobState::Succeeded],
+                    limit: 1,
+                    cursor: Some(cursor.clone()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(second["jobs"].as_array().unwrap().len(), 1);
+            assert!(second["nextCursor"].is_null());
+            assert_eq!(
+                runtime
+                    .jobs_status_page(&CaptureStatusRequest {
+                        capture_id: None,
+                        capture_group_id: None,
+                        instance: Some("camera-a".to_string()),
+                        request_id: None,
+                        states: vec![crate::model::JobState::Failed],
+                        limit: 1,
+                        cursor: Some(cursor),
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::InvalidRequest,
+                "a cursor must be bound to its original state filter"
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn simulator_runtime_cancel_ledger_replays_exact_results_and_conflicts_on_changes() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+            for camera in &mut configuration.instances {
+                let crate::config::BackendConfig::Sim(sim) = &mut camera.backend else {
+                    panic!("test fixture must use the simulator backend");
+                };
+                sim.capture_delay_ms = 1_000;
+            }
+            let runtime = runtime(configuration, &directory).await;
+            for instance in ["camera-a", "camera-b"] {
+                runtime
+                    .start_supervisor(instance.to_string(), runtime.engine(instance).unwrap())
+                    .unwrap();
+                wait_for_online(&runtime, instance).await;
+            }
+
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "cancel-single-target".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "cancel-single-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let capture_id = match accepted {
+                crate::catalog::AcceptJobOutcome::Inserted(record) => record.capture_id,
+                other => panic!("expected newly accepted cancellation target, got {other:?}"),
+            };
+            let single_request = CancelRequest {
+                request_id: "cancel-single-ledger".to_string(),
+                capture_id: Some(capture_id.clone()),
+                capture_group_id: None,
+                reason: Some("operator stopped this capture".to_string()),
+            };
+            let single = runtime
+                .cancel_capture(single_request.clone())
+                .await
+                .unwrap();
+            assert_eq!(single["captureId"], capture_id);
+            assert_eq!(single["cancelled"], true);
+            assert_eq!(single["state"], "CANCELLED");
+            assert!(
+                single["cancellationInProgress"].is_boolean(),
+                "the durable cancellation CAS may precede an acquiring backend's unwind"
+            );
+            assert_eq!(
+                runtime
+                    .cancel_capture(single_request.clone())
+                    .await
+                    .unwrap(),
+                single,
+                "an exact retry must return the stored direct-cancel result"
+            );
+            let mut changed_single = single_request;
+            changed_single.reason = Some("different cancellation reason".to_string());
+            assert_eq!(
+                runtime
+                    .cancel_capture(changed_single)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::IdempotencyConflict
+            );
+
+            let group = runtime
+                .submit_group(
+                    GroupCaptureRequest {
+                        request_id: "cancel-group-target".to_string(),
+                        instances: vec!["camera-a".to_string(), "camera-b".to_string()],
+                        capture_profile: None,
+                        profile_overrides: BTreeMap::new(),
+                        timeout_ms: None,
+                        metadata: serde_json::Map::new(),
+                    },
+                    "cancel-group-correlation".to_string(),
+                    crate::admission::CapturePriority::Submitted,
+                    None,
+                )
+                .await
+                .unwrap();
+            let group_request = CancelRequest {
+                request_id: "cancel-group-ledger".to_string(),
+                capture_id: None,
+                capture_group_id: Some(group.group_id.clone()),
+                reason: Some("operator cancelled the capture group".to_string()),
+            };
+            let group_result = runtime.cancel_capture(group_request.clone()).await.unwrap();
+            assert_eq!(group_result["captureGroupId"], group.group_id);
+            assert_eq!(group_result["cancelledMembers"], 2);
+            assert_eq!(group_result["unchangedMembers"], 0);
+            let members = group_result["members"].as_array().unwrap();
+            assert_eq!(members.len(), 2);
+            for member in members {
+                assert!(member["captureId"].is_string());
+                assert!(member["instance"].is_string());
+                assert_eq!(member["cancelled"], true);
+                assert_eq!(member["state"], "CANCELLED");
+                assert!(
+                    member["cancellationInProgress"].is_boolean(),
+                    "an acquiring backend may still be unwinding after the durable cancellation CAS"
+                );
+            }
+            assert_eq!(
+                runtime.cancel_capture(group_request.clone()).await.unwrap(),
+                group_result,
+                "the component-scoped group ledger must replay its exact complete result"
+            );
+            let canonical_group_cancel = json!({
+                "requestId": "cancel-group-ledger",
+                "target": { "kind": "capture-group", "captureGroupId": group.group_id },
+                "reason": "operator cancelled the capture group",
+            });
+            assert!(matches!(
+                runtime
+                    .catalog
+                    .begin_command(
+                        crate::catalog::LedgerKey::new(
+                            "main",
+                            "sb/capture-cancel",
+                            "cancel-group-ledger",
+                        )
+                        .unwrap(),
+                        crate::idempotency::canonical_request_hash(&canonical_group_cancel, false)
+                            .unwrap(),
+                        canonical_group_cancel,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await
+                    .unwrap(),
+                crate::catalog::BeginCommandOutcome::Existing(record)
+                    if record.state == crate::catalog::LedgerState::Succeeded
+                        && record.reply.as_ref() == Some(&group_result)
+            ));
+            let mut changed_group = group_request;
+            changed_group.reason = Some("different group cancellation reason".to_string());
+            assert_eq!(
+                runtime
+                    .cancel_capture(changed_group)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::IdempotencyConflict
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn command_service_dispatches_immediate_verbs_with_a_real_inbox_registry() {
+            let (port, _) = spawn_recording_mqtt_broker().await;
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            let crate::config::BackendConfig::Sim(sim) = &mut configuration.instances[0].backend
+            else {
+                panic!("test fixture must use the simulator backend");
+            };
+            // Keep acquisition active long enough for the immediate cancellation verb to win.
+            sim.capture_delay_ms = 1_000;
+            sim.ptz.supported = true;
+            configuration.instances[0].ptz.enabled = true;
+            let runtime = runtime(configuration, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+            let (app, deferred) = command_deferred_registry(&directory, port).await;
+
+            let list = immediate_success(
+                runtime
+                    .handle_camera_command(
+                        "sb/list",
+                        command_message("sb/list", "list", json!({"limit": 10})),
+                        deferred.clone(),
+                    )
+                    .await,
+            );
+            assert_eq!(list["cameras"].as_array().unwrap().len(), 1);
+            assert_eq!(list["cameras"][0]["instance"], "camera-a");
+
+            let status = immediate_success(
+                runtime
+                    .handle_camera_command(
+                        "sb/status",
+                        command_message("sb/status", "status", json!({"instance": "camera-a"})),
+                        deferred.clone(),
+                    )
+                    .await,
+            );
+            assert_eq!(status["instance"], "camera-a");
+            assert_eq!(status["state"], "ONLINE");
+
+            let accepted = immediate_success(
+                runtime
+                    .handle_camera_command(
+                        "sb/capture-submit",
+                        command_message(
+                            "sb/capture-submit",
+                            "capture-submit",
+                            json!({"instance": "camera-a", "requestId": "command-e2e-capture"}),
+                        ),
+                        deferred.clone(),
+                    )
+                    .await,
+            );
+            let capture_id = accepted["captureId"]
+                .as_str()
+                .expect("capture-submit returns a durable capture ID")
+                .to_string();
+            assert_eq!(accepted["state"], "QUEUED");
+
+            let status_before_cancel = immediate_success(
+                runtime
+                    .handle_camera_command(
+                        "sb/capture-status",
+                        command_message(
+                            "sb/capture-status",
+                            "capture-status-before-cancel",
+                            json!({"captureId": capture_id}),
+                        ),
+                        deferred.clone(),
+                    )
+                    .await,
+            );
+            assert_eq!(status_before_cancel["captureId"], capture_id);
+
+            let cancelled = immediate_success(
+                runtime
+                    .handle_camera_command(
+                        "sb/capture-cancel",
+                        command_message(
+                            "sb/capture-cancel",
+                            "capture-cancel",
+                            json!({
+                                "requestId": "command-e2e-cancel",
+                                "captureId": capture_id,
+                                "reason": "operator cancelled command-dispatch coverage fixture"
+                            }),
+                        ),
+                        deferred.clone(),
+                    )
+                    .await,
+            );
+            assert_eq!(cancelled["captureId"], capture_id);
+            assert_eq!(cancelled["state"], "CANCELLED");
+            assert_eq!(cancelled["cancelled"], true);
+
+            let status_after_cancel = immediate_success(
+                runtime
+                    .handle_camera_command(
+                        "sb/capture-status",
+                        command_message(
+                            "sb/capture-status",
+                            "capture-status-after-cancel",
+                            json!({"captureId": capture_id}),
+                        ),
+                        deferred.clone(),
+                    )
+                    .await,
+            );
+            assert_eq!(status_after_cancel["state"], "CANCELLED");
+
+            let ptz = immediate_success(
+                runtime
+                    .handle_camera_command(
+                        "sb/ptz",
+                        command_message(
+                            "sb/ptz",
+                            "ptz-status",
+                            json!({"operation": "status", "instance": "camera-a"}),
+                        ),
+                        deferred.clone(),
+                    )
+                    .await,
+            );
+            assert_eq!(ptz["available"], true);
+            assert!(ptz.get("position").is_some());
+
+            match runtime
+                .handle_camera_command(
+                    "sb/list",
+                    command_message("sb/list", "invalid-list", json!({"limit": 0})),
+                    deferred,
+                )
+                .await
+            {
+                CommandOutcome::ImmediateError(error) => {
+                    assert_eq!(error.code, crate::ErrorCode::InvalidRequest.as_str());
+                }
+                other => panic!("invalid request must return an immediate error, got {other:?}"),
+            }
+
+            app.commands().unwrap().stop().await;
+            runtime.shutdown().await;
+            drop(app);
+        }
+
+        #[tokio::test]
+        async fn simulator_runtime_executes_group_capture_and_paged_group_status() {
+            let directory = TempDir::new().unwrap();
+            let mut config = config(directory.path(), &["camera-a", "camera-b"], false);
+            for camera in &mut config.instances {
+                let crate::config::BackendConfig::Sim(sim) = &mut camera.backend else {
+                    panic!("test fixture must use the simulator backend");
+                };
+                sim.capture_delay_ms = 1;
+            }
+            let runtime = runtime(config, &directory).await;
+            for instance in ["camera-a", "camera-b"] {
+                runtime
+                    .start_supervisor(instance.to_string(), runtime.engine(instance).unwrap())
+                    .unwrap();
+                wait_for_online(&runtime, instance).await;
+            }
+
+            let group = runtime
+                .submit_group(
+                    GroupCaptureRequest {
+                        request_id: "runtime-e2e-group".to_string(),
+                        instances: vec!["camera-a".to_string(), "camera-b".to_string()],
+                        capture_profile: None,
+                        profile_overrides: BTreeMap::new(),
+                        timeout_ms: None,
+                        metadata: serde_json::Map::new(),
+                    },
+                    "runtime-e2e-group-correlation".to_string(),
+                    crate::admission::CapturePriority::Submitted,
+                    None,
+                )
+                .await
+                .unwrap();
+            for member in &group.members {
+                assert_eq!(
+                    wait_for_terminal(&runtime, &member.capture_id).await.state,
+                    crate::model::JobState::Succeeded
+                );
+            }
+            let completed_group = runtime
+                .catalog
+                .group(group.group_id.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            let first = runtime.group_status_page(completed_group, 1, None).unwrap();
+            assert_eq!(first["members"].as_array().unwrap().len(), 1);
+            let cursor = first["nextCursor"]
+                .as_str()
+                .expect("two-member group must page at a limit of one");
+            let second = runtime
+                .group_status_page(
+                    runtime
+                        .catalog
+                        .group(group.group_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    1,
+                    Some(cursor),
+                )
+                .unwrap();
+            assert_eq!(second["members"].as_array().unwrap().len(), 1);
+            assert!(second["nextCursor"].is_null());
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn live_same_backend_reload_replaces_session_without_stale_generation() {
+            let directory = TempDir::new().unwrap();
+            let mut initial = config(directory.path(), &["camera-a"], false);
+            let crate::config::BackendConfig::Sim(sim) = &mut initial.instances[0].backend else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.capture_delay_ms = 1;
+            let runtime = runtime(initial, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+            let previous_generation = runtime.registry.snapshot("camera-a").unwrap().generation;
+
+            let mut replacement = config(directory.path(), &["camera-a"], false);
+            let crate::config::BackendConfig::Sim(sim) = &mut replacement.instances[0].backend
+            else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.seed = Some(991);
+            let diff = runtime
+                .apply_reloaded_config(replacement, BTreeMap::new(), BTreeMap::new())
+                .await
+                .unwrap();
+            assert_eq!(diff.lifecycle_changed, vec!["camera-a".to_string()]);
+            wait_for_online(&runtime, "camera-a").await;
+            assert!(
+                runtime.registry.snapshot("camera-a").unwrap().generation > previous_generation,
+                "replacement supervisor must advance the lifecycle generation"
+            );
+            runtime.shutdown().await;
+        }
+
+        #[cfg(not(feature = "genicam"))]
+        #[tokio::test]
+        async fn supervisor_reports_unavailable_genicam_as_backoff_without_creating_an_actor() {
+            let directory = TempDir::new().unwrap();
+            let mut raw = core_config_value(directory.path(), &["camera-a"], false);
+            raw["component"]["instances"][0]["backend"] = json!({
+                "type": "genicam-aravis",
+                "selector": { "serial": "genicam-feature-gate-test" }
+            });
+            let configuration = AdapterConfig::from_core_reload(
+                &Config::from_value(COMPONENT_NAME, "gw-01", raw)
+                    .expect("core carries a valid adapter-specific GenICam shape"),
+            )
+            .expect("GenICam configuration itself is valid even when its native feature is absent");
+            let runtime = runtime(configuration, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let snapshot = runtime.registry.snapshot("camera-a").unwrap();
+                if snapshot.state == CameraConnectionState::Backoff {
+                    assert_eq!(
+                        snapshot
+                            .last_error
+                            .as_ref()
+                            .map(|error| error.code.as_str()),
+                        Some(crate::ErrorCode::UnsupportedCapability.as_str())
+                    );
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "a missing native GenICam feature must be surfaced as BACKOFF"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            match runtime.actor("camera-a") {
+                Err(error) => assert_eq!(
+                    error.code(),
+                    crate::ErrorCode::CameraUnavailable,
+                    "a rejected backend factory must never leave a live actor handle"
+                ),
+                Ok(_) => panic!("a rejected backend factory must never leave a live actor handle"),
+            }
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn runtime_command_paths_reject_disabled_ptz_and_preserve_reconnect_conflicts() {
+            let directory = TempDir::new().unwrap();
+            let initial = config(directory.path(), &["camera-a"], false);
+            let runtime = runtime(initial, &directory).await;
+            let ptz: PtzCommandRequest = commands::parse_closed(json!({
+                "operation": "status", "instance": "camera-a"
+            }))
+            .unwrap();
+            assert_eq!(
+                runtime.perform_ptz(ptz).await.unwrap_err().code(),
+                crate::ErrorCode::PtzDisabled
+            );
+            runtime
+                .reconnect(ReconnectRequest {
+                    instance: Some("camera-a".to_string()),
+                    request_id: "reconnect-conflict".to_string(),
+                    reason: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .reconnect(ReconnectRequest {
+                        instance: Some("camera-a".to_string()),
+                        request_id: "reconnect-conflict".to_string(),
+                        reason: Some("changed".to_string()),
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::IdempotencyConflict
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn reload_schedule_only_restarts_plan_without_replacing_roster() {
+            let directory = TempDir::new().unwrap();
+            let initial = config(directory.path(), &["camera-a"], false);
+            let runtime = runtime(initial, &directory).await;
+            let replacement = config(directory.path(), &["camera-a"], true);
+            let diff = runtime
+                .apply_reloaded_config(replacement, BTreeMap::new(), BTreeMap::new())
+                .await
+                .unwrap();
+            assert_eq!(diff.updated, vec!["camera-a".to_string()]);
+            assert_eq!(
+                runtime.config_snapshot().unwrap().instances[0]
+                    .schedules
+                    .len(),
+                1
+            );
+            assert_eq!(runtime.scheduler_cancellations.read().unwrap().len(), 1);
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn reload_cancels_periodic_discovery_and_clears_retained_observations() {
+            let directory = TempDir::new().unwrap();
+            let mut initial = config(directory.path(), &["camera-a"], false);
+            initial.global.discovery.enabled = true;
+            initial.global.discovery.report_unconfigured = true;
+            initial.global.discovery.interval_seconds = 5;
+            let runtime = runtime(initial, &directory).await;
+            runtime.start_periodic_discovery().unwrap();
+            let previous = runtime
+                .discovery_cancellation
+                .read()
+                .unwrap()
+                .clone()
+                .expect("enabled discovery starts a cancellable generation");
+            runtime
+                .discovery_cache
+                .lock()
+                .unwrap()
+                .candidates
+                .push(DiscoveryCandidate {
+                    backend: crate::model::BackendKind::GenicamAravis,
+                    selector: json!({ "serial": "unconfigured" }),
+                    vendor: None,
+                    model: None,
+                    capabilities: json!({}),
+                });
+            assert_eq!(
+                runtime
+                    .unconfigured_discoveries(&runtime.config_snapshot().unwrap())
+                    .unwrap()
+                    .len(),
+                1
+            );
+
+            let replacement = config(directory.path(), &["camera-a"], false);
+            runtime
+                .apply_reloaded_config(replacement, BTreeMap::new(), BTreeMap::new())
+                .await
+                .unwrap();
+            assert!(previous.is_cancelled());
+            assert!(runtime.discovery_cancellation.read().unwrap().is_none());
+            assert!(
+                runtime
+                    .discovery_cache
+                    .lock()
+                    .unwrap()
+                    .candidates
+                    .is_empty()
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn periodic_discovery_replaces_stale_cache_and_retires_each_generation() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            configuration.global.discovery.enabled = true;
+            configuration.global.discovery.report_unconfigured = true;
+            configuration.global.discovery.interval_seconds = 60;
+            let runtime = runtime(configuration, &directory).await;
+            runtime
+                .discovery_cache
+                .lock()
+                .unwrap()
+                .candidates
+                .push(DiscoveryCandidate {
+                    backend: crate::model::BackendKind::GenicamAravis,
+                    selector: json!({ "serial": "stale-discovery" }),
+                    vendor: Some("stale".to_string()),
+                    model: None,
+                    capabilities: json!({}),
+                });
+
+            runtime.start_periodic_discovery().unwrap();
+            let first = runtime
+                .discovery_cancellation
+                .read()
+                .unwrap()
+                .clone()
+                .expect("enabled discovery must retain its cancellation generation");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if runtime
+                    .discovery_cache
+                    .lock()
+                    .unwrap()
+                    .candidates
+                    .is_empty()
+                {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the simulator discovery pass did not replace stale retained observations"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            runtime.restart_periodic_discovery().unwrap();
+            assert!(
+                first.is_cancelled(),
+                "a restart must retire the former periodic-discovery generation"
+            );
+            let second = runtime
+                .discovery_cancellation
+                .read()
+                .unwrap()
+                .clone()
+                .expect("a restart must create one replacement discovery generation");
+            assert!(
+                !second.is_cancelled(),
+                "the replacement discovery generation must remain active before reload"
+            );
+
+            let replacement = config(directory.path(), &["camera-a"], false);
+            runtime
+                .apply_reloaded_config(replacement, BTreeMap::new(), BTreeMap::new())
+                .await
+                .unwrap();
+            assert!(
+                second.is_cancelled(),
+                "disabling discovery through reload must retire the active generation"
+            );
+            assert!(runtime.discovery_cancellation.read().unwrap().is_none());
+            assert!(
+                runtime
+                    .discovery_cache
+                    .lock()
+                    .unwrap()
+                    .candidates
+                    .is_empty()
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn reload_removal_interrupts_queued_work_and_retains_other_camera() {
+            let directory = TempDir::new().unwrap();
+            let initial = config(directory.path(), &["camera-a", "camera-b"], false);
+            let runtime = runtime(initial.clone(), &directory).await;
+            let queued = queued_job(&initial, "cap_reload_queued");
+            runtime.catalog.accept_job(queued).await.unwrap();
+            runtime
+                .catalog
+                .queue_job("cap_reload_queued", chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap();
+
+            let replacement = config(directory.path(), &["camera-a"], false);
+            let diff = runtime
+                .apply_reloaded_config(replacement, BTreeMap::new(), BTreeMap::new())
+                .await
+                .unwrap();
+            assert_eq!(diff.removed, vec!["camera-b".to_string()]);
+            let job = runtime
+                .catalog
+                .job("cap_reload_queued")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.state, crate::model::JobState::Interrupted);
+            assert_eq!(job.error_code.as_deref(), Some("PROCESS_INTERRUPTED"));
+            assert!(
+                job.error_message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("configuration reload"))
+            );
+            assert!(runtime.registry.snapshot("camera-b").is_err());
+            assert_eq!(
+                runtime.registry.snapshot("camera-a").unwrap().instance,
+                "camera-a"
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn reload_connection_change_restarts_only_the_session_and_keeps_compatible_queue() {
+            let directory = TempDir::new().unwrap();
+            let initial = config(directory.path(), &["camera-a", "camera-b"], false);
+            let runtime = runtime(initial.clone(), &directory).await;
+            runtime
+                .catalog
+                .accept_job(queued_job(&initial, "cap_same_backend"))
+                .await
+                .unwrap();
+            runtime
+                .catalog
+                .queue_job("cap_same_backend", chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap();
+
+            let mut replacement = config(directory.path(), &["camera-a", "camera-b"], false);
+            let crate::config::BackendConfig::Sim(sim) = &mut replacement.instances[1].backend
+            else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.seed = Some(73);
+            let diff = runtime
+                .apply_reloaded_config(replacement, BTreeMap::new(), BTreeMap::new())
+                .await
+                .unwrap();
+            assert_eq!(diff.lifecycle_changed, vec!["camera-b".to_string()]);
+            assert_eq!(
+                runtime
+                    .catalog
+                    .job("cap_same_backend")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                crate::model::JobState::Queued
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn rejected_runtime_reload_leaves_the_generation_and_roster_unchanged() {
+            let directory = TempDir::new().unwrap();
+            let initial = config(directory.path(), &["camera-a"], false);
+            let runtime = runtime(initial, &directory).await;
+            let other_root = directory.path().join("other-output");
+            std::fs::create_dir_all(&other_root).unwrap();
+            let replacement = config(&other_root, &["camera-a"], true);
+            assert!(
+                runtime
+                    .apply_reloaded_config(replacement, BTreeMap::new(), BTreeMap::new())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                runtime.config_snapshot().unwrap().instances[0]
+                    .schedules
+                    .is_empty()
+            );
+            assert_eq!(
+                runtime.registry.ids().unwrap(),
+                vec!["camera-a".to_string()]
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn runtime_config_listener_rejects_invalid_candidates_and_factory_failures_without_mutation()
+         {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+            let app_calls = Arc::new(AtomicUsize::new(0));
+            let event_calls = Arc::new(AtomicUsize::new(0));
+            let listener = RuntimeConfigListener::new(
+                Arc::downgrade(&runtime),
+                {
+                    let app_calls = Arc::clone(&app_calls);
+                    Arc::new(move |_instance| {
+                        app_calls.fetch_add(1, Ordering::AcqRel);
+                        Err(edgecommons::EdgeCommonsError::Facade(
+                            "controlled application facade failure".to_string(),
+                        ))
+                    })
+                },
+                {
+                    let event_calls = Arc::clone(&event_calls);
+                    Arc::new(move |_instance| {
+                        event_calls.fetch_add(1, Ordering::AcqRel);
+                        Err(edgecommons::EdgeCommonsError::Facade(
+                            "controlled events facade failure".to_string(),
+                        ))
+                    })
+                },
+            );
+
+            let mut invalid_raw = core_config_value(directory.path(), &["camera-a"], false);
+            invalid_raw["component"]["instances"][0]["backend"] =
+                json!({ "type": "unknown-camera-protocol" });
+            let invalid = Arc::new(
+                Config::from_value(COMPONENT_NAME, "gw-01", invalid_raw)
+                    .expect("core accepts opaque adapter-specific backend configuration"),
+            );
+            assert!(
+                !listener.on_configuration_change(invalid).await,
+                "an adapter-invalid core generation must be vetoed without facade construction"
+            );
+            assert_eq!(app_calls.load(Ordering::Acquire), 0);
+            assert_eq!(event_calls.load(Ordering::Acquire), 0);
+            assert_eq!(
+                runtime.registry.ids().unwrap(),
+                vec!["camera-a".to_string()]
+            );
+            assert!(
+                runtime.config_snapshot().unwrap().instances[0]
+                    .capture_profiles
+                    .contains_key("main")
+            );
+
+            assert!(
+                !listener
+                    .on_configuration_change(Arc::new(core_config(
+                        directory.path(),
+                        &["camera-a", "camera-b"],
+                        false,
+                    )))
+                    .await,
+                "a facade-factory failure must reject the generation before runtime mutation"
+            );
+            assert_eq!(
+                app_calls.load(Ordering::Acquire),
+                1,
+                "the first replacement camera is the only application facade requested"
+            );
+            assert_eq!(
+                event_calls.load(Ordering::Acquire),
+                0,
+                "events construction must not follow an application-factory failure"
+            );
+            assert_eq!(
+                runtime.registry.ids().unwrap(),
+                vec!["camera-a".to_string()]
+            );
+            assert!(runtime.events.read().unwrap().is_empty());
+            runtime.shutdown().await;
+        }
+
+        #[cfg(all(feature = "standalone", feature = "onvif"))]
+        #[tokio::test]
+        async fn scheduled_reject_skip_emits_event_and_never_accepts_a_job() {
+            let directory = TempDir::new().unwrap();
+            let (port, publishes) = spawn_recording_mqtt_broker().await;
+            let core = facade_core(&directory, port).await;
+            let mut initial = config(directory.path(), &["camera-a"], true);
+            let crate::config::BackendConfig::Sim(sim) = &mut initial.instances[0].backend else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.ptz.supported = true;
+            sim.ptz.status_supported = true;
+            initial.instances[0].ptz.enabled = true;
+            initial.instances[0]
+                .capture_profiles
+                .get_mut("main")
+                .unwrap()
+                .capture_interlock = Some(crate::config::CaptureInterlock::Reject);
+            let runtime = runtime(initial, &directory).await;
+            runtime.events.write().unwrap().insert(
+                "camera-a".to_string(),
+                core.instance("camera-a").unwrap().events(),
+            );
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+            runtime
+                .actor("camera-a")
+                .unwrap()
+                .ptz(
+                    crate::model::PtzRequest::Continuous {
+                        velocity: crate::model::PtzVector {
+                            pan: 0.5,
+                            tilt: 0.0,
+                            zoom: 0.0,
+                        },
+                        timeout: Duration::from_secs(2),
+                    },
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    &runtime.cancellation,
+                )
+                .await
+                .unwrap();
+            let occurrence = ScheduleOccurrence {
+                instance: "camera-a".to_string(),
+                schedule_id: "minute".to_string(),
+                intended_fire_time: chrono::Utc::now(),
+                admit_at: chrono::Utc::now(),
+                jitter: Duration::ZERO,
+            };
+
+            runtime.submit_scheduled(&occurrence).await.unwrap();
+
+            assert!(
+                runtime
+                    .catalog
+                    .jobs_page(Some("camera-a".to_string()), Vec::new(), None, 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a rejected scheduled occurrence must not create a durable capture job"
+            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let (topic, bytes) = loop {
+                if let Some(event) = publishes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(topic, _)| topic.ends_with("/evt/warning/schedule-skipped"))
+                    .cloned()
+                {
+                    break event;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "scheduled reject skip did not publish an operator event"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert!(topic.ends_with("/evt/warning/schedule-skipped"));
+            let event = Message::from_slice(&bytes).unwrap();
+            assert_eq!(event.header.name, "evt");
+            assert_eq!(event.body["severity"], "warning");
+            assert_eq!(event.body["type"], "schedule-skipped");
+            assert_eq!(event.body["context"]["scheduleId"], "minute");
+            assert_eq!(event.body["context"]["code"], "CAMERA_MOVING");
+            runtime.shutdown().await;
+        }
+
+        #[cfg(all(feature = "standalone", feature = "onvif"))]
+        #[tokio::test]
+        async fn reload_adds_and_removes_event_facades_with_the_camera_roster() {
+            let directory = TempDir::new().unwrap();
+            let (port, _) = spawn_recording_mqtt_broker().await;
+            let core = facade_core(&directory, port).await;
+            let initial = config(directory.path(), &["camera-a"], false);
+            let runtime = runtime(initial, &directory).await;
+            let replacement = config(directory.path(), &["camera-a", "camera-b"], false);
+            let mut apps = BTreeMap::new();
+            apps.insert(
+                "camera-b".to_string(),
+                Arc::new(core.instance("camera-b").unwrap().app()),
+            );
+            let mut events = BTreeMap::new();
+            events.insert(
+                "camera-b".to_string(),
+                core.instance("camera-b").unwrap().events(),
+            );
+            let diff = runtime
+                .apply_reloaded_config(replacement, apps, events)
+                .await
+                .unwrap();
+            assert_eq!(diff.added, vec!["camera-b".to_string()]);
+            assert_eq!(
+                runtime
+                    .events
+                    .read()
+                    .unwrap()
+                    .get("camera-b")
+                    .map(EventsFacade::instance_id),
+                Some("camera-b")
+            );
+
+            let removal = config(directory.path(), &["camera-a"], false);
+            runtime
+                .apply_reloaded_config(removal, BTreeMap::new(), BTreeMap::new())
+                .await
+                .unwrap();
+            assert!(
+                !runtime.events.read().unwrap().contains_key("camera-b"),
+                "removing a camera must retire its event facade with the rest of its runtime state"
+            );
+            runtime.shutdown().await;
+        }
+
+        #[cfg(all(feature = "standalone", feature = "onvif"))]
+        #[tokio::test]
+        async fn runtime_config_listener_refreshes_retained_facades_and_applies_roster_and_session_changes()
+         {
+            let directory = TempDir::new().unwrap();
+            let (port, _) = spawn_recording_mqtt_broker().await;
+            let core = facade_core(&directory, port).await;
+            let mut initial = config(directory.path(), &["camera-a", "camera-b"], false);
+            let crate::config::BackendConfig::Sim(sim) = &mut initial.instances[0].backend else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.capture_delay_ms = 1;
+            let runtime = runtime(initial, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+            let generation_before = runtime.registry.snapshot("camera-a").unwrap().generation;
+
+            let app_calls = Arc::new(Mutex::new(Vec::new()));
+            let event_calls = Arc::new(Mutex::new(Vec::new()));
+            let listener = RuntimeConfigListener::new(
+                Arc::downgrade(&runtime),
+                {
+                    let core = Arc::clone(&core);
+                    let app_calls = Arc::clone(&app_calls);
+                    Arc::new(move |instance| {
+                        app_calls.lock().unwrap().push(instance.to_string());
+                        Ok(Arc::new(core.instance(instance)?.app()))
+                    })
+                },
+                {
+                    let core = Arc::clone(&core);
+                    let event_calls = Arc::clone(&event_calls);
+                    Arc::new(move |instance| {
+                        event_calls.lock().unwrap().push(instance.to_string());
+                        Ok(core.instance(instance)?.events())
+                    })
+                },
+            );
+
+            assert!(
+                listener
+                    .on_configuration_change(Arc::new(core_config(
+                        directory.path(),
+                        &["camera-a", "camera-c"],
+                        false,
+                    )))
+                    .await
+            );
+            assert_eq!(
+                runtime.registry.ids().unwrap(),
+                vec!["camera-a".to_string(), "camera-c".to_string()]
+            );
+            assert_eq!(
+                app_calls.lock().unwrap().as_slice(),
+                ["camera-a", "camera-c"]
+            );
+            assert_eq!(
+                event_calls.lock().unwrap().as_slice(),
+                ["camera-a", "camera-c"]
+            );
+            {
+                let events = runtime.events.read().unwrap();
+                assert_eq!(events.len(), 2);
+                assert_eq!(
+                    events.get("camera-a").map(EventsFacade::instance_id),
+                    Some("camera-a")
+                );
+                assert_eq!(
+                    events.get("camera-c").map(EventsFacade::instance_id),
+                    Some("camera-c")
+                );
+            }
+
+            let mut session_replacement =
+                core_config_value(directory.path(), &["camera-a", "camera-c"], false);
+            session_replacement["component"]["instances"][0]["backend"]["seed"] = json!(919);
+            assert!(
+                listener
+                    .on_configuration_change(Arc::new(
+                        Config::from_value(COMPONENT_NAME, "gw-01", session_replacement).unwrap(),
+                    ))
+                    .await
+            );
+            assert_eq!(
+                app_calls.lock().unwrap().as_slice(),
+                ["camera-a", "camera-c", "camera-a", "camera-c"],
+                "every retained instance must receive a current core facade on every generation"
+            );
+            assert_eq!(
+                event_calls.lock().unwrap().as_slice(),
+                ["camera-a", "camera-c", "camera-a", "camera-c"],
+                "retained event facades must be refreshed, not only newly added cameras"
+            );
+            wait_for_online(&runtime, "camera-a").await;
+            assert!(
+                runtime.registry.snapshot("camera-a").unwrap().generation > generation_before,
+                "a same-kind backend change must replace the retained camera session"
+            );
+            assert!(runtime.registry.snapshot("camera-b").is_err());
+            runtime.shutdown().await;
+        }
+
+        #[test]
+        fn cursor_store_preserves_page_boundaries_and_rejects_cross_query_reuse() {
+            let cursors = CursorStore::default();
+            let list_query = json!({ "includeCapabilities": false, "includeUnconfigured": true });
+            let (cameras, unconfigured, next) = cursors
+                .list_page(
+                    &list_query,
+                    None,
+                    Some((
+                        vec![json!({ "instance": "camera-a" })],
+                        vec![json!({ "selector": { "serial": "unconfigured" } })],
+                    )),
+                    1,
+                )
+                .unwrap();
+            assert_eq!(cameras, vec![json!({ "instance": "camera-a" })]);
+            assert!(unconfigured.is_empty());
+            let list_cursor = next.expect("a second retained list item needs a continuation");
+
+            let (cameras, unconfigured, next) = cursors
+                .list_page(&list_query, Some(&list_cursor), None, 1)
+                .unwrap();
+            assert!(cameras.is_empty());
+            assert_eq!(
+                unconfigured,
+                vec![json!({ "selector": { "serial": "unconfigured" } })]
+            );
+            assert!(next.is_none());
+            assert_eq!(
+                cursors
+                    .list_page(
+                        &json!({ "includeCapabilities": true, "includeUnconfigured": true }),
+                        Some(&list_cursor),
+                        None,
+                        1,
+                    )
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::InvalidRequest,
+                "a retained list cursor is bound to its original capability view"
+            );
+
+            let snapshot_query = json!({ "instance": "camera-a" });
+            let (values, next, completed_at) = cursors
+                .snapshot_page(
+                    "ptz-presets",
+                    &snapshot_query,
+                    None,
+                    Some(vec![json!({ "token": "one" }), json!({ "token": "two" })]),
+                    Some(json!("2026-07-11T00:00:00Z")),
+                    1,
+                )
+                .unwrap();
+            assert_eq!(values, vec![json!({ "token": "one" })]);
+            assert_eq!(completed_at, Some(json!("2026-07-11T00:00:00Z")));
+            let snapshot_cursor = next.expect("a retained snapshot needs a continuation");
+            let (values, next, completed_at) = cursors
+                .snapshot_page(
+                    "ptz-presets",
+                    &snapshot_query,
+                    Some(&snapshot_cursor),
+                    None,
+                    None,
+                    1,
+                )
+                .unwrap();
+            assert_eq!(values, vec![json!({ "token": "two" })]);
+            assert!(next.is_none());
+            assert_eq!(completed_at, Some(json!("2026-07-11T00:00:00Z")));
+            assert_eq!(
+                cursors
+                    .snapshot_page(
+                        "different-kind",
+                        &snapshot_query,
+                        Some(&snapshot_cursor),
+                        None,
+                        None,
+                        1,
+                    )
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::InvalidRequest,
+                "a retained snapshot cursor cannot be replayed under another operation"
+            );
+
+            let jobs_query = json!({ "instance": "camera-a", "states": ["SUCCEEDED"] });
+            assert_eq!(cursors.job_before(&jobs_query, None).unwrap(), None);
+            let jobs_cursor = cursors
+                .next_job_cursor(&jobs_query, (42, "cap_stable_page_boundary".to_string()))
+                .unwrap();
+            assert_eq!(
+                cursors.job_before(&jobs_query, Some(&jobs_cursor)).unwrap(),
+                Some((42, "cap_stable_page_boundary".to_string()))
+            );
+            assert_eq!(
+                cursors
+                    .job_before(
+                        &json!({ "instance": "camera-b", "states": ["SUCCEEDED"] }),
+                        Some(&jobs_cursor),
+                    )
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::InvalidRequest,
+                "a durable status cursor is bound to its original filter"
+            );
+        }
+
+        #[test]
+        fn supervisor_dispatcher_enforces_capacity_and_releases_uncommitted_reservations() {
+            assert_eq!(
+                match SupervisorDispatcher::new(String::new(), 1) {
+                    Err(error) => error.code(),
+                    Ok(_) => panic!("an empty dispatcher instance must be rejected"),
+                },
+                crate::ErrorCode::InvalidRequest
+            );
+            assert_eq!(
+                match SupervisorDispatcher::new("camera-a".to_string(), 0) {
+                    Err(error) => error.code(),
+                    Ok(_) => panic!("a zero-capacity dispatcher must be rejected"),
+                },
+                crate::ErrorCode::InvalidRequest
+            );
+
+            let dispatcher = SupervisorDispatcher::new("camera-a".to_string(), 1).unwrap();
+            let reservation = CaptureDispatcher::reserve(&dispatcher).unwrap();
+            assert_eq!(
+                match CaptureDispatcher::reserve(&dispatcher) {
+                    Err(error) => error.code(),
+                    Ok(_) => panic!("the second reservation must observe queue capacity"),
+                },
+                crate::ErrorCode::QueueFull,
+                "the bounded supervisor queue must not over-admit work"
+            );
+            drop(reservation);
+            assert!(
+                CaptureDispatcher::reserve(&dispatcher).is_ok(),
+                "dropping an uncommitted reservation returns the queue slot"
+            );
+        }
+
+        #[tokio::test]
+        async fn simulator_runtime_rejects_invalid_requests_without_creating_durable_work() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+            configuration.instances[1].enabled = false;
+            let runtime = runtime(configuration, &directory).await;
+
+            assert_eq!(
+                runtime
+                    .submit_capture(
+                        "missing-camera".to_string(),
+                        "unknown-instance".to_string(),
+                        None,
+                        None,
+                        serde_json::Map::new(),
+                        "invalid-request-test".to_string(),
+                        "sb/capture-submit",
+                        crate::admission::CapturePriority::Submitted,
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::UnknownInstance
+            );
+            assert_eq!(
+                runtime
+                    .submit_capture(
+                        "camera-a".to_string(),
+                        "unknown-profile".to_string(),
+                        Some("not-configured".to_string()),
+                        None,
+                        serde_json::Map::new(),
+                        "invalid-request-test".to_string(),
+                        "sb/capture-submit",
+                        crate::admission::CapturePriority::Submitted,
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::UnknownCaptureProfile
+            );
+
+            let disabled_group: GroupCaptureRequest = commands::parse_closed(json!({
+                "requestId": "disabled-member-group",
+                "instances": ["camera-a", "camera-b"]
+            }))
+            .unwrap();
+            assert_eq!(
+                runtime
+                    .submit_group(
+                        disabled_group,
+                        "invalid-request-test".to_string(),
+                        crate::admission::CapturePriority::Submitted,
+                        None,
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::CameraDisabled,
+                "group acceptance must validate every member before writing a group record"
+            );
+            assert!(
+                runtime
+                    .catalog
+                    .group_by_ledger(
+                        crate::catalog::LedgerKey::new(
+                            "main",
+                            "sb/capture-group",
+                            "disabled-member-group",
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a rejected group must not leave an idempotency row or partial durable group"
+            );
+
+            assert_eq!(
+                runtime
+                    .discover(DiscoverRequest {
+                        backends: Vec::new(),
+                        timeout_ms: 100,
+                        limit: 1,
+                        cursor: None,
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::UnsupportedCapability,
+                "discovery respects the explicit configuration gate"
+            );
+            assert_eq!(
+                runtime
+                    .cancel_capture(CancelRequest {
+                        request_id: "missing-capture-cancel".to_string(),
+                        capture_id: Some("cap_missing".to_string()),
+                        capture_group_id: None,
+                        reason: None,
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::CaptureNotFound
+            );
+            assert_eq!(
+                runtime
+                    .reconnect(ReconnectRequest {
+                        instance: None,
+                        request_id: "ambiguous-reconnect".to_string(),
+                        reason: None,
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::InstanceRequired,
+                "multi-camera reconnect requires an explicit target"
+            );
+            assert_eq!(
+                runtime
+                    .reconnect(ReconnectRequest {
+                        instance: Some("camera-b".to_string()),
+                        request_id: "disabled-reconnect".to_string(),
+                        reason: None,
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::CameraDisabled
+            );
+            assert_eq!(
+                runtime
+                    .perform_presets(
+                        commands::parse_closed(json!({
+                            "operation": "list",
+                            "instance": "camera-a",
+                            "limit": 1
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::PtzDisabled
+            );
+            assert!(
+                runtime
+                    .catalog
+                    .jobs_page(None, Vec::new(), None, 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "rejected direct requests must not allocate capture jobs"
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn simulator_runtime_submission_retries_replay_existing_work_and_reject_changes() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+            let runtime = runtime(configuration, &directory).await;
+
+            let metadata = serde_json::Map::from_iter([(
+                "lot".to_string(),
+                serde_json::Value::String("A-17".to_string()),
+            )]);
+            let first = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "submitted-idempotency".to_string(),
+                    None,
+                    Some(30_000),
+                    metadata.clone(),
+                    "original-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let first_capture_id = match first {
+                crate::catalog::AcceptJobOutcome::Inserted(record) => record.capture_id,
+                other => panic!("first submitted capture must insert durable work, got {other:?}"),
+            };
+            let retry = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "submitted-idempotency".to_string(),
+                    None,
+                    Some(30_000),
+                    metadata.clone(),
+                    "retry-correlation-must-not-replace-origin".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                retry,
+                crate::catalog::AcceptJobOutcome::Existing(record)
+                    if record.capture_id == first_capture_id
+                        && record.origin_correlation_id.as_deref() == Some("original-correlation")
+            ));
+            let mut changed_metadata = metadata;
+            changed_metadata.insert(
+                "lot".to_string(),
+                serde_json::Value::String("B-18".to_string()),
+            );
+            assert!(matches!(
+                runtime
+                    .submit_capture(
+                        "camera-a".to_string(),
+                        "submitted-idempotency".to_string(),
+                        None,
+                        Some(30_000),
+                        changed_metadata,
+                        "changed-correlation".to_string(),
+                        "sb/capture-submit",
+                        crate::admission::CapturePriority::Submitted,
+                    )
+                    .await
+                    .unwrap(),
+                crate::catalog::AcceptJobOutcome::Conflict
+            ));
+
+            let group_request = GroupCaptureRequest {
+                request_id: "group-idempotency".to_string(),
+                instances: vec!["camera-a".to_string(), "camera-b".to_string()],
+                capture_profile: None,
+                profile_overrides: BTreeMap::new(),
+                timeout_ms: Some(30_000),
+                metadata: serde_json::Map::new(),
+            };
+            let group = runtime
+                .submit_group(
+                    group_request.clone(),
+                    "original-group-correlation".to_string(),
+                    crate::admission::CapturePriority::Submitted,
+                    None,
+                )
+                .await
+                .unwrap();
+            let replay = runtime
+                .submit_group(
+                    group_request.clone(),
+                    "retry-group-correlation".to_string(),
+                    crate::admission::CapturePriority::Submitted,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(replay.group_id, group.group_id);
+            assert_eq!(
+                replay.origin_correlation_id.as_deref(),
+                Some("original-group-correlation")
+            );
+            let mut changed_group = group_request;
+            changed_group.timeout_ms = Some(31_000);
+            assert_eq!(
+                runtime
+                    .submit_group(
+                        changed_group,
+                        "changed-group-correlation".to_string(),
+                        crate::admission::CapturePriority::Submitted,
+                        None,
+                    )
+                    .await
+                    .unwrap_err()
+                    .code(),
+                crate::ErrorCode::IdempotencyConflict
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn simulator_runtime_scheduled_admission_terminalizes_and_deduplicates_occurrences() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], true);
+            let crate::config::BackendConfig::Sim(sim) = &mut configuration.instances[0].backend
+            else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.capture_delay_ms = 1;
+            let runtime = runtime(configuration, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let intended_fire_time = chrono::Utc::now();
+            let occurrence = ScheduleOccurrence {
+                instance: "camera-a".to_string(),
+                schedule_id: "minute".to_string(),
+                intended_fire_time,
+                admit_at: intended_fire_time,
+                jitter: Duration::ZERO,
+            };
+            runtime.submit_scheduled(&occurrence).await.unwrap();
+            let jobs = runtime
+                .catalog
+                .jobs_page(Some("camera-a".to_string()), Vec::new(), None, 10)
+                .await
+                .unwrap();
+            assert_eq!(jobs.len(), 1);
+            let capture_id = jobs[0].capture_id.clone();
+            assert_eq!(jobs[0].trigger["type"], "schedule");
+            assert_eq!(jobs[0].trigger["scheduleId"], "minute");
+            assert_eq!(
+                wait_for_terminal(&runtime, &capture_id).await.state,
+                crate::model::JobState::Succeeded
+            );
+            assert!(
+                !runtime
+                    .has_schedule_overlap("camera-a", "minute")
+                    .await
+                    .unwrap()
+            );
+
+            runtime.submit_scheduled(&occurrence).await.unwrap();
+            let duplicate_page = runtime
+                .catalog
+                .jobs_page(Some("camera-a".to_string()), Vec::new(), None, 10)
+                .await
+                .unwrap();
+            assert_eq!(duplicate_page.len(), 1);
+            assert_eq!(duplicate_page[0].capture_id, capture_id);
+            assert_eq!(
+                runtime
+                    .catalog
+                    .latest_schedule_occurrence("camera-a", "minute")
+                    .await
+                    .unwrap(),
+                Some(intended_fire_time.timestamp_millis())
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn simulator_runtime_schedule_loop_skips_overlapping_occurrences() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], true);
+            configuration.instances[0].schedules[0].cron = "* * * * * *".to_string();
+            let plan = SchedulePlan::compile(
+                "camera-a".to_string(),
+                &configuration.instances[0].schedules[0],
+            )
+            .unwrap();
+            let runtime = runtime(configuration, &directory).await;
+            let cancellation = CancellationToken::new();
+            let runner =
+                tokio::spawn(Arc::clone(&runtime).run_schedule(plan, cancellation.clone()));
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                if !runtime
+                    .catalog
+                    .jobs_page(Some("camera-a".to_string()), Vec::new(), None, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the one-second schedule did not durably admit an occurrence"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                runtime
+                    .has_schedule_overlap("camera-a", "minute")
+                    .await
+                    .unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(1_250)).await;
+            cancellation.cancel();
+            runner.await.unwrap();
+            assert_eq!(
+                runtime
+                    .catalog
+                    .jobs_page(Some("camera-a".to_string()), Vec::new(), None, 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "an overlap-policy skip must consume later fires without admitting a second job"
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn simulator_runtime_moving_reject_interlock_skips_scheduled_admission() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], true);
+            let crate::config::BackendConfig::Sim(sim) = &mut configuration.instances[0].backend
+            else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.ptz.supported = true;
+            sim.ptz.status_supported = true;
+            configuration.instances[0].ptz.enabled = true;
+            configuration.instances[0]
+                .capture_profiles
+                .get_mut("main")
+                .unwrap()
+                .capture_interlock = Some(crate::config::CaptureInterlock::Reject);
+            let runtime = runtime(configuration, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+            runtime
+                .actor("camera-a")
+                .unwrap()
+                .ptz(
+                    crate::model::PtzRequest::Continuous {
+                        velocity: crate::model::PtzVector {
+                            pan: 0.5,
+                            tilt: 0.0,
+                            zoom: 0.0,
+                        },
+                        timeout: Duration::from_secs(2),
+                    },
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    &runtime.cancellation,
+                )
+                .await
+                .unwrap();
+            let occurrence = ScheduleOccurrence {
+                instance: "camera-a".to_string(),
+                schedule_id: "minute".to_string(),
+                intended_fire_time: chrono::Utc::now(),
+                admit_at: chrono::Utc::now(),
+                jitter: Duration::ZERO,
+            };
+            runtime.submit_scheduled(&occurrence).await.unwrap();
+            assert!(
+                runtime
+                    .catalog
+                    .jobs_page(Some("camera-a".to_string()), Vec::new(), None, 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a moving camera with reject interlock must not create a scheduled capture"
+            );
+            runtime.shutdown().await;
+        }
+
+        #[cfg(all(feature = "standalone", feature = "onvif"))]
+        #[tokio::test]
+        async fn runtime_startup_router_and_deferred_capture_flows_use_real_core_facades() {
+            let directory = TempDir::new().unwrap();
+            let router = RuntimeCommandRouter::new();
+            let (port, publishes) = spawn_recording_mqtt_broker().await;
+            let core = facade_core_with_router(&directory, port, Some(Arc::clone(&router))).await;
+            let inbox = core
+                .commands()
+                .expect("the MQTT core fixture must expose a command inbox");
+            for verb in CAMERA_COMMAND_VERBS {
+                assert!(
+                    inbox.verbs().contains(verb),
+                    "router registration omitted required camera verb {verb}"
+                );
+            }
+            let deferred = inbox.deferred_replies();
+
+            match router
+                .dispatch(
+                    "sb/list",
+                    command_message("sb/list", "before-runtime", json!({ "limit": 1 })),
+                    deferred.clone(),
+                )
+                .await
+            {
+                CommandOutcome::ImmediateError(error) => {
+                    assert_eq!(error.code, "CAMERA_UNAVAILABLE");
+                }
+                other => panic!("uninstalled router must reject requests, got {other:?}"),
+            }
+
+            let mut configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+            configuration.global.state.directory = Some(
+                directory
+                    .path()
+                    .join("startup-state")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            for camera in &mut configuration.instances {
+                let crate::config::BackendConfig::Sim(sim) = &mut camera.backend else {
+                    panic!("test fixture must use the simulator backend");
+                };
+                sim.capture_delay_ms = 1;
+            }
+            let resources = prepare_startup_resources(&configuration, Platform::Host)
+                .await
+                .unwrap();
+            let mut apps = BTreeMap::new();
+            let mut events = BTreeMap::new();
+            for camera in &configuration.instances {
+                let instance = core.instance(&camera.id).unwrap();
+                apps.insert(camera.id.clone(), Arc::new(instance.app()));
+                events.insert(camera.id.clone(), instance.events());
+            }
+            let core_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let readiness = {
+                let core_ready = Arc::clone(&core_ready);
+                RuntimeReadiness::new(Arc::new(move |ready| {
+                    core_ready.store(ready, std::sync::atomic::Ordering::Release);
+                }))
+            };
+            let runtime = CameraRuntime::start(
+                configuration,
+                resources,
+                RuntimeServices {
+                    apps,
+                    events,
+                    outbox_events: core.events(),
+                    readiness: readiness.clone(),
+                    backend_context: BackendRuntimeContext::new(None),
+                    messaging: core.messaging().unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+            for instance in ["camera-a", "camera-b"] {
+                wait_for_online(&runtime, instance).await;
+            }
+            router.install(runtime.clone()).unwrap();
+            readiness.complete_startup();
+            assert!(
+                core_ready.load(std::sync::atomic::Ordering::Acquire),
+                "readiness must remain closed until runtime installation then become true"
+            );
+
+            let direct_publish_index = publishes.lock().unwrap().len();
+            let direct_continuation = match router
+                .dispatch(
+                    "sb/capture",
+                    command_message(
+                        "sb/capture",
+                        "startup-direct",
+                        json!({ "instance": "camera-a", "requestId": "startup-direct" }),
+                    ),
+                    deferred.clone(),
+                )
+                .await
+            {
+                CommandOutcome::DeferredWithContinuation { continuation, .. } => continuation,
+                other => panic!("direct capture must use deferred hand-off, got {other:?}"),
+            };
+            direct_continuation.await.unwrap();
+            let direct = runtime
+                .catalog
+                .job_by_ledger(
+                    crate::catalog::LedgerKey::new("camera-a", "sb/capture", "startup-direct")
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("deferred direct capture must be durably accepted");
+            assert_eq!(
+                wait_for_terminal(&runtime, &direct.capture_id).await.state,
+                crate::model::JobState::Succeeded
+            );
+            let direct_reply = wait_for_recorded_reply(&publishes, direct_publish_index).await;
+            assert_eq!(direct_reply.body["ok"], true);
+            assert_eq!(direct_reply.body["result"]["captureId"], direct.capture_id);
+
+            let group_publish_index = publishes.lock().unwrap().len();
+            let group_continuation = match router
+                .dispatch(
+                    "sb/capture-group",
+                    command_message(
+                        "sb/capture-group",
+                        "startup-group",
+                        json!({
+                            "requestId": "startup-group",
+                            "instances": ["camera-a", "camera-b"]
+                        }),
+                    ),
+                    deferred.clone(),
+                )
+                .await
+            {
+                CommandOutcome::DeferredWithContinuation { continuation, .. } => continuation,
+                other => panic!("direct group capture must use deferred hand-off, got {other:?}"),
+            };
+            group_continuation.await.unwrap();
+            let group = runtime
+                .catalog
+                .group_by_ledger(
+                    crate::catalog::LedgerKey::new("main", "sb/capture-group", "startup-group")
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("deferred group capture must be durably accepted");
+            let group = wait_for_group_terminal(&runtime, &group.group_id).await;
+            assert_eq!(group.members.len(), 2);
+            assert!(
+                group
+                    .members
+                    .iter()
+                    .all(|member| member.state == crate::model::JobState::Succeeded)
+            );
+            let group_reply = wait_for_recorded_reply(&publishes, group_publish_index).await;
+            assert_eq!(group_reply.body["ok"], true);
+            assert_eq!(group_reply.body["result"]["captureGroupId"], group.group_id);
+            assert_eq!(
+                group_reply.body["result"]["members"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+
+            router.begin_shutdown();
+            match router
+                .dispatch(
+                    "sb/list",
+                    command_message("sb/list", "after-shutdown", json!({ "limit": 1 })),
+                    deferred,
+                )
+                .await
+            {
+                CommandOutcome::ImmediateError(error) => {
+                    assert_eq!(error.code, "COMPONENT_STOPPING");
+                }
+                other => panic!("stopping router must reject requests, got {other:?}"),
+            }
+            runtime.shutdown().await;
+            assert!(
+                !core_ready.load(std::sync::atomic::Ordering::Acquire),
+                "runtime shutdown must close the readiness bridge"
+            );
+            inbox.stop().await;
+        }
+    }
+}
