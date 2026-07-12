@@ -6048,7 +6048,7 @@ mod tests {
             feature = "onvif",
             feature = "capacity-harness"
         ))]
-        use serde::Serialize;
+        use serde::{Serialize, Value};
         #[cfg(all(
             target_os = "linux",
             feature = "standalone",
