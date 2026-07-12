@@ -16,6 +16,7 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
     && apt-get install -y --no-install-recommends \
       libgstreamer1.0-dev \
       libgstreamer-plugins-base1.0-dev \
+      libclang-dev \
       gstreamer1.0-plugins-base \
       gstreamer1.0-plugins-good \
       gstreamer1.0-plugins-bad \
