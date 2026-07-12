@@ -24,7 +24,7 @@ current branch; `Blocked` means the requirement remains a release gate and is no
 | TR-SEC | Validated locally | SSRF/DNS/XML/decompression/path/credential and no-overwrite tests; deployment threat review remains required. |
 | TR-OBS | Validated locally | Readiness, storage and outbox alarm tests. |
 | TR-RUNTIME | Validated locally | Startup/command races, linearizable readiness, atomic reload rejection, and safe supervisor-retry tests. |
-| TR-DEPLOY | Blocked | HOST simulator smoke exists; Greengrass and kind/hardware-cluster gates are not recorded. |
+| TR-DEPLOY | Blocked | HOST simulator smoke exists. A Linux lab build preflight on 2026-07-12 compiled the staged source archive `9aa9ce06bf7b111c9511c4f18edceafa5133b87590e87b16034f3fd97b6b0f91` with `cargo +1.90.0 build --locked --release --no-default-features --features greengrass,onvif`, producing a release binary in the isolated container. This establishes Linux feature-build compatibility only; no recipe artifact/config deployment, Greengrass IPC command flow, camera-VLAN capture, or Kubernetes validation has been recorded. |
 | TR-INTEGRATION | Blocked | File-replicator and bottling-company evidence is not recorded. |
 | TR-VALIDATION | Validated for simulator/native coverage | On Linux lab `enp7s0`, the committed `4ecb245512b9479c41eabc5f899efa0d75ac7944` source archive `c206cade567518b8fe8c157355c1badbc84fe15204cb9a4d56872d6fc5bdff9b` produced 42,899/46,992 covered lines (91.29%) in the hardened `standalone,native-all` aggregate. The scope includes 350 deterministic serial library tests, four pinned MediaMTX H.264/H.265 first-frame/warm-session fixtures, same-container Aravis discovery, and a two-frame Aravis capture fixture. Ordinary tests remain network-none; live fixtures are separately scoped. This is not L2, cross-container/cross-host GigE, physical-camera, hardware-compatibility, or global-adapter coverage evidence. Windows Docker Desktop is invalid evidence for the unfulfilled L2 claim. Scale/soak is tracked separately. |
 | TR-DOCS | Validated | Diátaxis set, exact command/event/terminal references, deployment runbooks, and compatibility register were audited against source. |
@@ -43,6 +43,7 @@ CAMERA_ADAPTER_DOCKER_E2E=1 CAMERA_ADAPTER_DOCKER_E2E_HOST=127.0.0.1 CAMERA_ADAP
 simulators/run-rtsp-native-coverage.ps1 -CoverageOutput C:\tmp\camera-adapter-rtsp-coverage
 bash simulators/run-native-all-validation.sh --skip-build --coverage-output /home/marc/camera-adapter-native-all-validation-20260712T160300/coverage-native-all --interface enp7s0
 bash simulators/run-capacity-validation-container.sh --artifact-dir /home/marc/camera-adapter-capacity-validation-20260712T153000/artifacts --source-revision 7dadd09c35e96abfa7fdfedc9c7a9d65cc11a421 --source-bundle /home/marc/camera-adapter-capacity-validation-20260712T153000/camera-adapter-capacity-lab-20260712T153000.tar.gz --soak-duration 15m
+cargo +1.90.0 build --locked --release --no-default-features --features greengrass,onvif
 ```
 
 No physical camera is represented as passing. Physical-camera validation is waived because hardware is not

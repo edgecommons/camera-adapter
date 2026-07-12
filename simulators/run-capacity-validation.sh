@@ -396,10 +396,55 @@ short_exclusions = short.get("omittedFromThisShortRun", [])
 soak_exclusions = soak.get("omittedFromThisSmoke", [])
 exclusions = sorted({*short_exclusions, *soak_exclusions})
 
+# The shell validator has already rejected failures before this report is generated.
+# Keep the report's verdict tied to the same observable values so the report remains
+# meaningful when it is copied away from the JSON evidence package.
+frame = short.get("frame") if isinstance(short.get("frame"), dict) else {}
+short_memory = idle_memory if isinstance(idle_memory, dict) else {}
+short_latency_p95 = {verb: short_latency[verb].get("p95Micros") for verb in ("sb/list", "sb/status", "sb/ptz-stop")}
+complete_samples = [sample for sample in soak_samples if isinstance(sample, dict) and sample.get("phase") == "soak-complete"]
+complete_sample = complete_samples[0] if len(complete_samples) == 1 else {}
+scheduled_values = [scheduled_jobs.get(f"camera-{index:04d}") for index in range(8)]
+
+criteria = (
+    ("Short proof: configured cameras", "exactly 1,024", short.get("configuredCameras"), short.get("configuredCameras") == 1024),
+    ("Short proof: enabled simulated sessions", "exactly 256", short.get("enabledSimulatedSessions"), short.get("enabledSimulatedSessions") == 256),
+    ("Short proof: concurrent 8MP capture target", "exactly 32", short.get("concurrentCaptureTarget"), short.get("concurrentCaptureTarget") == 32),
+    ("Short proof: frame", "3,264×2,448 Mono8 / 7,990,272 bytes", f"{frame.get('width')}×{frame.get('height')} {frame.get('pixelFormat')} / {frame.get('bytesPerFrame')} bytes", frame.get("width") == 3264 and frame.get("height") == 2448 and frame.get("pixelFormat") == "Mono8" and frame.get("bytesPerFrame") == 7_990_272),
+    ("Short proof: 32-member group", "Succeeded / 32 successful", f"{short.get('groupTerminalState')} / {short.get('groupSuccessfulMembers')}", short.get("groupTerminalState") == "Succeeded" and short.get("groupSuccessfulMembers") == 32),
+    ("Short proof: overflow capture", "Succeeded", short.get("overflowCaptureTerminalState"), short.get("overflowCaptureTerminalState") == "Succeeded"),
+    ("Short proof: peak idle-session RSS growth", f"≤ {short_memory.get('maximumAllowedDeltaBytes')} bytes", f"{short_memory.get('startupPeakDeltaBytes')} bytes", isinstance(short_memory.get("startupPeakDeltaBytes"), int) and isinstance(short_memory.get("maximumAllowedDeltaBytes"), int) and short_memory.get("startupPeakDeltaBytes") <= short_memory.get("maximumAllowedDeltaBytes")),
+    ("Short proof: saturated router p95", "each command ≤ 250,000 µs", ", ".join(f"{verb}={short_latency_p95[verb]}" for verb in short_latency_p95) + " µs", all(isinstance(value, int) and value <= 250_000 for value in short_latency_p95.values())),
+    ("Smoke: duration", "exactly 900 seconds", soak.get("durationSeconds"), soak.get("durationSeconds") == 900),
+    ("Smoke: configured cameras / enabled sessions", "1,024 / 256", f"{soak.get('configuredCameras')} / {soak.get('enabledSimulatedSessions')}", soak.get("configuredCameras") == 1024 and soak.get("enabledSimulatedSessions") == 256),
+    ("Smoke: accepted direct capture submissions", "at least 400", soak.get("submittedCaptures"), isinstance(soak.get("submittedCaptures"), int) and soak.get("submittedCaptures") >= 400),
+    ("Smoke: reconnects", "at least 14", soak.get("reconnects"), isinstance(soak.get("reconnects"), int) and soak.get("reconnects") >= 14),
+    ("Smoke: valid reload applications", "at least 4", soak.get("reloads"), isinstance(soak.get("reloads"), int) and soak.get("reloads") >= 4),
+    ("Smoke: scheduled jobs for eight named cameras", "each at least 120", f"{len(scheduled_values)} cameras; minimum {min(scheduled_values) if all(isinstance(value, int) for value in scheduled_values) else 'n/a'}", len(scheduled_values) == 8 and all(isinstance(value, int) and value >= 120 for value in scheduled_values)),
+    ("Smoke: terminal roster", "256 online cameras / 256 live actors", f"{complete_sample.get('onlineCameras')} / {complete_sample.get('liveActorCount')}", complete_sample.get("onlineCameras") == 256 and complete_sample.get("liveActorCount") == 256),
+)
+require(all(passed for _, _, _, passed in criteria), "acceptance criteria")
+criteria_rows = [
+    f"| {cell(name)} | {display(required)} | {display(observed)} | {'PASS' if passed else 'FAIL'} |"
+    for name, required, observed, passed in criteria
+]
+
 lines = [
     "# Camera-adapter capacity test report",
     "",
-    "This report is generated only after both capacity JSON artifacts validate and their SHA-256 attestations chain to the immutable run manifest. It covers the short 8MP admission proof and the bounded 15-minute simulator smoke; it is not a 24-hour soak or a hardware result.",
+    "This report is generated only after both capacity JSON artifacts validate and their SHA-256 attestations chain to the write-once run manifest. It covers the short 8MP admission proof and the bounded 15-minute simulator smoke; it is not a 24-hour soak or a hardware result.",
+    "",
+    "## Overall verdict",
+    "",
+    "**PASS — all enforced short-proof and 15-minute-smoke acceptance criteria passed.**",
+    "",
+    "The direct-capture figure below is the number of accepted capture submissions. This bounded smoke does not establish terminal completion of every accepted submission; the separate 32-member short-proof group does establish terminal success for all 32 members.",
+    "",
+    "## Enforced acceptance criteria and observed results",
+    "",
+    "| Criterion | Required | Observed | Result |",
+    "|---|---|---|---|",
+    *criteria_rows,
     "",
     "## Provenance",
     "",
@@ -456,7 +501,7 @@ lines.extend([
     f"| Duration | {display(soak.get('durationSeconds'))} seconds |",
     f"| Configured cameras / enabled sessions | {display(soak.get('configuredCameras'))} / {display(soak.get('enabledSimulatedSessions'))} |",
     f"| Scheduled cameras | {display(soak.get('scheduledCameras'))} |",
-    f"| Submitted direct captures | {display(soak.get('submittedCaptures'))} |",
+    f"| Accepted direct capture submissions (not terminal-completion count) | {display(soak.get('submittedCaptures'))} |",
     f"| Reconnects | {display(soak.get('reconnects'))} |",
     f"| Valid reload applications | {display(soak.get('reloads'))} |",
     "",
@@ -506,6 +551,9 @@ lines.extend([
     f"| `short-capacity-artifact-attestation.json` | `{short_attestation_hash}` |",
     f"| `fifteen-minute-soak-summary.json` | `{soak_hash}` |",
     f"| `fifteen-minute-soak-artifact-attestation.json` | `{soak_attestation_hash}` |",
+    "| `capacity-test-report-artifact-attestation.json` | Created after this report; records this report's SHA-256 and the same run-manifest SHA-256. |",
+    "",
+    "The report attestation is necessarily not hash-listed above because it is written after this report is durably created and made read-only. Verify it by comparing its `artifact` hash with this report and its `runManifest` hash with `capacity-run-manifest.json`.",
     "",
     "## Explicit exclusions",
     "",

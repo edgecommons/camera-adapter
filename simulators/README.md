@@ -133,10 +133,13 @@ hardware compatibility result. It must be reported with that scope even when it 
 When the 15-minute mode succeeds, the runner additionally writes a deterministic,
 human-readable `capacity-test-report.md` only after both JSON artifacts have passed validation and both
 JSON attestations have chained to the run manifest. The report contains source/toolchain/kernel/command
-provenance; short-proof capacity, idle-session RSS, p95, and resource results; 15-minute workload and
-per-camera schedule counts; p95 and resource summaries; artifact hashes; and explicit exclusions. A
-separate `capacity-test-report-artifact-attestation.json` binds the report SHA-256 to the same run
-manifest. No report is written for short-only mode because it would be incomplete.
+provenance; an explicit PASS verdict and criteria-versus-observed-results table; short-proof capacity,
+idle-session RSS, p95, and resource results; 15-minute workload and per-camera schedule counts; p95 and
+resource summaries; artifact hashes; and explicit exclusions. It labels direct captures as accepted
+submissions, not a terminal-completion count. A separate
+`capacity-test-report-artifact-attestation.json` binds the report SHA-256 to the same run manifest and
+is identified in the report with verification instructions. No report is written for short-only mode
+because it would be incomplete.
 
 This is not the 24-hour soak. The full soak execution is deferred to a later validation phase and is not
 a current gate. It remains necessary before any future scale-performance or general-release claim, along
