@@ -50,7 +50,8 @@ The in-process MQTT fixture uses loopback and continues to work in that namespac
 `cargo fetch --locked` may populate named Cargo cache volumes; it does not run the workload or write
 evidence. This removes any dependency on host Cargo or Python. To work with rootless/user-namespace Docker,
 the wrapper determines the invoking host uid:gid, uses a temporary root setup container with only `CHOWN`
-to initialize the three named Cargo volumes, and then runs prefetch and workload as that uid:gid with
+and `DAC_READ_SEARCH` to initialize the three named Cargo volumes (including previously created private
+Cargo directories), and then runs prefetch and workload as that uid:gid with
 `HOME=/tmp`. Before Cargo runs, the workload identity creates and removes a private probe in the new/empty
 host-owned artifact directory. The wrapper never makes evidence directories or files world-writable.
 

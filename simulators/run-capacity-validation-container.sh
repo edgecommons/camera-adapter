@@ -94,7 +94,7 @@ docker build --pull=false \
 for volume in "$target_volume" "$registry_volume" "$git_volume"; do
     docker volume create "$volume" >/dev/null
     docker run --rm --read-only \
-        --user 0:0 --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges:true \
+        --user 0:0 --cap-drop ALL --cap-add CHOWN --cap-add DAC_READ_SEARCH --security-opt no-new-privileges:true \
         -v "$volume:/volume" \
         --entrypoint /bin/chown "$image" \
         -R --no-dereference -- "$host_uid:$host_gid" /volume
