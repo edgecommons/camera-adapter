@@ -82,7 +82,7 @@ printf -v invoked_command '%q ' "${original_command[@]}"
 invoked_command=${invoked_command% }
 started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 cargo_version=$(cargo --version)
-rustc_version=$(cargo rustc --version)
+rustc_version=$(rustc --version)
 kernel=$(uname -srmo)
 manifest="$artifact_root/capacity-run-manifest.json"
 python3 - "$manifest" "$started_at_utc" "$invoked_command" "$source_revision" "$source_tree_state" "$source_provenance" "$source_bundle_sha256" "$cargo_version" "$rustc_version" "$kernel" <<'PY'
