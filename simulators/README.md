@@ -53,7 +53,9 @@ the wrapper determines the invoking host uid:gid, uses a temporary root setup co
 and `DAC_READ_SEARCH` to initialize the three named Cargo volumes (including previously created private
 Cargo directories), and then runs prefetch and workload as that uid:gid with
 `HOME=/tmp`. Before Cargo runs, the workload identity creates and removes a private probe in the new/empty
-host-owned artifact directory. The wrapper never makes evidence directories or files world-writable.
+host-owned artifact directory. The staged workspace must include both `core/libs/rust` and `core/proto`,
+which EdgeCommons' build script uses to generate its protocol bindings. The wrapper never makes evidence
+directories or files world-writable.
 
 The inner `run-capacity-validation.sh` enables the non-default `capacity-harness` feature, which isolates
 this live-lab-only workload from ordinary `cargo llvm-cov --lib` coverage. No production code is excluded:

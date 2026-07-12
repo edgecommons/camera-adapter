@@ -77,6 +77,8 @@ host_gid=$(id -g)
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 adapter_root=$(cd -- "$script_dir/.." && pwd)
 workspace_root=$(cd -- "$adapter_root/.." && pwd)
+[[ -f $workspace_root/core/libs/rust/Cargo.toml ]] || fail "workspace root must include core/libs/rust: $workspace_root"
+[[ -f $workspace_root/core/proto/edgecommons/v1/value.proto ]] || fail "workspace root must include core/proto build inputs: $workspace_root"
 
 if [[ -e $artifact_dir || -L $artifact_dir ]]; then
     [[ -d $artifact_dir && ! -L $artifact_dir ]] || fail "artifact directory must be a real directory, not a file or symlink: $artifact_dir"
