@@ -42,6 +42,7 @@ done
     exit 2
 }
 command -v docker >/dev/null || { printf 'docker is required\n' >&2; exit 127; }
+command -v id >/dev/null || { printf 'id is required to select the workload identity\n' >&2; exit 127; }
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 adapter_root=$(cd -- "$script_dir/.." && pwd)
@@ -71,8 +72,19 @@ fi
 target_volume=camera-adapter-native-all-target
 registry_volume=camera-adapter-native-all-registry
 git_volume=camera-adapter-native-all-git
+host_uid=$(id -u)
+host_gid=$(id -g)
+[[ $host_uid =~ ^[0-9]+$ && $host_gid =~ ^[0-9]+$ ]] || {
+    printf 'host uid:gid must be numeric\n' >&2
+    exit 2
+}
 for volume in "$target_volume" "$registry_volume" "$git_volume"; do
     docker volume create "$volume" >/dev/null
+    docker run --rm --read-only \
+        --user 0:0 --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges:true \
+        -v "$volume:/volume" \
+        --entrypoint /bin/chown "$image" \
+        -R --no-dereference -- "$host_uid:$host_gid" /volume
 done
 
 source_mount="$workspace_root:/edgecommons:ro"
@@ -83,6 +95,7 @@ git_mount="$git_volume:/usr/local/cargo/git"
 network_none_run=(
     docker run --rm --network none --read-only --tmpfs /tmp:size=2g,mode=1777
     --cap-drop ALL --security-opt no-new-privileges:true
+    --user "$host_uid:$host_gid"
     -v "$source_mount"
     -v "$target_mount"
     -v "$registry_mount"
@@ -98,6 +111,7 @@ network_none_run=(
 prefetch_run=(
     docker run --rm --network bridge --read-only --tmpfs /tmp:size=64m,mode=1777
     --cap-drop ALL --security-opt no-new-privileges:true
+    --user "$host_uid:$host_gid"
     -v "$source_mount"
     -v "$target_mount"
     -v "$registry_mount"
@@ -158,6 +172,7 @@ run_rtsp_fixture() {
     printf 'Running MediaMTX fixture %s (%s)\n' "$path" "$test_filter"
     docker run --rm --network "$rtsp_network" --read-only --tmpfs /tmp:size=64m,mode=1777 \
         --cap-drop ALL --security-opt no-new-privileges:true \
+        --user "$host_uid:$host_gid" \
         -v "$source_mount" \
         -v "$target_mount" \
         -v "$registry_mount" \
@@ -181,6 +196,7 @@ done
 run_genicam_fixture() {
     docker run --rm --network host --read-only --tmpfs /tmp:size=64m,mode=1777 \
         --cap-drop ALL --security-opt no-new-privileges:true \
+        --user "$host_uid:$host_gid" \
         -v "$source_mount" \
         -v "$target_mount" \
         -v "$registry_mount" \
