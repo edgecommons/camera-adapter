@@ -159,7 +159,10 @@ mediamtx_container=$(docker compose -f "$compose_file" ps -q mediamtx)
     printf 'MediaMTX is not running; omit --skip-simulator-start or start the Compose service first\n' >&2
     exit 1
 }
-mapfile -t mediamtx_networks < <(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$mediamtx_container")
+mapfile -t mediamtx_networks < <(
+    docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' "$mediamtx_container" \
+        | awk 'NF'
+)
 [[ ${#mediamtx_networks[@]} -eq 1 ]] || {
     printf 'expected exactly one Compose network for MediaMTX, found %d\n' "${#mediamtx_networks[@]}" >&2
     exit 1
