@@ -81,8 +81,8 @@ fi
 printf -v invoked_command '%q ' "${original_command[@]}"
 invoked_command=${invoked_command% }
 started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-cargo_version=$(cargo +1.85.0 --version)
-rustc_version=$(cargo +1.85.0 rustc --version)
+cargo_version=$(cargo --version)
+rustc_version=$(cargo rustc --version)
 kernel=$(uname -srmo)
 manifest="$artifact_root/capacity-run-manifest.json"
 python3 - "$manifest" "$started_at_utc" "$invoked_command" "$source_revision" "$source_tree_state" "$source_provenance" "$source_bundle_sha256" "$cargo_version" "$rustc_version" "$kernel" <<'PY'
@@ -515,7 +515,7 @@ PY
 }
 
 cd -- "$adapter_root"
-cargo +1.85.0 test --locked --no-default-features --features standalone,onvif,capacity-harness --lib \
+cargo test --locked --no-default-features --features standalone,onvif,capacity-harness --lib \
     runtime::tests::simulator_runtime::short_linux_capacity_proves_1024_configured_256_sessions_and_32_captures \
     -- --ignored --exact --test-threads 1
 
@@ -529,7 +529,7 @@ if [[ -z $soak_duration ]]; then
 fi
 
 CAMERA_ADAPTER_CAPACITY_SOAK_DURATION_SECS=900 \
-    cargo +1.85.0 test --locked --no-default-features --features standalone,onvif,capacity-harness --lib \
+    cargo test --locked --no-default-features --features standalone,onvif,capacity-harness --lib \
     runtime::tests::simulator_runtime::fifteen_minute_linux_capacity_smoke_exercises_mixed_runtime_traffic \
     -- --ignored --exact --test-threads 1
 [[ -s $soak_summary ]] || fail "15-minute smoke completed without the required evidence artifact: $soak_summary"

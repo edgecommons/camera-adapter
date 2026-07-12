@@ -41,18 +41,25 @@ The normal endpoints exposed on the host are:
 
 ### Short simulated capacity proof
 
-`run-capacity-validation.sh` is a Linux-only, ignored test runner for the first capacity-validation
-slice. It uses the real `CameraRuntime`, Core instance facades, command router, SQLite catalog, storage,
-and in-process `SimBackend`; it does not use camera hardware, network discovery, or a Docker smoke
-configuration. The runner enables the non-default `capacity-harness` feature, which isolates this
-live-lab-only workload from ordinary `cargo llvm-cov --lib` coverage. No production code is excluded:
-the feature contains only test instrumentation and the ignored workload, whose evidence is recorded in
-the explicit artifact instead of a unit-coverage percentage.
+`run-capacity-validation-container.sh` is the Linux-only entry point for the first capacity-validation
+slice. It builds `capacity_validation.Dockerfile`, which pins the same Rust 1.85.1 image digest used by
+the native validators and adds Python 3 for evidence validation. It mounts the whole workspace read-only,
+keeps Cargo target/registry/git state in named volumes, and runs the workload with a read-only root
+filesystem, `/tmp` tmpfs, all Linux capabilities dropped, no-new-privileges, and `--network none`.
+The in-process MQTT fixture uses loopback and continues to work in that namespace. A preceding bridge-only
+`cargo fetch --locked` may populate named Cargo cache volumes; it does not run the workload or write
+evidence. This removes any dependency on host Cargo or Python.
+
+The inner `run-capacity-validation.sh` enables the non-default `capacity-harness` feature, which isolates
+this live-lab-only workload from ordinary `cargo llvm-cov --lib` coverage. No production code is excluded:
+the feature contains only test instrumentation and the ignored workload, whose evidence is recorded in the
+explicit artifact instead of a unit-coverage percentage.
 
 ```bash
-bash simulators/run-capacity-validation.sh \
+bash simulators/run-capacity-validation-container.sh \
   --artifact-dir /home/marc/camera-adapter-capacity-short-$(date +%Y%m%dT%H%M%S) \
-  --target-dir /home/marc/camera-adapter-capacity-target
+  --source-revision <full-commit> \
+  --source-bundle /home/marc/camera-adapter-capacity-source.tar.gz
 ```
 
 The short proof configures 1,024 camera entries, opens 256 enabled simulated sessions, submits one
@@ -70,19 +77,17 @@ separate read-only hash attestation chained to the run manifest (`short-capacity
 and, when requested, `fifteen-minute-soak-artifact-attestation.json`). The attestation contains the
 SHA-256 of its JSON artifact; the runner refuses to reuse a populated evidence directory.
 
-When the staged source intentionally has no `.git` directory, set both
-`CAMERA_ADAPTER_SOURCE_REVISION` to the commit revision and
-`CAMERA_ADAPTER_SOURCE_BUNDLE_SHA256` to the 64-character SHA-256 of the exact uploaded source tarball.
-The runner rejects an archive run that omits either value or supplies a malformed bundle digest. Archive
-provenance is not treated as immutable without both identifiers. The short JSON schema is
+When the staged source intentionally has no `.git` directory, pass both the full commit revision and the
+exact uploaded source tarball to the container wrapper. The wrapper rejects a missing, empty, or symlinked
+bundle and computes its SHA-256 itself before passing that digest to the inner runner. Archive provenance
+is not treated as immutable without both identifiers. The short JSON schema is
 `camera-adapter-short-capacity/v1` and has these bounded sections:
 
 ```bash
-CAMERA_ADAPTER_SOURCE_REVISION=<commit> \
-CAMERA_ADAPTER_SOURCE_BUNDLE_SHA256=<sha256-of-exact-uploaded-tarball> \
-bash simulators/run-capacity-validation.sh \
+bash simulators/run-capacity-validation-container.sh \
   --artifact-dir /home/marc/camera-adapter-capacity-15m-$(date +%Y%m%dT%H%M%S) \
-  --target-dir /home/marc/camera-adapter-capacity-target \
+  --source-revision <full-commit> \
+  --source-bundle /home/marc/camera-adapter-capacity-source.tar.gz \
   --soak-duration 15m
 ```
 
@@ -103,9 +108,10 @@ For a separate, bounded mixed-workload check on a true Linux host such as `lab-5
 `fifteen-minute-soak-summary.json` alongside it:
 
 ```bash
-bash simulators/run-capacity-validation.sh \
+bash simulators/run-capacity-validation-container.sh \
   --artifact-dir /home/marc/camera-adapter-capacity-15m-$(date +%Y%m%dT%H%M%S) \
-  --target-dir /home/marc/camera-adapter-capacity-target \
+  --source-revision <full-commit> \
+  --source-bundle /home/marc/camera-adapter-capacity-source.tar.gz \
   --soak-duration 15m
 ```
 

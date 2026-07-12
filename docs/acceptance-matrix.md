@@ -19,7 +19,7 @@ current branch; `Blocked` means the requirement remains a release gate and is no
 | TR-CORE-P1 | Validated | Four-language local MQTT matrix (16 deferred + 16 confirmed edges) and lab-5950x IPC matrix (16 + 16 verified edges). |
 | TR-MSG | Validated locally | Command/router/outbox correlation and broker-outage tests; deployment capture smoke is recorded below. |
 | TR-CMD | Validated locally | Closed request-schema and runtime command tests. |
-| TR-CAPACITY | In progress | `simulators/run-capacity-validation.sh` runs the ignored Linux short proof for 1,024 configured entries, 256 enabled SimBackend sessions, and 32 concurrent 8MP captures with bounded resource/process and router-latency evidence. It records pre-runtime-to-roster RSS evidence and rejects idle-session growth above one eighth of the 256-frame 8MP equivalent. A new/empty artifact directory receives a write-once run manifest and per-test SHA-256 attestations after schema/scope/value validation; Git-less archive runs require both the commit revision and exact uploaded-bundle SHA-256. Its optional `--soak-duration 15m` follows that proof with a partial mixed-traffic simulator smoke (schedules, commands, PTZ/status, reconnects, and valid reloads), then produces a validated, manifest-chained human-readable `capacity-test-report.md` and report attestation. No lab artifact is recorded yet. The 24-hour soak execution is explicitly deferred to a later phase and is not a current gate; neither test may be represented as that soak. |
+| TR-CAPACITY | In progress | `simulators/run-capacity-validation-container.sh` runs the ignored Linux short proof in a pinned Rust 1.85.1/Python image, with source mounted read-only, named Cargo volumes, dropped capabilities, no-new-privileges, tmpfs, and no workload network. It exercises 1,024 configured entries, 256 enabled SimBackend sessions, and 32 concurrent 8MP captures with bounded resource/process and router-latency evidence. It records pre-runtime-to-roster RSS evidence and rejects idle-session growth above one eighth of the 256-frame 8MP equivalent. A new/empty artifact directory receives a write-once run manifest and per-test SHA-256 attestations after schema/scope/value validation; Git-less archive runs require a full commit revision plus a real exact staged tarball, whose SHA-256 the wrapper computes itself. Its optional `--soak-duration 15m` follows that proof with a partial mixed-traffic simulator smoke (schedules, commands, PTZ/status, reconnects, and valid reloads), then produces a validated, manifest-chained human-readable `capacity-test-report.md` and report attestation. No lab artifact is recorded yet. The 24-hour soak execution is explicitly deferred to a later phase and is not a current gate; neither test may be represented as that soak. |
 | TR-RECOVERY | Validated locally | Catalog/outbox crash-recovery and stable-envelope tests. |
 | TR-SEC | Validated locally | SSRF/DNS/XML/decompression/path/credential and no-overwrite tests; deployment threat review remains required. |
 | TR-OBS | Validated locally | Readiness, storage and outbox alarm tests. |
@@ -54,9 +54,10 @@ The following is an unexecuted Linux/lab command, not recorded evidence. It writ
 `short-capacity-summary.json` artifact and refuses to overwrite an existing one:
 
 ```bash
-bash simulators/run-capacity-validation.sh \
+bash simulators/run-capacity-validation-container.sh \
   --artifact-dir /home/marc/camera-adapter-capacity-short-$(date +%Y%m%dT%H%M%S) \
-  --target-dir /home/marc/camera-adapter-capacity-target
+  --source-revision <full-commit> \
+  --source-bundle /home/marc/camera-adapter-capacity-source.tar.gz
 ```
 
 Appending `--soak-duration 15m` runs the short proof first and then writes
