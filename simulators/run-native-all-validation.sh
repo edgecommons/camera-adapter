@@ -235,7 +235,7 @@ printf 'Running same-container Aravis helper\n'
 helper_output=$(run_genicam_fixture +1.87.0 llvm-cov run --locked --offline --no-clean \
     --no-default-features --features standalone,native-all \
     --bin camera-adapter-genicam-discover -- \
-    --interface "$interface" --transport gige-vision --max-results 1)
+    --interface "$interface" --transport gige-vision --max-results 1 2>&1)
 printf '%s\n' "$helper_output"
 if [[ $helper_output != *'"deviceId":"Aravis-Fake-GV01"'* ]]; then
     printf 'instrumented GenICam helper did not discover Aravis-Fake-GV01\n' >&2
