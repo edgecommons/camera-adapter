@@ -810,6 +810,35 @@ pub struct AdmissionController {
     writers: Arc<Semaphore>,
 }
 
+/// A bounded point-in-time view of the internal admission controls.
+///
+/// This is crate-visible only because the Linux capacity harness records its
+/// evidence from the real runtime rather than reconstructing permit use from
+/// terminal job timing. It deliberately contains no camera identifiers,
+/// payload bytes, or paths.
+#[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "standalone",
+    feature = "onvif",
+    feature = "capacity-harness"
+))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdmissionSnapshot {
+    /// Unused global acquisition permits.
+    pub available_acquisitions: usize,
+    /// Unused named resource-group acquisition permits.
+    pub available_resource_group_acquisitions: BTreeMap<String, usize>,
+    /// Unreserved source-frame bytes.
+    pub available_memory_bytes: u64,
+    /// Bytes logically reserved against the output filesystem.
+    pub outstanding_disk_bytes: u64,
+    /// Unused image-conversion permits.
+    pub available_encoders: usize,
+    /// Unused image-persistence permits.
+    pub available_writers: usize,
+}
+
 impl AdmissionController {
     /// Builds capacity controls from `LimitsConfig` and output free-space policy.
     pub fn new(
@@ -958,6 +987,29 @@ impl AdmissionController {
     #[must_use]
     pub fn outstanding_disk_bytes(&self) -> u64 {
         self.disk.outstanding()
+    }
+
+    /// Returns a compact snapshot for the capacity-validation harness.
+    #[cfg(all(
+        test,
+        target_os = "linux",
+        feature = "standalone",
+        feature = "onvif",
+        feature = "capacity-harness"
+    ))]
+    pub(crate) fn snapshot(&self) -> AdmissionSnapshot {
+        AdmissionSnapshot {
+            available_acquisitions: self.available_acquisitions(),
+            available_resource_group_acquisitions: self
+                .resource_groups
+                .iter()
+                .map(|(name, semaphore)| (name.clone(), semaphore.available_permits()))
+                .collect(),
+            available_memory_bytes: self.available_memory_bytes(),
+            outstanding_disk_bytes: self.outstanding_disk_bytes(),
+            available_encoders: self.encoders.available_permits(),
+            available_writers: self.writers.available_permits(),
+        }
     }
 }
 

@@ -5012,8 +5012,10 @@ mod tests {
             media_version: MediaVersion::Media1,
             media_profile_token: "main".to_owned(),
             snapshot_endpoint: None,
+            #[cfg(feature = "rtsp")]
             snapshot_unavailable: None,
             max_snapshot_bytes: 1_024,
+            #[cfg(feature = "rtsp")]
             rtsp: None,
             ptz_endpoint: None,
             ptz_ranges: None,

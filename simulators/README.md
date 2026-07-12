@@ -39,6 +39,101 @@ The normal endpoints exposed on the host are:
 - Proxied ONVIF: `http://127.0.0.1:28080`
 - Proxied RTSP: `rtsp://127.0.0.1:28554/camera`
 
+### Short simulated capacity proof
+
+`run-capacity-validation.sh` is a Linux-only, ignored test runner for the first capacity-validation
+slice. It uses the real `CameraRuntime`, Core instance facades, command router, SQLite catalog, storage,
+and in-process `SimBackend`; it does not use camera hardware, network discovery, or a Docker smoke
+configuration. The runner enables the non-default `capacity-harness` feature, which isolates this
+live-lab-only workload from ordinary `cargo llvm-cov --lib` coverage. No production code is excluded:
+the feature contains only test instrumentation and the ignored workload, whose evidence is recorded in
+the explicit artifact instead of a unit-coverage percentage.
+
+```bash
+bash simulators/run-capacity-validation.sh \
+  --artifact-dir /home/marc/camera-adapter-capacity-short-$(date +%Y%m%dT%H%M%S) \
+  --target-dir /home/marc/camera-adapter-capacity-target
+```
+
+The short proof configures 1,024 camera entries, opens 256 enabled simulated sessions, submits one
+32-member 3,264×2,448 Mono8 group (7,990,272 bytes per frame), and verifies that a thirty-third capture
+remains behind saturated global/resource-group/byte/disk admission until capacity is released. It also
+records 20 router-boundary samples each for `sb/list`, `sb/status`, and PTZ stop while acquisition is
+saturated. The command samples exclude MQTT transport time; Core's built-in `ping` has no equivalent
+adapter-boundary timer yet and is intentionally not claimed by this slice.
+
+The requested artifact directory must be new or empty. Before it starts Cargo, the runner creates
+`capacity-run-manifest.json` with the invoked command, UTC start, source revision/provenance, pinned
+toolchain, and kernel. It creates that file with exclusive creation and makes it read-only. After each
+test it validates the produced JSON's exact schema, scope, and required acceptance values, then creates a
+separate read-only hash attestation chained to the run manifest (`short-capacity-artifact-attestation.json`
+and, when requested, `fifteen-minute-soak-artifact-attestation.json`). The attestation contains the
+SHA-256 of its JSON artifact; the runner refuses to reuse a populated evidence directory.
+
+When the staged source intentionally has no `.git` directory, set both
+`CAMERA_ADAPTER_SOURCE_REVISION` to the commit revision and
+`CAMERA_ADAPTER_SOURCE_BUNDLE_SHA256` to the 64-character SHA-256 of the exact uploaded source tarball.
+The runner rejects an archive run that omits either value or supplies a malformed bundle digest. Archive
+provenance is not treated as immutable without both identifiers. The short JSON schema is
+`camera-adapter-short-capacity/v1` and has these bounded sections:
+
+```bash
+CAMERA_ADAPTER_SOURCE_REVISION=<commit> \
+CAMERA_ADAPTER_SOURCE_BUNDLE_SHA256=<sha256-of-exact-uploaded-tarball> \
+bash simulators/run-capacity-validation.sh \
+  --artifact-dir /home/marc/camera-adapter-capacity-15m-$(date +%Y%m%dT%H%M%S) \
+  --target-dir /home/marc/camera-adapter-capacity-target \
+  --soak-duration 15m
+```
+
+| Field | Evidence |
+|---|---|
+| `configuredCameras` / `enabledSimulatedSessions` | Exact 1,024-entry roster and 256 connected sessions. |
+| `frame` / `concurrentCaptureTarget` | Exact 8MP Mono8 workload and 32-capture target. |
+| `idleSessionMemory` | RSS immediately before runtime startup, roster-online RSS, their delta, and a machine-independent bound of one eighth of 256 full 8MP Mono8 frames. This proves idle sessions did not allocate a frame per camera. |
+| `resourceSamples` | Global/resource-group permits, in-flight and disk bytes, encoder/writer availability, queue depth, RSS, threads, and open descriptors at bounded phases. |
+| `commandLatency` | Minimum, p50, p95, and maximum router-boundary latency for the three exercised commands. |
+| terminal states | Group success count and the deferred thirty-third capture outcome. |
+| `omittedFromThisShortRun` | Explicit exclusions so this artifact cannot be mistaken for wider validation. |
+
+### Bounded 15-minute simulator smoke
+
+For a separate, bounded mixed-workload check on a true Linux host such as `lab-5950x`, add
+`--soak-duration 15m`. The runner always executes the preceding short 8MP proof first, then writes
+`fifteen-minute-soak-summary.json` alongside it:
+
+```bash
+bash simulators/run-capacity-validation.sh \
+  --artifact-dir /home/marc/camera-adapter-capacity-15m-$(date +%Y%m%dT%H%M%S) \
+  --target-dir /home/marc/camera-adapter-capacity-target \
+  --soak-duration 15m
+```
+
+The second test retains the 1,024 configured/256 enabled SimBackend roster, switches its traffic to
+640×480 Mono8 frames, and proves sustained runtime activity: eight schedules fire every five seconds
+(at least 120 durable occurrences per scheduled camera), one direct capture is submitted every two
+seconds, `sb/list`/`sb/status`/PTZ stop are timed every five seconds, a session reconnect is requested
+every minute, and a valid configuration generation is reapplied every three minutes. The artifact records
+the command latency samples, resource/process samples, accepted scheduled-job counts, and operation counts.
+
+This is deliberately a **partial simulator smoke**, not a 24-hour soak, full 8MP-duration test,
+10,000-job workload, broker-outage exercise, encoder/writer saturation graph, Core ping benchmark, or
+hardware compatibility result. It must be reported with that scope even when it passes.
+
+When the 15-minute mode succeeds, the runner additionally writes a deterministic,
+human-readable `capacity-test-report.md` only after both JSON artifacts have passed validation and both
+JSON attestations have chained to the run manifest. The report contains source/toolchain/kernel/command
+provenance; short-proof capacity, idle-session RSS, p95, and resource results; 15-minute workload and
+per-camera schedule counts; p95 and resource summaries; artifact hashes; and explicit exclusions. A
+separate `capacity-test-report-artifact-attestation.json` binds the report SHA-256 to the same run
+manifest. No report is written for short-only mode because it would be incomplete.
+
+This is not the 24-hour soak. The full soak execution is deferred to a later validation phase and is not
+a current gate. It remains necessary before any future scale-performance or general-release claim, along
+with the separate 10,000-job, broker-outage, and encoder/writer saturation scenarios. Do not
+reinterpret the short proof as protocol, L2, cross-container, physical-camera, or hardware compatibility
+evidence.
+
 ### Native RTSP decoder validation
 
 The Rust decoder is validated from a pinned Linux image, on the Compose network,
@@ -46,7 +141,10 @@ so `onvif-sim` and `mediamtx` retain their service names and no host-network
 shortcut weakens the URI-pinning test. The reproducible coverage runner starts
 MediaMTX, builds the image with pinned `cargo-llvm-cov 0.8.7` and matching
 `llvm-tools-preview`, runs both ignored decoder tests, and writes a separate
-LCOV artifact for each H.264/H.265 fixture and session policy:
+LCOV artifact for each H.264/H.265 fixture and session policy. It then runs the
+ordinary native-feature library suite plus all four fixtures again to export a
+measured aggregate JSON summary with a dedicated `src/backend/rtsp.rs` line
+percentage:
 
 ```powershell
 ./simulators/run-rtsp-native-coverage.ps1 -CoverageOutput C:\tmp\camera-adapter-rtsp-coverage
@@ -55,11 +153,11 @@ LCOV artifact for each H.264/H.265 fixture and session policy:
 It mounts the whole EdgeCommons workspace read-only (the adapter depends on
 the sibling Core crate), writes Cargo target and registry state only to named
 Docker volumes, and writes only the four requested LCOV artifacts to
-`CoverageOutput`. The volumes are intentionally retained for a repeatable fast
-rerun; remove them explicitly only when a clean native rebuild is required.
-These four fixture-level artifacts prove native decoder execution only. They
-are not an aggregate adapter coverage report and must not be used to claim the
-project's 90% coverage gate is satisfied.
+`CoverageOutput` plus `rtsp-native-summary.json`. The volumes are intentionally
+retained for a repeatable fast rerun; remove them explicitly only when a clean
+native rebuild is required. The fixture LCOV files prove individual decoder
+paths; the JSON summary measures the native RTSP test scope. Neither is an
+adapter-wide coverage report or proof that the project's 90% gate is satisfied.
 
 The image keeps the adapter's Rust 1.85.1 MSRV toolchain for ordinary native
 decoder tests. Since `cargo-llvm-cov 0.8.7` itself requires Rust 1.87, the
@@ -109,10 +207,16 @@ docker compose -f simulators/compose.yaml --profile linux-l2 exec -T aravis-fake
 ```
 
 The same pinned Aravis installation can compile and exercise the adapter's GenICam discovery
-helper. This is the native feature gate; it is separate from physical-camera compatibility:
+helper. This is the native feature gate; it is separate from physical-camera compatibility. Tag
+the locally built fake image with its freshly resolved image hash before building the validation
+layer; neither validation Dockerfile has a mutable implicit base:
 
 ```bash
+fake_image_id=$(docker image inspect --format '{{.Id}}' camera-adapter-simulators-aravis-fake)
+fake_image_ref="camera-adapter-aravis-validation-input:${fake_image_id#sha256:}"
+docker tag camera-adapter-simulators-aravis-fake "$fake_image_ref"
 docker build -f simulators/aravis_fake/AdapterValidation.Dockerfile \
+  --build-arg "ARAVIS_RUNTIME_IMAGE=$fake_image_ref" \
   -t camera-adapter-aravis-validation simulators/aravis_fake
 docker run --rm --network host -v "$PWD/..:/edgecommons" -w /edgecommons/camera-adapter \
   camera-adapter-aravis-validation build --features genicam --bin camera-adapter-genicam-discover

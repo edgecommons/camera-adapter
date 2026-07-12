@@ -1602,15 +1602,75 @@ fn open_scoped(
         };
         let camera = aravis::Camera::new(Some(&identity.device_id))
             .map_err(|_| unavailable("GenICam camera open failed"))?;
-        let verified =
+        let opened =
             identity_from_camera(&camera, transport, interface, identity.address.as_str())?;
-        if verified.device_id != identity.device_id || !selector_matches(config, &verified) {
+        let opened = verify_open_identity(&identity, opened)?;
+        if !selector_matches_after_open(config, &identity, &opened) {
             return Err(backend_error(
                 "opened GenICam identity changed during binding",
             ));
         }
-        Ok((camera, verified))
+        Ok((camera, opened))
     })
+}
+
+/// Validates camera-reported metadata after opening a discovered Aravis device.
+///
+/// The normal case requires the discovery identifier and the opened GenICam
+/// `DeviceID` register to agree. Aravis' pinned fake GigE fixture is the only
+/// supported alias: it discovers as `Aravis-Fake-GV01` while exposing `GV01`
+/// after opening. Keeping that exception explicit prevents an arbitrary
+/// discovery/open race from being mistaken for a stable binding.
+fn verify_open_identity(discovered: &WireDevice, opened: WireDevice) -> Result<WireDevice> {
+    if discovered.transport != opened.transport
+        || discovered.interface != opened.interface
+        || (discovered.vendor != opened.vendor && !discovered.vendor.is_empty())
+        || (discovered.model != opened.model && !discovered.model.is_empty())
+        || (discovered.serial != opened.serial && !discovered.serial.is_empty())
+        || (discovered.device_id != opened.device_id
+            && !is_approved_aravis_fake_lookup_alias(discovered, &opened))
+    {
+        return Err(backend_error(
+            "opened GenICam identity changed during binding",
+        ));
+    }
+    Ok(opened)
+}
+
+fn is_approved_aravis_fake_lookup_alias(discovered: &WireDevice, opened: &WireDevice) -> bool {
+    discovered.transport == WireTransport::GigeVision
+        && opened.transport == WireTransport::GigeVision
+        && discovered.device_id == "Aravis-Fake-GV01"
+        && opened.device_id == "GV01"
+        && discovered.vendor == "Aravis"
+        && opened.vendor == "Aravis"
+        && discovered.model == "Fake"
+        && opened.model == "Fake"
+        && discovered.serial == "GV01"
+        && opened.serial == "GV01"
+}
+
+/// Matches a configured selector after the device has been opened and its
+/// GenICam registers have been re-read. A fake-camera lookup alias is accepted
+/// only after [`is_approved_aravis_fake_lookup_alias`] has authenticated the
+/// complete pinned fixture shape.
+fn selector_matches_after_open(
+    config: &GenicamBackendConfig,
+    discovered: &WireDevice,
+    opened: &WireDevice,
+) -> bool {
+    if let Some(expected) = config.selector.device_id.as_deref() {
+        return expected == opened.device_id
+            || (expected == discovered.device_id
+                && is_approved_aravis_fake_lookup_alias(discovered, opened));
+    }
+    if config.selector.mac.is_some() {
+        // Aravis does not expose a post-open physical/MAC register through the
+        // current binding. The discovery record remains the authoritative
+        // transport-layer source for the already-selected MAC.
+        return selector_matches(config, discovered);
+    }
+    selector_matches(config, opened)
 }
 
 fn identity_from_camera(
@@ -2150,6 +2210,63 @@ mod tests {
     }
 
     #[test]
+    fn opened_identity_requires_exact_device_id_or_the_pinned_fake_alias() {
+        let exact = WireDevice {
+            device_id: "device-42".to_owned(),
+            physical_id: "00:00:00:00:00:00".to_owned(),
+            vendor: "Vendor".to_owned(),
+            model: "Model".to_owned(),
+            serial: "SN-42".to_owned(),
+            address: "192.0.2.10".to_owned(),
+            transport: WireTransport::GigeVision,
+            interface: Some("eth0".to_owned()),
+        };
+        let mut config = backend_config();
+        config.selector = GenicamSelector {
+            device_id: Some("device-42".to_owned()),
+            ..GenicamSelector::default()
+        };
+        let opened = verify_open_identity(&exact, exact.clone()).expect("exact DeviceID");
+        assert_eq!(
+            opened.device_id, "device-42",
+            "the post-open identity remains the stable selector source"
+        );
+        assert!(selector_matches_after_open(&config, &exact, &opened));
+
+        let fake_lookup = WireDevice {
+            device_id: "Aravis-Fake-GV01".to_owned(),
+            physical_id: "00:00:00:00:00:00".to_owned(),
+            vendor: "Aravis".to_owned(),
+            model: "Fake".to_owned(),
+            serial: "GV01".to_owned(),
+            address: "192.0.2.10".to_owned(),
+            transport: WireTransport::GigeVision,
+            interface: Some("eth0".to_owned()),
+        };
+        let fake_opened = WireDevice {
+            device_id: "GV01".to_owned(),
+            physical_id: String::new(),
+            ..fake_lookup.clone()
+        };
+        config.selector.device_id = Some("Aravis-Fake-GV01".to_owned());
+        let opened = verify_open_identity(&fake_lookup, fake_opened.clone())
+            .expect("the pinned fake camera uses a documented lookup alias");
+        assert_eq!(opened.device_id, "GV01");
+        assert!(selector_matches_after_open(&config, &fake_lookup, &opened));
+
+        let unrelated_fake_alias = WireDevice {
+            device_id: "Aravis-Fake-GV02".to_owned(),
+            ..fake_lookup.clone()
+        };
+        assert!(verify_open_identity(&unrelated_fake_alias, fake_opened.clone()).is_err());
+        let metadata_changed = WireDevice {
+            model: "Replacement".to_owned(),
+            ..fake_opened
+        };
+        assert!(verify_open_identity(&fake_lookup, metadata_changed).is_err());
+    }
+
+    #[test]
     fn helper_cli_is_closed_and_bounded() {
         let parsed = parse_helper_args([
             "--interface".to_owned(),
@@ -2257,5 +2374,219 @@ mod tests {
         let (timestamp, quality) = calibration.resolve(0, 0);
         assert!(timestamp.is_none());
         assert_eq!(quality, FrameTimestampQuality::Unknown);
+    }
+
+    #[test]
+    fn helper_records_are_bounded_scoped_and_exposed_as_safe_candidates() {
+        let gige = WireDevice {
+            device_id: "device-a".to_owned(),
+            physical_id: "00:11:22:33:44:55".to_owned(),
+            vendor: "vendor".to_owned(),
+            model: "model".to_owned(),
+            serial: "serial".to_owned(),
+            address: "192.0.2.20".to_owned(),
+            transport: WireTransport::GigeVision,
+            interface: Some("eth0".to_owned()),
+        };
+        let candidate = gige.clone().into_candidate();
+        assert_eq!(candidate.backend, BackendKind::GenicamAravis);
+        assert_eq!(candidate.selector, json!({"deviceId": "device-a"}));
+        assert_eq!(candidate.vendor.as_deref(), Some("vendor"));
+        assert_eq!(candidate.capabilities["interface"], json!("eth0"));
+        assert!(
+            validate_helper_devices(
+                std::slice::from_ref(&gige),
+                "eth0",
+                WireTransport::GigeVision
+            )
+            .is_ok()
+        );
+
+        let mut missing_identity = gige.clone();
+        missing_identity.device_id.clear();
+        assert!(
+            validate_helper_devices(&[missing_identity], "eth0", WireTransport::GigeVision)
+                .is_err()
+        );
+
+        let usb = WireDevice {
+            transport: WireTransport::Usb3Vision,
+            interface: None,
+            ..gige.clone()
+        };
+        assert!(
+            validate_helper_devices(
+                std::slice::from_ref(&usb),
+                "eth0",
+                WireTransport::Usb3Vision
+            )
+            .is_ok()
+        );
+        let mut usb_with_interface = usb;
+        usb_with_interface.interface = Some("eth0".to_owned());
+        assert!(
+            validate_helper_devices(&[usb_with_interface], "eth0", WireTransport::Usb3Vision)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn helper_parser_reader_and_profile_key_cover_closed_local_boundaries() {
+        let parsed = parse_helper_args([
+            "--interface".to_owned(),
+            "usb0".to_owned(),
+            "--transport".to_owned(),
+            "usb3-vision".to_owned(),
+            "--max-results".to_owned(),
+            "1".to_owned(),
+        ])
+        .expect("USB helper arguments");
+        assert_eq!(parsed, ("usb0".to_owned(), WireTransport::Usb3Vision, 1));
+        for arguments in [
+            vec![
+                "--interface".to_owned(),
+                "bad\ninterface".to_owned(),
+                "--transport".to_owned(),
+                "gige-vision".to_owned(),
+                "--max-results".to_owned(),
+                "1".to_owned(),
+            ],
+            vec![
+                "--interface".to_owned(),
+                "eth0".to_owned(),
+                "--transport".to_owned(),
+                "other".to_owned(),
+                "--max-results".to_owned(),
+                "1".to_owned(),
+            ],
+            vec![
+                "--interface".to_owned(),
+                "eth0".to_owned(),
+                "--transport".to_owned(),
+                "gige-vision".to_owned(),
+                "--max-results".to_owned(),
+                "0".to_owned(),
+            ],
+        ] {
+            assert!(parse_helper_args(arguments).is_err());
+        }
+
+        assert_eq!(
+            read_bounded(std::io::Cursor::new(b"abc"), 3).unwrap(),
+            b"abc"
+        );
+        assert!(read_bounded(std::io::Cursor::new(b"abcd"), 3).is_err());
+
+        let mut keyed = profile();
+        let original = ProfileKey::from(&keyed);
+        keyed.output.jpeg_quality = 1;
+        assert_eq!(ProfileKey::from(&keyed), original);
+        keyed.width = Some(2);
+        assert_ne!(ProfileKey::from(&keyed), original);
+    }
+
+    #[test]
+    fn timestamp_and_numeric_validation_remain_bounded_and_fail_closed() {
+        let mut calibration = TimestampCalibration::default();
+        let (first, quality) = calibration.resolve(100, 1_000);
+        assert_eq!(quality, FrameTimestampQuality::Camera);
+        assert_eq!(first, datetime_from_ns(1_000));
+        let (cached, quality) = calibration.resolve(200, 1_100);
+        assert_eq!(quality, FrameTimestampQuality::Camera);
+        assert_eq!(cached, datetime_from_ns(1_100));
+        let refreshed_system = 1_000 + TIMESTAMP_REFRESH_NS;
+        let (refreshed, quality) = calibration.resolve(300, refreshed_system);
+        assert_eq!(quality, FrameTimestampQuality::Camera);
+        assert_eq!(refreshed, datetime_from_ns(i128::from(refreshed_system)));
+        assert!(datetime_from_ns(i128::MAX).is_none());
+
+        assert_eq!(positive_dimension(1, "width").unwrap(), 1);
+        assert!(positive_dimension(0, "width").is_err());
+        assert!(positive_dimension(-1, "width").is_err());
+        assert_eq!(requested_i32(None, 7, "width").unwrap(), 7);
+        assert_eq!(requested_i32(Some(8), 7, "width").unwrap(), 8);
+        assert_eq!(
+            requested_i32(Some(u32::MAX), 7, "width")
+                .expect_err("u32 outside native range")
+                .code(),
+            ErrorCode::InvalidRequest
+        );
+        assert!(validate_axis(Ok((2, 10)), Ok(2), 6, "width").is_ok());
+        assert!(validate_axis(Ok((2, 10)), Ok(2), 7, "width").is_err());
+        assert!(validate_axis(Ok((2, 10)), Ok(0), 9, "width").is_ok());
+        assert!(verify_float_readback(10.0, 10.0 + 1e-10, "gain").is_ok());
+        assert!(verify_float_readback(10.0, 10.1, "gain").is_err());
+        assert!(verify_float_readback(10.0, f64::NAN, "gain").is_err());
+    }
+
+    #[test]
+    fn selector_interface_and_metadata_helpers_reject_unsafe_edges() {
+        let device = WireDevice {
+            device_id: "device-id".to_owned(),
+            physical_id: "00:11:22:33:44:55".to_owned(),
+            vendor: String::new(),
+            model: String::new(),
+            serial: "serial".to_owned(),
+            address: "192.0.2.20".to_owned(),
+            transport: WireTransport::GigeVision,
+            interface: Some("eth0".to_owned()),
+        };
+        let mut config = backend_config();
+        config.selector = GenicamSelector {
+            device_id: Some("device-id".to_owned()),
+            ..GenicamSelector::default()
+        };
+        assert!(selector_matches(&config, &device));
+        config.selector = GenicamSelector {
+            ip: Some("192.0.2.20".to_owned()),
+            ..GenicamSelector::default()
+        };
+        assert!(selector_matches(&config, &device));
+        assert_eq!(
+            normalize_mac("001122334455").as_deref(),
+            Some("001122334455")
+        );
+        assert!(normalize_mac("00112233445").is_none());
+        assert!(normalize_mac("00:11:22:33:44:GG").is_none());
+        assert!(required_interface(&backend_config()).is_err());
+        config.interface = Some("eth0".to_owned());
+        assert_eq!(required_interface(&config).unwrap(), "eth0");
+
+        let invalid_utf8 = std::ffi::CString::new(vec![0xff]).expect("nul-free bytes");
+        assert!(native_string(&invalid_utf8, "vendor").is_err());
+        assert_eq!(nonempty(String::new()), None);
+        assert_eq!(nonempty("value".to_owned()).as_deref(), Some("value"));
+        assert!(validate_interfaces(&["eth0".to_owned(), "usb0".to_owned()]).is_ok());
+
+        let cancellation = CancellationToken::new();
+        assert!(
+            check_deadline(
+                Instant::now() + Duration::from_secs(1),
+                &cancellation,
+                "test"
+            )
+            .is_ok()
+        );
+        cancellation.cancel();
+        assert_eq!(
+            check_deadline(
+                Instant::now() + Duration::from_secs(1),
+                &cancellation,
+                "test"
+            )
+            .expect_err("cancelled caller")
+            .code(),
+            ErrorCode::CaptureCancelled
+        );
+        assert_eq!(
+            check_deadline(
+                Instant::now() - Duration::from_millis(1),
+                &CancellationToken::new(),
+                "test"
+            )
+            .expect_err("elapsed deadline")
+            .code(),
+            ErrorCode::CaptureTimeout
+        );
     }
 }

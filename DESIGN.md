@@ -2220,7 +2220,14 @@ ONVIF/RTSP:
 
 ### 23.5 Scale and soak tests
 
-Minimum release tests:
+The current capacity-validation slice is a short, repeatable Linux simulator proof of 1,024 configured
+entries, 256 connected idle sessions, and 32 concurrent 8-megapixel captures with resource and process
+samples. A separately recorded, 15-minute partial simulator smoke follows that proof with schedules,
+commands, PTZ/status, reconnects, and valid reloads using small frames. Neither is a long-duration
+performance result or a replacement for the deferred soak below.
+
+The following full-soak scenario remains part of the design, but its 24-hour execution is explicitly
+deferred to a later validation phase and is not a current gate:
 
 - 256 simulated connected cameras for 24 hours with schedules, command bursts, reconnects, and PTZ traffic.
 - 32 concurrent 8-megapixel captures with `maxInFlightBytes` enforcement and no unbounded RSS growth.
@@ -2262,7 +2269,7 @@ matrix.
 
 | Path | Required validation |
 |---|---|
-| HOST/Linux | EMQX, all simulators, native Aravis/GStreamer build, local disk, scale and soak. |
+| HOST/Linux | EMQX, all simulators, native Aravis/GStreamer build, local disk, and the current short capacity proof. The 24-hour soak execution is deferred to a later validation phase. |
 | HOST/Windows | ONVIF snapshot and messaging first; Aravis/GStreamer only after the packaging spike proves them. |
 | Rust Greengrass feature | WSL/Linux build and tests. |
 | GREENGRASS | Deploy to `lab-5950x`; exercise commands, `app`, and `evt` over IPC and at least a reachable simulator or physical network camera. |
@@ -2295,7 +2302,7 @@ A phase is not complete based only on unit tests. The review record must include
 | P3 — ONVIF snapshot and PTZ | ONVIF discovery/services/auth, snapshot capture, PTZ/presets, simulator | Full ONVIF simulator suite and security tests; physical ONVIF/PTZ compatibility is explicitly waived for this project. |
 | P4 — GenICam/Aravis | GigE Vision and USB3 Vision, feature profiles, buffer acquisition, formats | Aravis simulator and packet-fault tests; vendor hardware compatibility is explicitly waived for this project. |
 | P5 — RTSP capture | GStreamer frame extraction and ONVIF fallback | RTSP simulator and codec/fault suite; physical fallback-camera compatibility is explicitly waived for this project. |
-| P6 — deployments and system validation | Greengrass, Kubernetes, file-replicator and bottling-company integration, scale/soak | All platform gates, 24-hour fleet soak, docs and registry ready. |
+| P6 — deployments and system validation | Greengrass, Kubernetes, file-replicator and bottling-company integration, scale/soak | All current platform gates, short capacity evidence, docs and registry ready. The 24-hour fleet-soak execution is deferred to a later validation phase. |
 | P7 — general release | Compatibility register, security review, operational docs, registry status change | No unresolved blocking findings; release checklist signed off. |
 
 Implementation remains local until the user explicitly authorizes push, pull request, or merge.

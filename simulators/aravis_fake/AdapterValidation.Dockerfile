@@ -1,8 +1,11 @@
-# Ephemeral native validation image.  It deliberately starts from the exact fake-camera runtime
+# Ephemeral native validation image. It deliberately starts from the exact fake-camera runtime
 # image so cargo links against the same Aravis 0.8.36 installation that provides L2 evidence.
+# The invoking runner must supply a freshly tagged, hash-named local image reference after it has
+# built the pinned fake-camera Dockerfile; this Dockerfile never pulls an implicit mutable base.
+ARG ARAVIS_RUNTIME_IMAGE=scratch
 FROM docker.io/library/rust@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4 AS rust
 
-FROM camera-adapter-simulators-aravis-fake:latest
+FROM ${ARAVIS_RUNTIME_IMAGE}
 
 ARG CARGO_LLVM_COV_VERSION=0.8.7
 ARG LLVM_COV_TOOLCHAIN=1.87.0

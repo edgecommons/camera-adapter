@@ -6042,6 +6042,21 @@ mod tests {
         use edgecommons::{messaging::MessageBuilder, prelude::EdgeCommonsBuilder};
         use tempfile::TempDir;
 
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        use serde::Serialize;
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        use std::{fs, path::PathBuf, time::Instant};
+
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
             net::{TcpListener, TcpStream},
@@ -6504,17 +6519,32 @@ mod tests {
             port: u16,
             router: Option<Arc<RuntimeCommandRouter>>,
         ) -> Arc<edgecommons::EdgeCommons> {
+            let instances = ["camera-a", "camera-b", "camera-c"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            facade_core_with_router_instances(directory, port, router, &instances).await
+        }
+
+        /// Builds the loopback Core fixture with the same instance roster used by a runtime test.
+        ///
+        /// Core permits dynamic facade handles, but capacity validation must not use that escape
+        /// hatch: the configured Core roster and the adapter roster need to agree so facade
+        /// construction, command registration, and instance identity all follow the production
+        /// path.
+        async fn facade_core_with_router_instances(
+            directory: &TempDir,
+            port: u16,
+            router: Option<Arc<RuntimeCommandRouter>>,
+            instances: &[String],
+        ) -> Arc<edgecommons::EdgeCommons> {
             let component_config = directory.path().join("facade-core-config.json");
             let messaging_config = directory.path().join("facade-core-messaging.json");
             std::fs::write(
                 &component_config,
                 serde_json::to_vec(&json!({
                     "component": {
-                        "instances": [
-                            { "id": "camera-a" },
-                            { "id": "camera-b" },
-                            { "id": "camera-c" }
-                        ]
+                        "instances": instances.iter().map(|id| json!({ "id": id })).collect::<Vec<_>>()
                     }
                 }))
                 .unwrap(),
@@ -6695,7 +6725,15 @@ mod tests {
             runtime: &CameraRuntime,
             capture_id: &str,
         ) -> crate::catalog::JobRecord {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            wait_for_terminal_within(runtime, capture_id, Duration::from_secs(5)).await
+        }
+
+        async fn wait_for_terminal_within(
+            runtime: &CameraRuntime,
+            capture_id: &str,
+            timeout: Duration,
+        ) -> crate::catalog::JobRecord {
+            let deadline = tokio::time::Instant::now() + timeout;
             loop {
                 if let Some(record) = runtime.catalog.job(capture_id).await.unwrap() {
                     if record.state.is_terminal() {
@@ -6714,7 +6752,15 @@ mod tests {
             runtime: &CameraRuntime,
             group_id: &str,
         ) -> crate::catalog::GroupRecord {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            wait_for_group_terminal_within(runtime, group_id, Duration::from_secs(5)).await
+        }
+
+        async fn wait_for_group_terminal_within(
+            runtime: &CameraRuntime,
+            group_id: &str,
+            timeout: Duration,
+        ) -> crate::catalog::GroupRecord {
+            let deadline = tokio::time::Instant::now() + timeout;
             loop {
                 if let Some(record) = runtime.catalog.group(group_id).await.unwrap() {
                     if record.state.is_terminal() {
@@ -9951,6 +9997,1010 @@ mod tests {
                 "runtime shutdown must close the readiness bridge"
             );
             inbox.stop().await;
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        const SHORT_CAPACITY_CONFIGURED_CAMERAS: usize = 1_024;
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        const SHORT_CAPACITY_ENABLED_CAMERAS: usize = 256;
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        const SHORT_CAPACITY_CONCURRENT_CAPTURES: usize = 32;
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        const SHORT_CAPACITY_FRAME_WIDTH: u32 = 3_264;
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        const SHORT_CAPACITY_FRAME_HEIGHT: u32 = 2_448;
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        const SHORT_CAPACITY_FRAME_BYTES: u64 =
+            (SHORT_CAPACITY_FRAME_WIDTH as u64) * (SHORT_CAPACITY_FRAME_HEIGHT as u64);
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        const IDLE_SESSION_RSS_MAXIMUM_FULL_FRAME_FRACTION_DENOMINATOR: u64 = 8;
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        #[derive(Debug, Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CapacityProcessStats {
+            rss_bytes: Option<u64>,
+            thread_count: Option<u64>,
+            open_file_descriptors: Option<u64>,
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        #[derive(Debug, Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CapacitySample {
+            phase: String,
+            elapsed_millis: u64,
+            configured_cameras: usize,
+            enabled_cameras: usize,
+            online_cameras: usize,
+            live_actor_count: usize,
+            queued_capture_descriptors: usize,
+            queued_control_descriptors: usize,
+            available_global_acquisitions: usize,
+            available_resource_group_acquisitions: BTreeMap<String, usize>,
+            available_in_flight_bytes: u64,
+            outstanding_disk_bytes: u64,
+            available_encoders: usize,
+            available_writers: usize,
+            process: CapacityProcessStats,
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        #[derive(Debug, Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CommandLatencySummary {
+            samples: usize,
+            minimum_micros: u64,
+            p50_micros: u64,
+            p95_micros: u64,
+            maximum_micros: u64,
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        #[derive(Debug, Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct IdleSessionMemoryEvidence {
+            baseline_rss_bytes: u64,
+            roster_online_rss_bytes: u64,
+            roster_online_delta_bytes: u64,
+            full_frame_allocation_equivalent_bytes: u64,
+            maximum_allowed_delta_bytes: u64,
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        #[derive(Debug, Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ShortCapacityArtifact {
+            schema_version: &'static str,
+            scope: &'static str,
+            configured_cameras: usize,
+            enabled_simulated_sessions: usize,
+            concurrent_capture_target: usize,
+            frame: serde_json::Value,
+            idle_session_memory: IdleSessionMemoryEvidence,
+            capture_group_submit_micros: u64,
+            command_latency: BTreeMap<String, CommandLatencySummary>,
+            resource_samples: Vec<CapacitySample>,
+            group_terminal_state: String,
+            group_successful_members: usize,
+            overflow_capture_terminal_state: String,
+            omitted_from_this_short_run: Vec<&'static str>,
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        fn short_capacity_configuration(root: &Path) -> AdapterConfig {
+            let output_root = root.join("capacity-output");
+            let state_root = root.join("capacity-state");
+            let instances = (0..SHORT_CAPACITY_CONFIGURED_CAMERAS)
+                .map(|index| {
+                    json!({
+                        "id": format!("camera-{index:04}"),
+                        "enabled": index < SHORT_CAPACITY_ENABLED_CAMERAS,
+                        "resourceGroup": "sim-shared",
+                        "backend": {
+                            "type": "sim",
+                            "captureDelayMs": 5_000,
+                            "frame": {
+                                "width": SHORT_CAPACITY_FRAME_WIDTH,
+                                "height": SHORT_CAPACITY_FRAME_HEIGHT,
+                                "pixelFormat": "Mono8",
+                                "pattern": "checkerboard"
+                            },
+                            "ptz": { "supported": true, "statusSupported": true }
+                        },
+                        "ptz": { "enabled": true },
+                        "defaultCaptureProfile": "main",
+                        "captureProfiles": {
+                            "main": {
+                                "maximumFrameBytes": SHORT_CAPACITY_FRAME_BYTES,
+                                "output": { "encoding": "raw" }
+                            }
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let raw = json!({
+                "component": {
+                    "global": {
+                        "output": {
+                            "rootDirectory": output_root,
+                            "minimumFreeBytes": 0,
+                            "minimumFreePercent": 0
+                        },
+                        "state": { "directory": state_root },
+                        "limits": {
+                            "maxConnectedCameras": SHORT_CAPACITY_ENABLED_CAMERAS,
+                            "maxConcurrentCaptures": SHORT_CAPACITY_CONCURRENT_CAPTURES,
+                            "maxConcurrentEncodes": 8,
+                            "maxConcurrentWrites": 8,
+                            "maxConcurrentConnects": 16,
+                            "maxInFlightBytes": SHORT_CAPACITY_FRAME_BYTES * SHORT_CAPACITY_CONCURRENT_CAPTURES as u64,
+                            "maxFrameBytesPerCamera": SHORT_CAPACITY_FRAME_BYTES,
+                            "maxCamerasPerGroup": SHORT_CAPACITY_CONCURRENT_CAPTURES,
+                            "resourceGroups": {
+                                "sim-shared": {
+                                    "maxConcurrentCaptures": SHORT_CAPACITY_CONCURRENT_CAPTURES
+                                }
+                            }
+                        }
+                    },
+                    "instances": instances
+                }
+            });
+            AdapterConfig::from_core_reload(
+                &Config::from_value(COMPONENT_NAME, "capacity-lab", raw)
+                    .expect("short capacity configuration must be structurally valid"),
+            )
+            .expect("short capacity configuration must satisfy adapter limits")
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        async fn wait_for_capacity_roster(runtime: &CameraRuntime) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let snapshots = runtime
+                    .registry
+                    .snapshots(SHORT_CAPACITY_CONFIGURED_CAMERAS)
+                    .expect("capacity registry must remain readable");
+                let online = snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.state == CameraConnectionState::Online)
+                    .count();
+                let disabled = snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.state == CameraConnectionState::Disabled)
+                    .count();
+                if snapshots.len() == SHORT_CAPACITY_CONFIGURED_CAMERAS
+                    && online == SHORT_CAPACITY_ENABLED_CAMERAS
+                    && disabled
+                        == SHORT_CAPACITY_CONFIGURED_CAMERAS - SHORT_CAPACITY_ENABLED_CAMERAS
+                {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "short capacity roster did not reach 256 ONLINE and 768 DISABLED cameras; online={online}, disabled={disabled}, total={}",
+                    snapshots.len()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        fn proc_status_value(key: &str) -> Option<u64> {
+            fs::read_to_string("/proc/self/status")
+                .ok()?
+                .lines()
+                .find_map(|line| {
+                    let value = line.strip_prefix(key)?.split_whitespace().next()?;
+                    value.parse::<u64>().ok()
+                })
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        fn capacity_process_stats() -> CapacityProcessStats {
+            CapacityProcessStats {
+                rss_bytes: proc_status_value("VmRSS:").and_then(|kib| kib.checked_mul(1024)),
+                thread_count: proc_status_value("Threads:"),
+                open_file_descriptors: fs::read_dir("/proc/self/fd")
+                    .ok()
+                    .map(|entries| entries.filter_map(std::result::Result::ok).count() as u64),
+            }
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        fn capacity_sample(
+            runtime: &CameraRuntime,
+            phase: &str,
+            started: Instant,
+        ) -> CapacitySample {
+            let admission = runtime.admission.snapshot();
+            let snapshots = runtime
+                .registry
+                .snapshots(SHORT_CAPACITY_CONFIGURED_CAMERAS)
+                .expect("capacity registry must remain readable");
+            let actors = runtime
+                .actors
+                .read()
+                .expect("capacity actor map must remain readable");
+            let queued_capture_descriptors =
+                actors.values().map(|actor| actor.queued_captures()).sum();
+            let queued_control_descriptors =
+                actors.values().map(|actor| actor.queued_controls()).sum();
+            CapacitySample {
+                phase: phase.to_owned(),
+                elapsed_millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                configured_cameras: snapshots.len(),
+                enabled_cameras: snapshots.iter().filter(|snapshot| snapshot.enabled).count(),
+                online_cameras: snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.state == CameraConnectionState::Online)
+                    .count(),
+                live_actor_count: actors.len(),
+                queued_capture_descriptors,
+                queued_control_descriptors,
+                available_global_acquisitions: admission.available_acquisitions,
+                available_resource_group_acquisitions: admission
+                    .available_resource_group_acquisitions,
+                available_in_flight_bytes: admission.available_memory_bytes,
+                outstanding_disk_bytes: admission.outstanding_disk_bytes,
+                available_encoders: admission.available_encoders,
+                available_writers: admission.available_writers,
+                process: capacity_process_stats(),
+            }
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        fn summarize_latency(mut values: Vec<u64>) -> CommandLatencySummary {
+            values.sort_unstable();
+            let sample_count = values.len();
+            assert!(
+                sample_count > 0,
+                "capacity command timing series must not be empty"
+            );
+            let p95_index = (sample_count * 95).div_ceil(100).saturating_sub(1);
+            CommandLatencySummary {
+                samples: sample_count,
+                minimum_micros: values[0],
+                p50_micros: values[(sample_count - 1) / 2],
+                p95_micros: values[p95_index],
+                maximum_micros: values[sample_count - 1],
+            }
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        async fn time_immediate_command(
+            router: &RuntimeCommandRouter,
+            deferred: &DeferredReplyRegistry,
+            verb: &'static str,
+            suffix: &str,
+            body: serde_json::Value,
+        ) -> u64 {
+            let started = Instant::now();
+            let _ = immediate_success(
+                router
+                    .dispatch(verb, command_message(verb, suffix, body), deferred.clone())
+                    .await,
+            );
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        fn capacity_artifact_directory() -> PathBuf {
+            std::env::var_os("CAMERA_ADAPTER_CAPACITY_ARTIFACT_DIR")
+                .map(PathBuf::from)
+                .expect(
+                    "set CAMERA_ADAPTER_CAPACITY_ARTIFACT_DIR to an explicit empty artifact directory",
+                )
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        fn write_capacity_artifact<T: Serialize>(directory: &Path, file_name: &str, artifact: &T) {
+            fs::create_dir_all(directory).expect("capacity artifact directory must be creatable");
+            let destination = directory.join(file_name);
+            assert!(
+                !destination.exists(),
+                "refusing to overwrite existing capacity evidence: {}",
+                destination.display()
+            );
+            let temporary = directory.join(format!(
+                ".short-capacity-summary-{}.tmp",
+                uuid::Uuid::now_v7()
+            ));
+            fs::write(
+                &temporary,
+                serde_json::to_vec_pretty(artifact)
+                    .expect("capacity artifact must serialize to JSON"),
+            )
+            .expect("capacity artifact temporary file must be writable");
+            fs::rename(&temporary, &destination)
+                .expect("capacity artifact must atomically install in its requested directory");
+        }
+
+        /// Short Linux-only capacity proof for a simulated fleet.
+        ///
+        /// It is intentionally ignored so routine local test runs do not create 33 eight-megapixel
+        /// images. The companion Linux runner provides an explicit artifact directory. This proves
+        /// the roster and admission slice only; it is not the deferred 24-hour soak or a hardware
+        /// compatibility test.
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+        #[ignore = "short Linux capacity evidence; run simulators/run-capacity-validation.sh"]
+        async fn short_linux_capacity_proves_1024_configured_256_sessions_and_32_captures() {
+            let artifact_directory = capacity_artifact_directory();
+            let temporary_root = TempDir::new().expect("capacity test root must be creatable");
+            let configuration = short_capacity_configuration(temporary_root.path());
+            fs::create_dir_all(&configuration.global.output.root_directory)
+                .expect("capacity output root must exist before secure storage initialization");
+            let instance_ids = configuration
+                .instances
+                .iter()
+                .map(|camera| camera.id.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(instance_ids.len(), SHORT_CAPACITY_CONFIGURED_CAMERAS);
+            assert_eq!(
+                configuration
+                    .instances
+                    .iter()
+                    .filter(|camera| camera.enabled)
+                    .count(),
+                SHORT_CAPACITY_ENABLED_CAMERAS
+            );
+
+            let router = RuntimeCommandRouter::new();
+            let (port, _) = spawn_recording_mqtt_broker().await;
+            let core = facade_core_with_router_instances(
+                &temporary_root,
+                port,
+                Some(Arc::clone(&router)),
+                &instance_ids,
+            )
+            .await;
+            let inbox = core
+                .commands()
+                .expect("capacity fixture Core must expose the command inbox");
+            let deferred = inbox.deferred_replies();
+            let resources = prepare_startup_resources(&configuration, Platform::Host)
+                .await
+                .expect("capacity startup resources must be durable and valid");
+            let mut apps = BTreeMap::new();
+            let mut events = BTreeMap::new();
+            for instance in &instance_ids {
+                let instance_facade = core
+                    .instance(instance)
+                    .expect("configured capacity instance must build Core facades");
+                apps.insert(instance.clone(), Arc::new(instance_facade.app()));
+                events.insert(instance.clone(), instance_facade.events());
+            }
+            let idle_session_baseline_rss_bytes = capacity_process_stats().rss_bytes.expect(
+                "Linux capacity proof requires /proc/self/status VmRSS before runtime startup",
+            );
+            let readiness = RuntimeReadiness::noop();
+            let runtime = CameraRuntime::start(
+                configuration,
+                resources,
+                RuntimeServices {
+                    apps,
+                    events,
+                    outbox_events: core.events(),
+                    readiness,
+                    backend_context: BackendRuntimeContext::new(None),
+                    messaging: core
+                        .messaging()
+                        .expect("capacity Core must expose messaging"),
+                },
+            )
+            .await
+            .expect("capacity runtime must start all configured supervisors");
+            router
+                .install(runtime.clone())
+                .expect("capacity router must install exactly one complete runtime");
+            let started = Instant::now();
+            wait_for_capacity_roster(&runtime).await;
+            let roster_online_sample = capacity_sample(&runtime, "roster-online", started);
+            let roster_online_rss_bytes = roster_online_sample.process.rss_bytes.expect(
+                "Linux capacity proof requires /proc/self/status VmRSS after roster startup",
+            );
+            let full_frame_allocation_equivalent_bytes = SHORT_CAPACITY_FRAME_BYTES
+                .checked_mul(SHORT_CAPACITY_ENABLED_CAMERAS as u64)
+                .expect("configured full-frame equivalent must fit in u64");
+            let maximum_allowed_delta_bytes = full_frame_allocation_equivalent_bytes
+                / IDLE_SESSION_RSS_MAXIMUM_FULL_FRAME_FRACTION_DENOMINATOR;
+            let roster_online_delta_bytes =
+                roster_online_rss_bytes.saturating_sub(idle_session_baseline_rss_bytes);
+            assert!(
+                roster_online_delta_bytes <= maximum_allowed_delta_bytes,
+                "256 idle SimBackend sessions increased RSS by {roster_online_delta_bytes} bytes; this must remain at most one eighth of their {full_frame_allocation_equivalent_bytes}-byte full-frame equivalent"
+            );
+            let idle_session_memory = IdleSessionMemoryEvidence {
+                baseline_rss_bytes: idle_session_baseline_rss_bytes,
+                roster_online_rss_bytes,
+                roster_online_delta_bytes,
+                full_frame_allocation_equivalent_bytes,
+                maximum_allowed_delta_bytes,
+            };
+            let mut samples = vec![roster_online_sample];
+
+            let capture_instances = instance_ids
+                .iter()
+                .take(SHORT_CAPACITY_CONCURRENT_CAPTURES)
+                .cloned()
+                .collect::<Vec<_>>();
+            let accepted_at = Instant::now();
+            let group_response = immediate_success(
+                router
+                    .dispatch(
+                        "sb/capture-group-submit",
+                        command_message(
+                            "sb/capture-group-submit",
+                            "short-capacity-group",
+                            json!({
+                                "requestId": "short-capacity-group",
+                                "instances": capture_instances
+                            }),
+                        ),
+                        deferred.clone(),
+                    )
+                    .await,
+            );
+            let capture_group_submit_micros =
+                u64::try_from(accepted_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let group_id = group_response["captureGroupId"]
+                .as_str()
+                .expect("capacity group response must contain a group id")
+                .to_owned();
+
+            let saturation_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            let saturation = loop {
+                let sample = capacity_sample(&runtime, "acquisition-saturation", started);
+                let group_available = sample
+                    .available_resource_group_acquisitions
+                    .get("sim-shared")
+                    .copied();
+                if sample.available_global_acquisitions == 0
+                    && group_available == Some(0)
+                    && sample.available_in_flight_bytes == 0
+                    && sample.outstanding_disk_bytes
+                        == SHORT_CAPACITY_FRAME_BYTES * SHORT_CAPACITY_CONCURRENT_CAPTURES as u64
+                {
+                    break sample;
+                }
+                samples.push(sample);
+                assert!(
+                    tokio::time::Instant::now() < saturation_deadline,
+                    "the short capacity group never saturated global, resource-group, byte, and disk admission"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            samples.push(saturation);
+
+            let overflow_response = immediate_success(
+                router
+                    .dispatch(
+                        "sb/capture-submit",
+                        command_message(
+                            "sb/capture-submit",
+                            "short-capacity-overflow",
+                            json!({
+                                "instance": "camera-0032",
+                                "requestId": "short-capacity-overflow"
+                            }),
+                        ),
+                        inbox.deferred_replies(),
+                    )
+                    .await,
+            );
+            let overflow_capture_id = overflow_response["captureId"]
+                .as_str()
+                .expect("overflow capture response must contain a capture id")
+                .to_owned();
+            let overflow_queued = runtime
+                .catalog
+                .job(&overflow_capture_id)
+                .await
+                .expect("overflow capture query must succeed")
+                .expect("overflow capture must be durable");
+            assert!(
+                !overflow_queued.state.is_terminal(),
+                "the 33rd capture must not bypass a saturated global admission gate"
+            );
+            samples.push(capacity_sample(&runtime, "overflow-queued", started));
+
+            let mut latency_samples = BTreeMap::<String, Vec<u64>>::new();
+            for index in 0..20 {
+                latency_samples
+                    .entry("sb/list".to_owned())
+                    .or_default()
+                    .push(
+                        time_immediate_command(
+                            &router,
+                            &deferred,
+                            "sb/list",
+                            &format!("short-capacity-list-{index}"),
+                            json!({ "limit": 1 }),
+                        )
+                        .await,
+                    );
+                latency_samples
+                    .entry("sb/status".to_owned())
+                    .or_default()
+                    .push(
+                        time_immediate_command(
+                            &router,
+                            &deferred,
+                            "sb/status",
+                            &format!("short-capacity-status-{index}"),
+                            json!({ "instance": "camera-0033" }),
+                        )
+                        .await,
+                    );
+                latency_samples
+                    .entry("sb/ptz-stop".to_owned())
+                    .or_default()
+                    .push(
+                        time_immediate_command(
+                            &router,
+                            &deferred,
+                            "sb/ptz",
+                            &format!("short-capacity-stop-{index}"),
+                            json!({
+                                "operation": "stop",
+                                "instance": "camera-0033",
+                                "requestId": format!("short-capacity-stop-{index}"),
+                                "axes": ["pan", "tilt", "zoom"]
+                            }),
+                        )
+                        .await,
+                    );
+            }
+            let command_latency = latency_samples
+                .into_iter()
+                .map(|(verb, values)| (verb, summarize_latency(values)))
+                .collect::<BTreeMap<_, _>>();
+            for (verb, summary) in &command_latency {
+                assert!(
+                    summary.p95_micros <= 250_000,
+                    "{verb} p95 was {}us while acquisitions were saturated",
+                    summary.p95_micros
+                );
+            }
+
+            let group =
+                wait_for_group_terminal_within(&runtime, &group_id, Duration::from_secs(90)).await;
+            assert_eq!(group.members.len(), SHORT_CAPACITY_CONCURRENT_CAPTURES);
+            let group_successful_members = group
+                .members
+                .iter()
+                .filter(|member| member.state == crate::model::JobState::Succeeded)
+                .count();
+            assert_eq!(group_successful_members, SHORT_CAPACITY_CONCURRENT_CAPTURES);
+            let overflow =
+                wait_for_terminal_within(&runtime, &overflow_capture_id, Duration::from_secs(90))
+                    .await;
+            assert_eq!(overflow.state, crate::model::JobState::Succeeded);
+            samples.push(capacity_sample(&runtime, "captures-terminal", started));
+
+            router.begin_shutdown();
+            runtime.shutdown().await;
+            inbox.stop().await;
+
+            write_capacity_artifact(
+                &artifact_directory,
+                "short-capacity-summary.json",
+                &ShortCapacityArtifact {
+                    schema_version: "camera-adapter-short-capacity/v1",
+                    scope: "ignored Linux short proof using the real Core facade and in-process SimBackend; not a 24-hour soak or hardware test",
+                    configured_cameras: SHORT_CAPACITY_CONFIGURED_CAMERAS,
+                    enabled_simulated_sessions: SHORT_CAPACITY_ENABLED_CAMERAS,
+                    concurrent_capture_target: SHORT_CAPACITY_CONCURRENT_CAPTURES,
+                    frame: json!({
+                        "width": SHORT_CAPACITY_FRAME_WIDTH,
+                        "height": SHORT_CAPACITY_FRAME_HEIGHT,
+                        "pixelFormat": "Mono8",
+                        "bytesPerFrame": SHORT_CAPACITY_FRAME_BYTES
+                    }),
+                    idle_session_memory,
+                    capture_group_submit_micros,
+                    command_latency,
+                    resource_samples: samples,
+                    group_terminal_state: format!("{:?}", group.state),
+                    group_successful_members,
+                    overflow_capture_terminal_state: format!("{:?}", overflow.state),
+                    omitted_from_this_short_run: vec![
+                        "24-hour soak execution",
+                        "10,000 mixed-job workload",
+                        "broker-outage recovery",
+                        "reload churn",
+                        "encoder and writer saturation graph",
+                        "Core ping handler timing",
+                        "physical-camera compatibility",
+                    ],
+                },
+            );
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        fn capacity_facades(
+            core: &edgecommons::EdgeCommons,
+            instances: &[String],
+        ) -> (
+            BTreeMap<String, Arc<AppFacade>>,
+            BTreeMap<String, EventsFacade>,
+        ) {
+            let mut apps = BTreeMap::new();
+            let mut events = BTreeMap::new();
+            for instance in instances {
+                let facade = core
+                    .instance(instance)
+                    .expect("configured capacity instance must build Core facades");
+                apps.insert(instance.clone(), Arc::new(facade.app()));
+                events.insert(instance.clone(), facade.events());
+            }
+            (apps, events)
+        }
+
+        /// Bounded 15-minute simulator smoke for the capacity harness itself.
+        ///
+        /// The runner always executes the separate 8MP short proof first. This smoke switches to
+        /// small deterministic frames so schedules and command traffic can run for fifteen
+        /// minutes without turning a harness-construction check into a multi-hour disk benchmark.
+        #[cfg(all(
+            target_os = "linux",
+            feature = "standalone",
+            feature = "onvif",
+            feature = "capacity-harness"
+        ))]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+        #[ignore = "15-minute Linux simulator smoke; run simulators/run-capacity-validation.sh --soak-duration 15m"]
+        async fn fifteen_minute_linux_capacity_smoke_exercises_mixed_runtime_traffic() {
+            let duration_seconds = std::env::var("CAMERA_ADAPTER_CAPACITY_SOAK_DURATION_SECS")
+                .expect("runner must set CAMERA_ADAPTER_CAPACITY_SOAK_DURATION_SECS")
+                .parse::<u64>()
+                .expect("soak duration must be an unsigned integer");
+            assert_eq!(
+                duration_seconds, 900,
+                "only the bounded 15-minute smoke is implemented; the 24-hour soak remains deferred"
+            );
+            let artifact_directory = capacity_artifact_directory();
+            let temporary_root = TempDir::new().expect("capacity smoke root must be creatable");
+            let mut configuration = short_capacity_configuration(temporary_root.path());
+            const SMOKE_FRAME_BYTES: u64 = 640 * 480;
+            const SMOKE_RESERVATION_BYTES: u64 = 1024 * 1024;
+            configuration.global.limits.max_frame_bytes_per_camera = SMOKE_RESERVATION_BYTES;
+            configuration.global.limits.max_in_flight_bytes =
+                SMOKE_RESERVATION_BYTES * SHORT_CAPACITY_CONCURRENT_CAPTURES as u64;
+            for (index, camera) in configuration.instances.iter_mut().enumerate() {
+                let crate::config::BackendConfig::Sim(sim) = &mut camera.backend else {
+                    panic!("capacity smoke must use SimBackend");
+                };
+                sim.capture_delay_ms = 50;
+                sim.frame.width = 640;
+                sim.frame.height = 480;
+                camera
+                    .capture_profiles
+                    .get_mut("main")
+                    .expect("capacity smoke main profile must exist")
+                    .maximum_frame_bytes = Some(SMOKE_RESERVATION_BYTES);
+                if index < 8 {
+                    camera.schedules.push(
+                        serde_json::from_value(json!({
+                            "id": "five-second-smoke",
+                            "cron": "*/5 * * * * *",
+                            "timezone": "UTC",
+                            "captureProfile": "main"
+                        }))
+                        .expect("capacity smoke schedule must deserialize"),
+                    );
+                }
+            }
+            fs::create_dir_all(&configuration.global.output.root_directory)
+                .expect("capacity smoke output root must exist before storage initialization");
+            let instance_ids = configuration
+                .instances
+                .iter()
+                .map(|camera| camera.id.clone())
+                .collect::<Vec<_>>();
+            let router = RuntimeCommandRouter::new();
+            let (port, _) = spawn_recording_mqtt_broker().await;
+            let core = facade_core_with_router_instances(
+                &temporary_root,
+                port,
+                Some(Arc::clone(&router)),
+                &instance_ids,
+            )
+            .await;
+            let inbox = core
+                .commands()
+                .expect("capacity smoke Core must expose inbox");
+            let deferred = inbox.deferred_replies();
+            let resources = prepare_startup_resources(&configuration, Platform::Host)
+                .await
+                .expect("capacity smoke startup resources must be valid");
+            let (apps, events) = capacity_facades(&core, &instance_ids);
+            let runtime = CameraRuntime::start(
+                configuration,
+                resources,
+                RuntimeServices {
+                    apps,
+                    events,
+                    outbox_events: core.events(),
+                    readiness: RuntimeReadiness::noop(),
+                    backend_context: BackendRuntimeContext::new(None),
+                    messaging: core
+                        .messaging()
+                        .expect("capacity smoke Core must expose messaging"),
+                },
+            )
+            .await
+            .expect("capacity smoke runtime must start");
+            router
+                .install(runtime.clone())
+                .expect("capacity smoke router must install");
+            wait_for_capacity_roster(&runtime).await;
+
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(duration_seconds);
+            let mut ticks = tokio::time::interval(Duration::from_secs(1));
+            let mut samples = vec![capacity_sample(&runtime, "soak-roster-online", started)];
+            let mut timing = BTreeMap::<String, Vec<u64>>::new();
+            let mut submitted_captures = 0_u64;
+            let mut reconnects = 0_u64;
+            let mut reloads = 0_u64;
+            let mut tick = 0_u64;
+            while Instant::now() < deadline {
+                ticks.tick().await;
+                tick = tick.saturating_add(1);
+                let target = format!("camera-{:04}", 32 + (tick as usize % 224));
+                if tick % 2 == 0 {
+                    let _ = immediate_success(
+                        router
+                            .dispatch(
+                                "sb/capture-submit",
+                                command_message(
+                                    "sb/capture-submit",
+                                    &format!("soak-capture-{tick}"),
+                                    json!({ "instance": target, "requestId": format!("soak-capture-{tick}") }),
+                                ),
+                                deferred.clone(),
+                            )
+                            .await,
+                    );
+                    submitted_captures = submitted_captures.saturating_add(1);
+                }
+                if tick % 5 == 0 {
+                    timing.entry("sb/list".to_owned()).or_default().push(
+                        time_immediate_command(
+                            &router,
+                            &deferred,
+                            "sb/list",
+                            &format!("soak-list-{tick}"),
+                            json!({ "limit": 10 }),
+                        )
+                        .await,
+                    );
+                    timing.entry("sb/status".to_owned()).or_default().push(
+                        time_immediate_command(
+                            &router,
+                            &deferred,
+                            "sb/status",
+                            &format!("soak-status-{tick}"),
+                            json!({ "instance": "camera-0033" }),
+                        )
+                        .await,
+                    );
+                    timing.entry("sb/ptz-stop".to_owned()).or_default().push(
+                        time_immediate_command(
+                            &router,
+                            &deferred,
+                            "sb/ptz",
+                            &format!("soak-stop-{tick}"),
+                            json!({
+                                "operation": "stop",
+                                "instance": "camera-0033",
+                                "requestId": format!("soak-stop-{tick}"),
+                                "axes": ["pan", "tilt", "zoom"]
+                            }),
+                        )
+                        .await,
+                    );
+                    samples.push(capacity_sample(&runtime, "soak-sample", started));
+                }
+                if tick % 60 == 0 {
+                    runtime
+                        .reconnect(ReconnectRequest {
+                            instance: Some("camera-0000".to_owned()),
+                            request_id: format!("soak-reconnect-{tick}"),
+                            reason: Some("capacity-smoke".to_owned()),
+                        })
+                        .await
+                        .expect("capacity smoke reconnect must be accepted");
+                    reconnects = reconnects.saturating_add(1);
+                }
+                if tick % 180 == 0 {
+                    let replacement = runtime
+                        .config_snapshot()
+                        .expect("capacity smoke configuration must remain readable");
+                    let (apps, events) = capacity_facades(&core, &instance_ids);
+                    runtime
+                        .apply_reloaded_config(replacement, apps, events)
+                        .await
+                        .expect("capacity smoke reload must preserve the valid generation");
+                    reloads = reloads.saturating_add(1);
+                }
+            }
+            samples.push(capacity_sample(&runtime, "soak-complete", started));
+            let mut scheduled_jobs_by_camera = BTreeMap::new();
+            for instance in instance_ids.iter().take(8) {
+                let scheduled_jobs = runtime
+                    .catalog
+                    .jobs_page(Some(instance.clone()), Vec::new(), None, 1_000)
+                    .await
+                    .expect("capacity smoke must retain scheduled job evidence")
+                    .into_iter()
+                    .filter(|job| {
+                        job.trigger.get("type").and_then(Value::as_str) == Some("schedule")
+                            && job.trigger.get("scheduleId").and_then(Value::as_str)
+                                == Some("five-second-smoke")
+                    })
+                    .count() as u64;
+                assert!(
+                    scheduled_jobs >= 120,
+                    "capacity smoke must record sustained scheduled traffic for {instance}; observed {scheduled_jobs} accepted occurrences"
+                );
+                scheduled_jobs_by_camera.insert(instance.clone(), scheduled_jobs);
+            }
+            let command_latency = timing
+                .into_iter()
+                .map(|(verb, values)| (verb, summarize_latency(values)))
+                .collect::<BTreeMap<_, _>>();
+            assert!(
+                submitted_captures >= 400,
+                "15-minute smoke submitted too little command traffic"
+            );
+            assert!(
+                reconnects >= 14,
+                "15-minute smoke omitted reconnect traffic"
+            );
+            assert!(reloads >= 4, "15-minute smoke omitted reload traffic");
+
+            router.begin_shutdown();
+            runtime.shutdown().await;
+            inbox.stop().await;
+            write_capacity_artifact(
+                &artifact_directory,
+                "fifteen-minute-soak-summary.json",
+                &json!({
+                    "schemaVersion": "camera-adapter-capacity-smoke/v1",
+                    "scope": "15-minute Linux SimBackend smoke; not a 24-hour soak or hardware test",
+                    "durationSeconds": duration_seconds,
+                    "configuredCameras": SHORT_CAPACITY_CONFIGURED_CAMERAS,
+                    "enabledSimulatedSessions": SHORT_CAPACITY_ENABLED_CAMERAS,
+                    "scheduledCameras": 8,
+                    "scheduledJobsByCamera": scheduled_jobs_by_camera,
+                    "frame": { "width": 640, "height": 480, "pixelFormat": "Mono8", "bytesPerFrame": SMOKE_FRAME_BYTES, "reservationBytes": SMOKE_RESERVATION_BYTES },
+                    "submittedCaptures": submitted_captures,
+                    "reconnects": reconnects,
+                    "reloads": reloads,
+                    "commandLatency": command_latency,
+                    "resourceSamples": samples,
+                    "omittedFromThisSmoke": ["24-hour execution", "10,000-job completion target", "broker-outage recovery", "encoder/writer saturation", "Core ping timing", "physical cameras"]
+                }),
+            );
         }
     }
 }

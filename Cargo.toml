@@ -42,6 +42,9 @@ rtsp = [
     "dep:tokio-rustls",
 ]
 native-all = ["genicam", "rtsp"]
+# Linux-only live-lab test plumbing. This is intentionally non-default so the
+# short capacity workload is not compiled into ordinary `--lib` coverage.
+capacity-harness = []
 
 [dependencies]
 edgecommons = { path = "../core/libs/rust", default-features = false, features = ["credentials"] }

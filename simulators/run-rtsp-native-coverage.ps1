@@ -81,4 +81,83 @@ foreach ($fixture in @(
     }
 }
 
-Write-Host "Native H.264/H.265 first-frame and warm-session fixture LCOV artifacts: $coverageRoot"
+# The four reports above are intentionally isolated fixture evidence. Re-run
+# the ordinary native-feature library suite plus both live codecs without
+# cleaning between invocations, then export one measured aggregate. This is a
+# native RTSP scope report, not the adapter-wide coverage gate.
+$summaryArtifact = '/coverage-artifacts/rtsp-native-summary.json'
+Invoke-Docker -Arguments @(
+    'run', '--rm', '--network', $Network,
+    '-v', $sourceMount,
+    '-v', $targetMount,
+    '-v', $registryMount,
+    '-v', $gitMount,
+    '-v', $artifactMount,
+    '-w', '/edgecommons/camera-adapter',
+    '-e', 'CARGO_TARGET_DIR=/coverage-target',
+    $Image,
+    '+1.87.0', 'llvm-cov', 'clean'
+)
+Invoke-Docker -Arguments @(
+    'run', '--rm', '--network', $Network,
+    '-v', $sourceMount,
+    '-v', $targetMount,
+    '-v', $registryMount,
+    '-v', $gitMount,
+    '-v', $artifactMount,
+    '-w', '/edgecommons/camera-adapter',
+    '-e', 'CARGO_TARGET_DIR=/coverage-target',
+    $Image,
+    '+1.87.0', 'llvm-cov', 'test', '--no-clean', '--locked',
+    '--no-default-features', '--features', 'standalone,onvif,rtsp', '--lib',
+    '--json', '--summary-only', '--output-path', $summaryArtifact
+)
+foreach ($fixture in @(
+    @{ Name = 'h264'; Path = 'camera' },
+    @{ Name = 'h265'; Path = 'camera-h265' }
+)) {
+    Invoke-Docker -Arguments @(
+        'run', '--rm', '--network', $Network,
+        '-v', $sourceMount,
+        '-v', $targetMount,
+        '-v', $registryMount,
+        '-v', $gitMount,
+        '-v', $artifactMount,
+        '-w', '/edgecommons/camera-adapter',
+        '-e', 'CARGO_TARGET_DIR=/coverage-target',
+        '-e', "CAMERA_ADAPTER_RTSP_URI=rtsp://mediamtx:8554/$($fixture.Path)",
+        $Image,
+        '+1.87.0', 'llvm-cov', 'test', '--no-clean', '--locked',
+        '--no-default-features', '--features', 'standalone,onvif,rtsp', '--lib',
+        '--json', '--summary-only', '--output-path', $summaryArtifact,
+        'backend::rtsp::tests::pinned_mediamtx', '--', '--ignored'
+    )
+}
+Invoke-Docker -Arguments @(
+    'run', '--rm', '--network', $Network,
+    '-v', $sourceMount,
+    '-v', $targetMount,
+    '-v', $registryMount,
+    '-v', $gitMount,
+    '-v', $artifactMount,
+    '-w', '/edgecommons/camera-adapter',
+    '-e', 'CARGO_TARGET_DIR=/coverage-target',
+    $Image,
+    '+1.87.0', 'llvm-cov', 'report', '--locked', '--json', '--summary-only',
+    '--output-path', $summaryArtifact
+)
+$hostSummary = Join-Path $coverageRoot 'rtsp-native-summary.json'
+if (-not (Test-Path -LiteralPath $hostSummary) -or (Get-Item -LiteralPath $hostSummary).Length -eq 0) {
+    throw "native RTSP coverage did not produce $hostSummary"
+}
+$summary = Get-Content -LiteralPath $hostSummary -Raw | ConvertFrom-Json
+$rtspSummary = @($summary.data | ForEach-Object { $_.files } | Where-Object {
+    $_.filename -replace '\\', '/' -match '/src/backend/rtsp\.rs$'
+})
+if ($rtspSummary.Count -ne 1) {
+    throw "native RTSP coverage summary did not contain exactly one src/backend/rtsp.rs entry"
+}
+$lines = $rtspSummary[0].summary.lines
+$linePercent = if ($lines.count -eq 0) { 0 } else { [math]::Round((100 * $lines.covered) / $lines.count, 2) }
+Write-Host "Native RTSP aggregate: $($lines.covered)/$($lines.count) lines ($linePercent%)"
+Write-Host "Native H.264/H.265 fixture LCOV and aggregate summary artifacts: $coverageRoot"

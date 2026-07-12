@@ -112,7 +112,7 @@ selected for the release is integrated with the real P1 APIs.
 | P3 | WS-Discovery, ONVIF services/media/auth/TLS/snapshot, PTZ/presets, deterministic in-repo simulators | Simulator security/fault suite; physical ONVIF/PTZ compatibility is waived with no hardware claim | §24 P3 |
 | P4 | Aravis GigE/USB3 backend, features, bounded buffers, timestamp quality, formats | Fake camera and packet faults; physical vendor compatibility is waived with no hardware claim | §24 P4 |
 | P5 | GStreamer RTSP extraction, bounded warm session, fallback | RTSP codec/fault suite; physical fallback-camera compatibility is waived with no hardware claim | §24 P5 |
-| P6 | HOST, Greengrass, Kubernetes, file-replicator, bottling-company integration, scale/soak | All applicable platform gates, 24-hour fleet soak, docs and registry ready | §24 P6, line 2298 |
+| P6 | HOST, Greengrass, Kubernetes, file-replicator, bottling-company integration, scale/soak | All current platform gates, short capacity evidence, docs and registry ready; 24-hour fleet-soak execution is deferred to a later validation phase | §24 P6, line 2304 |
 | P7 | Compatibility register, threat/security review, operations, release status | No unresolved blocking findings; physical and lab gaps either closed or release explicitly withheld | §24 P7, line 2299 |
 
 ## 4. Implementation module map
@@ -953,7 +953,7 @@ Each row links source files, tests, evidence artifacts, and status (`not started
 | `TR-RUNTIME` | DESIGN §§19.4–20, lines 1924–1955; addendum §§5.4, 7.5–7.6, 9.3 | runtime, config, supervisor, jobs | Initial-not-ready and command-start races, reload compatibility matrix, durable-path resolution, and timed shutdown/forced-stop tests |
 | `TR-DEPLOY` | DESIGN §21, lines 1957–2038 | packaging/deployment artifacts | HOST, Greengrass, kind, hardware runner evidence or explicit gaps |
 | `TR-INTEGRATION` | DESIGN §22, lines 2040–2108 | system tests, file-replicator docs/config | End-to-end metadata/file/checksum/group/replication evidence |
-| `TR-VALIDATION` | DESIGN §23; addendum §12 | all test suites | Portable and native-feature coverage, simulator versions/config, soak graphs, and the hardware-waiver register |
+| `TR-VALIDATION` | DESIGN §23; addendum §12 | all test suites | Portable and native-feature coverage, simulator versions/config, short-capacity artifacts, deferred-soak plan/results after later execution, and the hardware-waiver register |
 | `TR-DOCS` | DESIGN §25, lines 2303–2321 | component and core docs | Diátaxis set reviewed against shipped behavior |
 
 ### 13.2 Adversarial review gates
@@ -988,7 +988,7 @@ The final local handoff contains:
 - pinned native dependency, container image, codec, and simulator versions;
 - sample successful and failing requests, replies, terminal app envelopes, and operator alarm envelopes;
 - image and sidecar paths, modes, sizes, SHA-256 values, and crash-recovery evidence;
-- 256-camera/32-capture resource graphs and 24-hour soak results;
+- 256-camera/32-capture short-capacity artifacts, their write-once run manifest, SHA-256 attestations, and complete 15-minute human-readable report with report attestation, plus the deferred 24-hour soak plan; attach soak results only after that later execution;
 - broker-outage outbox evidence with stable envelope UUIDs;
 - four-language local MQTT and deployed Greengrass IPC interop evidence for P1;
 - HOST, Greengrass, kind, and applicable hardware-cluster evidence;

@@ -20,6 +20,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+if ($env:OS -eq 'Windows_NT') {
+    throw 'Native fake-Aravis coverage requires a true Linux host/L2 namespace. Windows Docker Desktop Linux containers are not accepted evidence; run this script from a native Linux or WSL Linux host connected to the camera-facing interface.'
+}
+
 function Invoke-Docker {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
@@ -53,7 +57,20 @@ if (-not $SkipSimulatorStart) {
 }
 
 if (-not $SkipBuild) {
-    Invoke-Docker -Arguments @('build', '-f', $aravisDockerfile, '-t', $Image, $aravisContext)
+    Invoke-Docker -Arguments @(
+        'compose', '-f', $composeFile, '--profile', 'linux-l2', 'build', 'aravis-fake'
+    )
+    $fakeImageId = (& docker image inspect --format '{{.Id}}' 'camera-adapter-simulators-aravis-fake').Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($fakeImageId)) {
+        throw 'unable to resolve the freshly built Aravis fake image ID'
+    }
+    $fakeImageReference = "camera-adapter-aravis-validation-input:$($fakeImageId -replace '^sha256:', '')"
+    Invoke-Docker -Arguments @('tag', 'camera-adapter-simulators-aravis-fake', $fakeImageReference)
+    Invoke-Docker -Arguments @(
+        'build', '-f', $aravisDockerfile,
+        '--build-arg', "ARAVIS_RUNTIME_IMAGE=$fakeImageReference",
+        '-t', $Image, $aravisContext
+    )
 }
 
 # Cargo state is kept off the read-only source mount. The named volumes are
@@ -89,15 +106,21 @@ $commonRunArguments = @(
 Invoke-Docker -Arguments ($commonRunArguments + @(
     '+1.87.0', 'llvm-cov', 'clean', '--workspace'
 ))
+# Build and execute the real production helper at cargo-llvm-cov's fixed target
+# location. This avoids a test-harness binary and contributes a separately
+# collected profile that the later no-clean library test report can merge.
 Invoke-Docker -Arguments ($commonRunArguments + @(
-    '+1.87.0', 'llvm-cov', 'test', '--locked', '--no-clean', '--no-report',
-    '--no-default-features', '--features', 'standalone,genicam',
-    '--lib', '--bin', 'camera-adapter-genicam-discover',
-    'backend::genicam_aravis::tests::pinned_aravis_fake_discovers_and_captures_two_complete_mono8_frames',
-    '--', '--ignored', '--exact', '--test-threads', '1'
+    '+1.87.0', 'llvm-cov', 'run', '--locked', '--no-report', '--no-default-features',
+    '--features', 'standalone,genicam',
+    '--bin', 'camera-adapter-genicam-discover', '--',
+    '--interface', $Interface, '--transport', 'gige-vision', '--max-results', '1'
 ))
 Invoke-Docker -Arguments ($commonRunArguments + @(
-    '+1.87.0', 'llvm-cov', 'report', '--lcov', '--output-path', $artifact
+    '+1.87.0', 'llvm-cov', 'test', '--locked', '--no-clean',
+    '--no-default-features', '--features', 'standalone,genicam',
+    '--lib', '--lcov', '--output-path', $artifact,
+    'backend::genicam_aravis::tests::pinned_aravis_fake_discovers_and_captures_two_complete_mono8_frames',
+    '--', '--ignored', '--exact', '--test-threads', '1'
 ))
 
 $hostArtifact = Join-Path $coverageRoot 'genicam-fake-gv-mono8.lcov'
@@ -105,5 +128,27 @@ if (-not (Test-Path -LiteralPath $hostArtifact) -or (Get-Item -LiteralPath $host
     throw "native GenICam coverage did not produce $hostArtifact"
 }
 
+$moduleLines = 0
+$moduleHits = 0
+$isGenicamModule = $false
+foreach ($line in Get-Content -LiteralPath $hostArtifact) {
+    if ($line.StartsWith('SF:')) {
+        $normalized = $line.Substring(3).Replace('\', '/')
+        $isGenicamModule = $normalized.EndsWith('/src/backend/genicam_aravis.rs')
+        continue
+    }
+    if ($isGenicamModule -and $line -match '^DA:\d+,(\d+)$') {
+        $moduleLines++
+        if ([int64]$Matches[1] -gt 0) {
+            $moduleHits++
+        }
+    }
+}
+if ($moduleLines -eq 0) {
+    throw "native GenICam coverage artifact did not contain src/backend/genicam_aravis.rs"
+}
+$moduleCoverage = [math]::Round((100.0 * $moduleHits) / $moduleLines, 2)
+
 Write-Host "Native fake-Aravis fixture LCOV artifact: $hostArtifact"
+Write-Host "Native GenICam module fixture coverage: $moduleHits/$moduleLines lines ($moduleCoverage%)"
 Write-Host 'This artifact is not an adapter-wide coverage result and does not certify physical camera compatibility.'

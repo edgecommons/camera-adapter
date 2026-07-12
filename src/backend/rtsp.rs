@@ -6,6 +6,8 @@
 //! H.264/H.265 access units cross into the native decoder boundary.
 #![cfg_attr(not(feature = "rtsp"), allow(dead_code))]
 
+#[cfg(feature = "rtsp")]
+use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 #[cfg(feature = "rtsp")]
@@ -1459,6 +1461,7 @@ struct GstreamerDecoder {
     codec: RtspCodec,
     next_pts: u64,
     pending: BTreeMap<u64, PendingDecoderUnit>,
+    recently_terminal_pts: VecDeque<u64>,
 }
 
 #[cfg(feature = "rtsp")]
@@ -1527,6 +1530,7 @@ impl GstreamerDecoder {
             codec,
             next_pts: 1,
             pending: BTreeMap::new(),
+            recently_terminal_pts: VecDeque::new(),
         })
     }
 
@@ -1560,17 +1564,18 @@ impl GstreamerDecoder {
                 "decoded RTSP frame exceeds the decompression-ratio bound",
             ));
         }
-        if self.pending.len() >= MAX_DECODER_PENDING_UNITS {
-            return Err(CameraError::rejected(
-                ErrorCode::ResourceLimit,
-                "GStreamer decoder pending-frame bound was reached",
-            ));
-        }
         let pts = self.next_pts;
-        self.next_pts = self
+        let next_pts = self
             .next_pts
             .checked_add(1_000_000)
             .ok_or_else(|| security_error("GStreamer decoder timestamp wrapped"))?;
+        if self.pending.len() >= MAX_DECODER_PENDING_UNITS {
+            let _ = retire_oldest_pending_decoder_unit(
+                &mut self.pending,
+                &mut self.recently_terminal_pts,
+            )?;
+        }
+        self.next_pts = next_pts;
         let mut buffer = gst::Buffer::from_slice(unit.bytes);
         {
             let buffer = buffer
@@ -1644,21 +1649,7 @@ impl GstreamerDecoder {
             .pts()
             .ok_or_else(|| security_error("GStreamer output frame omitted stream timestamp"))?
             .nseconds();
-        let pending = self
-            .pending
-            .remove(&output_pts)
-            .ok_or_else(|| security_error("GStreamer output timestamp was not requested"))?;
-        self.pending
-            .retain(|pending_pts, _| *pending_pts > output_pts);
-        if (width, height) != pending.dimensions {
-            return Err(security_error(
-                "GStreamer decoded dimensions differ from the validated SPS",
-            ));
-        }
-        let exact_length = u64::from(width)
-            .checked_mul(u64::from(height))
-            .and_then(|value| value.checked_mul(3))
-            .ok_or_else(|| security_error("GStreamer output size overflowed"))?;
+        let exact_length = decoded_rgb_frame_bytes(width, height)?;
         if exact_length > maximum_bytes
             || u64::try_from(output.size()).unwrap_or(u64::MAX) != exact_length
         {
@@ -1667,9 +1658,25 @@ impl GstreamerDecoder {
                 "GStreamer output violates the exact decoded-frame bound",
             ));
         }
+        let Some(pending) =
+            correlate_decoder_output(&mut self.pending, &self.recently_terminal_pts, output_pts)?
+        else {
+            // This PTS already reached a terminal outcome (published or
+            // retired at the bounded pending edge). Some H.265 decoder/parser
+            // combinations surface a stale duplicate after the next input.
+            // It has passed the raw-frame bound above but is never remapped,
+            // copied, or published.
+            return Ok(None);
+        };
+        if (width, height) != pending.dimensions {
+            return Err(security_error(
+                "GStreamer decoded dimensions differ from the validated SPS",
+            ));
+        }
         let mapped = output
             .map_readable()
             .map_err(|_| backend_error("GStreamer output frame is not readable"))?;
+        remember_terminal_decoder_pts(&mut self.recently_terminal_pts, output_pts);
         Ok(Some(DecodedRtspFrame {
             bytes: Bytes::copy_from_slice(mapped.as_slice()),
             width,
@@ -1680,6 +1687,61 @@ impl GstreamerDecoder {
             ingested_at: pending.ingested_at,
         }))
     }
+}
+
+#[cfg(feature = "rtsp")]
+fn decoded_rgb_frame_bytes(width: u32, height: u32) -> Result<u64> {
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|value| value.checked_mul(3))
+        .ok_or_else(|| security_error("GStreamer output size overflowed"))
+}
+
+#[cfg(feature = "rtsp")]
+fn correlate_decoder_output(
+    pending: &mut BTreeMap<u64, PendingDecoderUnit>,
+    recently_terminal_pts: &VecDeque<u64>,
+    output_pts: u64,
+) -> Result<Option<PendingDecoderUnit>> {
+    if let Some(unit) = pending.remove(&output_pts) {
+        return Ok(Some(unit));
+    }
+    if recently_terminal_pts.contains(&output_pts) {
+        return Ok(None);
+    }
+    Err(security_error(
+        "GStreamer output timestamp was not requested",
+    ))
+}
+
+#[cfg(feature = "rtsp")]
+fn retire_oldest_pending_decoder_unit(
+    pending: &mut BTreeMap<u64, PendingDecoderUnit>,
+    recently_terminal_pts: &mut VecDeque<u64>,
+) -> Result<u64> {
+    // Do not retire all lower PTS values when a newer frame is decoded: H.264
+    // and H.265 decoders may surface legitimate frames out of PTS order. At
+    // the bounded admission edge, retire only one oldest requested unit. Its
+    // exact PTS becomes terminal so a late frame is dropped, never correlated
+    // with a newer input; an unissued PTS remains a hard failure below.
+    let retired_pts = pending
+        .iter()
+        .min_by_key(|entry| (entry.1.ingested_at, *entry.0))
+        .map(|(pts, _)| *pts)
+        .ok_or_else(|| backend_error("GStreamer pending-frame retirement found no pending unit"))?;
+    let _ = pending.remove(&retired_pts).ok_or_else(|| {
+        backend_error("GStreamer pending-frame retirement lost its selected unit")
+    })?;
+    remember_terminal_decoder_pts(recently_terminal_pts, retired_pts);
+    Ok(retired_pts)
+}
+
+#[cfg(feature = "rtsp")]
+fn remember_terminal_decoder_pts(recently_terminal_pts: &mut VecDeque<u64>, output_pts: u64) {
+    if recently_terminal_pts.len() >= MAX_DECODER_PENDING_UNITS {
+        let _ = recently_terminal_pts.pop_front();
+    }
+    recently_terminal_pts.push_back(output_pts);
 }
 
 #[cfg(feature = "rtsp")]
@@ -4183,6 +4245,123 @@ mod tests {
             .expect_err("elapsed deadline cannot enter decoder admission")
             .code(),
             ErrorCode::CaptureTimeout
+        );
+    }
+
+    #[cfg(feature = "rtsp")]
+    #[test]
+    fn decoder_timestamp_correlation_preserves_reordered_frames_and_rejects_unknown_pts() {
+        let issued_at = Instant::now();
+        let pending_unit = |rtp_timestamp, ingested_at| PendingDecoderUnit {
+            rtp_timestamp,
+            compressed_bytes: 100,
+            dimensions: (320, 240),
+            ingested_at,
+        };
+        let mut pending = BTreeMap::from([
+            (10_u64, pending_unit(10, issued_at)),
+            (
+                20_u64,
+                pending_unit(20, issued_at + Duration::from_millis(1)),
+            ),
+        ]);
+        let mut recently_terminal = VecDeque::new();
+
+        let later = correlate_decoder_output(&mut pending, &recently_terminal, 20)
+            .expect("later pending PTS")
+            .expect("later pending PTS is not terminal");
+        assert_eq!(later.rtp_timestamp, 20);
+        remember_terminal_decoder_pts(&mut recently_terminal, 20);
+        assert!(pending.contains_key(&10));
+
+        let earlier = correlate_decoder_output(&mut pending, &recently_terminal, 10)
+            .expect("reordered earlier PTS remains pending")
+            .expect("reordered earlier PTS is not terminal");
+        assert_eq!(earlier.rtp_timestamp, 10);
+        remember_terminal_decoder_pts(&mut recently_terminal, 10);
+        assert!(
+            correlate_decoder_output(&mut pending, &recently_terminal, 10)
+                .expect("known duplicate PTS")
+                .is_none()
+        );
+        assert_eq!(
+            correlate_decoder_output(&mut pending, &recently_terminal, 999)
+                .expect_err("unknown PTS remains a security failure")
+                .code(),
+            ErrorCode::BackendError
+        );
+
+        for output_pts in 100..=u64::try_from(100 + MAX_DECODER_PENDING_UNITS).unwrap() {
+            remember_terminal_decoder_pts(&mut recently_terminal, output_pts);
+        }
+        assert_eq!(recently_terminal.len(), MAX_DECODER_PENDING_UNITS);
+        assert!(!recently_terminal.contains(&10));
+        assert_eq!(recently_terminal.front(), Some(&101));
+    }
+
+    #[cfg(feature = "rtsp")]
+    #[test]
+    fn decoder_pending_retirement_recovers_after_skipped_output_and_stays_bounded() {
+        let issued_at = Instant::now();
+        let pending_unit = |rtp_timestamp, ingested_at| PendingDecoderUnit {
+            rtp_timestamp,
+            compressed_bytes: 100,
+            dimensions: (320, 240),
+            ingested_at,
+        };
+        let mut pending = BTreeMap::new();
+        let mut recently_terminal = VecDeque::new();
+        for index in 1..=MAX_DECODER_PENDING_UNITS {
+            let pts = u64::try_from(index).expect("bounded test PTS");
+            let rtp_timestamp = u32::try_from(index).expect("bounded RTP timestamp");
+            let offset =
+                u64::try_from(MAX_DECODER_PENDING_UNITS - index).expect("bounded ingest offset");
+            pending.insert(
+                pts,
+                pending_unit(rtp_timestamp, issued_at + Duration::from_millis(offset)),
+            );
+        }
+
+        // The oldest requested unit is PTS 16, even though it is not the
+        // lowest PTS. Retirement follows ingestion age and records that exact
+        // PTS as terminal; it never guesses a replacement correlation.
+        for index in (MAX_DECODER_PENDING_UNITS + 1)..=(MAX_DECODER_PENDING_UNITS + 4) {
+            let retired = retire_oldest_pending_decoder_unit(&mut pending, &mut recently_terminal)
+                .expect("full pending set retires one unit");
+            if index == MAX_DECODER_PENDING_UNITS + 1 {
+                assert_eq!(
+                    retired,
+                    u64::try_from(MAX_DECODER_PENDING_UNITS).expect("bounded retired PTS")
+                );
+            }
+            let pts = u64::try_from(index).expect("bounded recovered PTS");
+            let rtp_timestamp = u32::try_from(index).expect("bounded recovered RTP timestamp");
+            let offset = u64::try_from(index).expect("bounded recovered ingest offset");
+            pending.insert(
+                pts,
+                pending_unit(rtp_timestamp, issued_at + Duration::from_millis(offset)),
+            );
+            assert_eq!(pending.len(), MAX_DECODER_PENDING_UNITS);
+        }
+        assert_eq!(recently_terminal.len(), 4);
+        assert!(recently_terminal.contains(&16));
+
+        let recovered_pts =
+            u64::try_from(MAX_DECODER_PENDING_UNITS + 4).expect("bounded newest recovered PTS");
+        let recovered = correlate_decoder_output(&mut pending, &recently_terminal, recovered_pts)
+            .expect("newer exact PTS remains correlated after a skipped frame")
+            .expect("newer exact PTS is not terminal");
+        assert_eq!(recovered.rtp_timestamp, 20);
+        assert!(
+            correlate_decoder_output(&mut pending, &recently_terminal, 16)
+                .expect("retired exact PTS is a safe late drop")
+                .is_none()
+        );
+        assert_eq!(
+            correlate_decoder_output(&mut pending, &recently_terminal, 999)
+                .expect_err("unknown PTS is never accepted after retirement")
+                .code(),
+            ErrorCode::BackendError
         );
     }
 }
