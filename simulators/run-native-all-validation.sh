@@ -237,7 +237,7 @@ helper_output=$(run_genicam_fixture +1.87.0 llvm-cov run --locked --offline --no
     --bin camera-adapter-genicam-discover -- \
     --interface "$interface" --transport gige-vision --max-results 1)
 printf '%s\n' "$helper_output"
-if ! grep -Fq '"deviceId":"Aravis-Fake-GV01"' <<<"$helper_output"; then
+if [[ $helper_output != *'"deviceId":"Aravis-Fake-GV01"'* ]]; then
     printf 'instrumented GenICam helper did not discover Aravis-Fake-GV01\n' >&2
     exit 1
 fi
