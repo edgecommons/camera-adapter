@@ -29,13 +29,22 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "standalone",
+    feature = "onvif",
+    feature = "capacity-harness"
+))]
+use std::sync::atomic::AtomicU64;
+
 use crate::{
     COMPONENT_NAME, Result,
     actor::{CameraActor, CameraActorHandle},
     admission::{AdmissionController, FilesystemSpaceProbe},
     backend::{BackendRuntimeContext, ConnectRequest, DiscoveryCandidate},
     catalog::{Catalog, CatalogOptions},
-    config::AdapterConfig,
+    config::{AdapterConfig, GlobalConfig},
     jobs::{
         AcceptanceHook, AppTerminalEnvelopeEncoder, CaptureDescriptor, CaptureDispatcher,
         CaptureJobSpec, DispatchReservation, JobEngine, JobHooks,
@@ -983,6 +992,19 @@ impl CameraRuntime {
         self.config
             .read()
             .map(|config| config.clone())
+            .map_err(|_| {
+                crate::CameraError::Catalog("runtime configuration lock is unavailable".to_string())
+            })
+    }
+
+    /// Takes the small, shared portion of the active configuration for long-lived supervisor
+    /// work.  A supervisor already reads its camera-specific configuration from the registry;
+    /// cloning the complete camera roster here would retain one full copy per connection attempt
+    /// while the bounded connection gate is saturated.
+    fn global_config_snapshot(&self) -> Result<GlobalConfig> {
+        self.config
+            .read()
+            .map(|config| config.global.clone())
             .map_err(|_| {
                 crate::CameraError::Catalog("runtime configuration lock is unavailable".to_string())
             })
@@ -4145,7 +4167,7 @@ impl CameraRuntime {
             .snapshot(&instance)
             .map_or(0, |snapshot| snapshot.generation);
         loop {
-            let runtime_config = match self.config_snapshot() {
+            let global_config = match self.global_config_snapshot() {
                 Ok(config) => config,
                 Err(error) => {
                     tracing::error!(instance = %instance, error = %error, "camera supervisor lost runtime configuration");
@@ -4158,7 +4180,7 @@ impl CameraRuntime {
             };
             let factory = match self
                 .backend_context
-                .factory_for(&camera.backend, &runtime_config.global)
+                .factory_for(&camera.backend, &global_config)
             {
                 Ok(factory) => factory,
                 Err(error) => {
@@ -4200,7 +4222,7 @@ impl CameraRuntime {
             let request = ConnectRequest {
                 instance_id: camera.id.clone(),
                 backend: camera.backend.clone(),
-                timeout: Duration::from_millis(runtime_config.global.timeouts.connect_ms),
+                timeout: Duration::from_millis(global_config.timeouts.connect_ms),
                 cancellation: cancellation.child_token(),
             };
             let connected =
@@ -4218,8 +4240,8 @@ impl CameraRuntime {
                         camera.id.clone(),
                         session,
                         engine.clone(),
-                        runtime_config.global.limits.max_queued_captures_per_camera,
-                        runtime_config.global.limits.max_queued_controls_per_camera,
+                        global_config.limits.max_queued_captures_per_camera,
+                        global_config.limits.max_queued_controls_per_camera,
                     ) {
                         Ok(pair) => pair,
                         Err(error) => {
@@ -10123,7 +10145,9 @@ mod tests {
         #[serde(rename_all = "camelCase")]
         struct IdleSessionMemoryEvidence {
             baseline_rss_bytes: u64,
+            startup_peak_rss_bytes: u64,
             roster_online_rss_bytes: u64,
+            startup_peak_delta_bytes: u64,
             roster_online_delta_bytes: u64,
             full_frame_allocation_equivalent_bytes: u64,
             maximum_allowed_delta_bytes: u64,
@@ -10232,9 +10256,14 @@ mod tests {
             feature = "onvif",
             feature = "capacity-harness"
         ))]
-        async fn wait_for_capacity_roster(runtime: &CameraRuntime) {
+        async fn wait_for_capacity_roster(runtime: &CameraRuntime) -> u64 {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            let mut peak_rss_bytes = 0_u64;
             loop {
+                let rss_bytes = capacity_process_stats().rss_bytes.expect(
+                    "Linux capacity proof requires /proc/self/status VmRSS while supervisors start",
+                );
+                peak_rss_bytes = peak_rss_bytes.max(rss_bytes);
                 let snapshots = runtime
                     .registry
                     .snapshots(SHORT_CAPACITY_CONFIGURED_CAMERAS)
@@ -10247,17 +10276,23 @@ mod tests {
                     .iter()
                     .filter(|snapshot| snapshot.state == CameraConnectionState::Disabled)
                     .count();
+                let live_actor_count = runtime
+                    .actors
+                    .read()
+                    .expect("capacity actor registry lock must remain readable")
+                    .len();
                 if snapshots.len() == SHORT_CAPACITY_CONFIGURED_CAMERAS
                     && online == SHORT_CAPACITY_ENABLED_CAMERAS
                     && disabled
                         == SHORT_CAPACITY_CONFIGURED_CAMERAS - SHORT_CAPACITY_ENABLED_CAMERAS
+                    && live_actor_count == SHORT_CAPACITY_ENABLED_CAMERAS
                 {
-                    return;
+                    return peak_rss_bytes;
                 }
                 assert!(
                     tokio::time::Instant::now() < deadline,
-                    "short capacity roster did not reach 256 ONLINE and 768 DISABLED cameras; online={online}, disabled={disabled}, total={}",
-                    snapshots.len()
+                    "short capacity roster did not reach 256 ONLINE live actors and 768 DISABLED cameras; online={online}, liveActors={live_actor_count}, disabled={disabled}, total={}",
+                    snapshots.len(),
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -10492,6 +10527,23 @@ mod tests {
             let idle_session_baseline_rss_bytes = capacity_process_stats().rss_bytes.expect(
                 "Linux capacity proof requires /proc/self/status VmRSS before runtime startup",
             );
+            let startup_rss_peak = Arc::new(AtomicU64::new(idle_session_baseline_rss_bytes));
+            let startup_sampling_cancellation = CancellationToken::new();
+            let startup_sampler = {
+                let startup_rss_peak = Arc::clone(&startup_rss_peak);
+                let cancellation = startup_sampling_cancellation.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if let Some(rss_bytes) = capacity_process_stats().rss_bytes {
+                            startup_rss_peak.fetch_max(rss_bytes, Ordering::AcqRel);
+                        }
+                        tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                        }
+                    }
+                })
+            };
             let readiness = RuntimeReadiness::noop();
             let runtime = CameraRuntime::start(
                 configuration,
@@ -10513,7 +10565,11 @@ mod tests {
                 .install(runtime.clone())
                 .expect("capacity router must install exactly one complete runtime");
             let started = Instant::now();
-            wait_for_capacity_roster(&runtime).await;
+            let roster_poll_peak_rss_bytes = wait_for_capacity_roster(&runtime).await;
+            startup_sampling_cancellation.cancel();
+            startup_sampler
+                .await
+                .expect("capacity startup RSS sampler must not panic");
             let roster_online_sample = capacity_sample(&runtime, "roster-online", started);
             let roster_online_rss_bytes = roster_online_sample.process.rss_bytes.expect(
                 "Linux capacity proof requires /proc/self/status VmRSS after roster startup",
@@ -10523,15 +10579,23 @@ mod tests {
                 .expect("configured full-frame equivalent must fit in u64");
             let maximum_allowed_delta_bytes = full_frame_allocation_equivalent_bytes
                 / IDLE_SESSION_RSS_MAXIMUM_FULL_FRAME_FRACTION_DENOMINATOR;
+            let startup_peak_rss_bytes = startup_rss_peak
+                .load(Ordering::Acquire)
+                .max(roster_poll_peak_rss_bytes)
+                .max(roster_online_rss_bytes);
+            let startup_peak_delta_bytes =
+                startup_peak_rss_bytes.saturating_sub(idle_session_baseline_rss_bytes);
             let roster_online_delta_bytes =
                 roster_online_rss_bytes.saturating_sub(idle_session_baseline_rss_bytes);
             assert!(
-                roster_online_delta_bytes <= maximum_allowed_delta_bytes,
-                "256 idle SimBackend sessions increased RSS by {roster_online_delta_bytes} bytes; this must remain at most one eighth of their {full_frame_allocation_equivalent_bytes}-byte full-frame equivalent"
+                startup_peak_delta_bytes <= maximum_allowed_delta_bytes,
+                "256 idle SimBackend sessions increased startup RSS by {startup_peak_delta_bytes} bytes; this must remain at most one eighth of their {full_frame_allocation_equivalent_bytes}-byte full-frame equivalent"
             );
             let idle_session_memory = IdleSessionMemoryEvidence {
                 baseline_rss_bytes: idle_session_baseline_rss_bytes,
+                startup_peak_rss_bytes,
                 roster_online_rss_bytes,
+                startup_peak_delta_bytes,
                 roster_online_delta_bytes,
                 full_frame_allocation_equivalent_bytes,
                 maximum_allowed_delta_bytes,
@@ -10858,7 +10922,7 @@ mod tests {
             router
                 .install(runtime.clone())
                 .expect("capacity smoke router must install");
-            wait_for_capacity_roster(&runtime).await;
+            let _ = wait_for_capacity_roster(&runtime).await;
 
             let started = Instant::now();
             let deadline = started + Duration::from_secs(duration_seconds);

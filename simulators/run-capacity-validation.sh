@@ -163,14 +163,18 @@ require(frame.get("pixelFormat") == "Mono8" and frame.get("bytesPerFrame") == 7_
 memory = value.get("idleSessionMemory")
 require(isinstance(memory, dict), "idleSessionMemory")
 baseline = integer(memory.get("baselineRssBytes"), "idleSessionMemory.baselineRssBytes")
+peak = integer(memory.get("startupPeakRssBytes"), "idleSessionMemory.startupPeakRssBytes")
 roster = integer(memory.get("rosterOnlineRssBytes"), "idleSessionMemory.rosterOnlineRssBytes")
+peak_delta = integer(memory.get("startupPeakDeltaBytes"), "idleSessionMemory.startupPeakDeltaBytes")
 delta = integer(memory.get("rosterOnlineDeltaBytes"), "idleSessionMemory.rosterOnlineDeltaBytes")
 full_frame_equivalent = integer(memory.get("fullFrameAllocationEquivalentBytes"), "idleSessionMemory.fullFrameAllocationEquivalentBytes")
 maximum_delta = integer(memory.get("maximumAllowedDeltaBytes"), "idleSessionMemory.maximumAllowedDeltaBytes")
+require(peak >= roster, "idleSessionMemory peak must cover roster RSS")
+require(peak_delta == max(0, peak - baseline), "idleSessionMemory peak delta")
 require(delta == max(0, roster - baseline), "idleSessionMemory delta")
 require(full_frame_equivalent == frame["bytesPerFrame"] * 256, "idleSessionMemory full-frame equivalent")
 require(maximum_delta == full_frame_equivalent // 8, "idleSessionMemory maximum delta")
-require(delta <= maximum_delta, "idleSessionMemory delta bound")
+require(peak_delta <= maximum_delta, "idleSessionMemory peak delta bound")
 require(value.get("groupTerminalState") == "Succeeded", "groupTerminalState")
 require(value.get("groupSuccessfulMembers") == 32, "groupSuccessfulMembers")
 require(value.get("overflowCaptureTerminalState") == "Succeeded", "overflowCaptureTerminalState")
@@ -417,8 +421,10 @@ lines = [
     f"| Group terminal state / successful members | {display(short.get('groupTerminalState'))} / {display(short.get('groupSuccessfulMembers'))} |",
     f"| Overflow capture terminal state | {display(short.get('overflowCaptureTerminalState'))} |",
     f"| RSS before runtime | {display(idle_memory.get('baselineRssBytes'))} bytes |",
+    f"| Peak RSS during 256-session startup | {display(idle_memory.get('startupPeakRssBytes'))} bytes |",
     f"| RSS at 256-online roster | {display(idle_memory.get('rosterOnlineRssBytes'))} bytes |",
-    f"| Idle-session RSS delta | {display(idle_memory.get('rosterOnlineDeltaBytes'))} bytes |",
+    f"| Peak idle-session startup RSS delta | {display(idle_memory.get('startupPeakDeltaBytes'))} bytes |",
+    f"| Idle-session roster RSS delta | {display(idle_memory.get('rosterOnlineDeltaBytes'))} bytes |",
     f"| Allowed idle-session delta | {display(idle_memory.get('maximumAllowedDeltaBytes'))} bytes (one eighth of {display(idle_memory.get('fullFrameAllocationEquivalentBytes'))}) |",
     "",
     "### Router-boundary latency while acquisition was saturated",
