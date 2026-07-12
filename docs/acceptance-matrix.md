@@ -19,7 +19,7 @@ current branch; `Blocked` means the requirement remains a release gate and is no
 | TR-CORE-P1 | Validated | Four-language local MQTT matrix (16 deferred + 16 confirmed edges) and lab-5950x IPC matrix (16 + 16 verified edges). |
 | TR-MSG | Validated locally | Command/router/outbox correlation and broker-outage tests; deployment capture smoke is recorded below. |
 | TR-CMD | Validated locally | Closed request-schema and runtime command tests. |
-| TR-CAPACITY | In progress | `simulators/run-capacity-validation-container.sh` runs the ignored Linux short proof in a pinned Rust 1.85.1/Python image, with source mounted read-only, named Cargo volumes, dropped capabilities, no-new-privileges, tmpfs, and no workload network. It initializes only Cargo volumes through a restricted root setup container, then runs prefetch/workload as the invoking host uid:gid and confirms artifact-directory writability with a create/remove probe before Cargo; it never relaxes artifact permissions to world-writable. It exercises 1,024 configured entries, 256 enabled SimBackend sessions and live actors, and 32 concurrent 8MP captures with bounded resource/process and router-latency evidence. It records pre-runtime, startup-peak, and final-roster RSS, rejecting peak idle-session growth above one eighth of the 256-frame 8MP equivalent. A new/empty artifact directory receives a write-once run manifest and per-test SHA-256 attestations after schema/scope/value validation; Git-less archive runs require a full commit revision plus a real exact staged tarball, whose SHA-256 the wrapper computes itself. Its optional `--soak-duration 15m` follows that proof with a partial mixed-traffic simulator smoke (schedules, commands, PTZ/status, reconnects, and valid reloads), requires the terminal sample to return to all 256 online actors after the final reconnect, then produces a validated, manifest-chained human-readable `capacity-test-report.md` and report attestation. No lab artifact is recorded yet. The 24-hour soak execution is explicitly deferred to a later phase and is not a current gate; neither test may be represented as that soak. |
+| TR-CAPACITY | Validated for 15-minute simulator smoke | `simulators/run-capacity-validation-container.sh` runs the ignored Linux short proof in a pinned Rust 1.85.1/Python image, with source mounted read-only, named Cargo volumes, dropped capabilities, no-new-privileges, tmpfs, and no workload network. It initializes only Cargo volumes through a restricted root setup container, then runs prefetch/workload as the invoking host uid:gid and confirms artifact-directory writability with a create/remove probe before Cargo; it never relaxes artifact permissions to world-writable. It exercises 1,024 configured entries, 256 enabled SimBackend sessions and live actors, and 32 concurrent 8MP captures with bounded resource/process and router-latency evidence. It records pre-runtime, startup-peak, and final-roster RSS, rejecting peak idle-session growth above one eighth of the 256-frame 8MP equivalent. A new/empty artifact directory receives a write-once run manifest and per-test SHA-256 attestations after schema/scope/value validation; Git-less archive runs require a full commit revision plus a real exact staged tarball, whose SHA-256 the wrapper computes itself. Lab-5950x evidence recorded 2026-07-12 from `7dadd09c35e96abfa7fdfedc9c7a9d65cc11a421` and staged bundle `0c887aa1ae9c9766efaa443f3e94885b6534225a6bda5fea00c26d34a28f2063`: the short proof passed with a 4,931,584-byte startup delta against a 255,688,704-byte bound, and the 900-second smoke passed with 450 direct captures, 15 reconnects, 5 reloads, 180 scheduled jobs for each of eight cameras, and a terminal roster of 256 online actors. The 24-hour soak execution is explicitly deferred to a later phase and is not a current gate; neither test may be represented as that soak. |
 | TR-RECOVERY | Validated locally | Catalog/outbox crash-recovery and stable-envelope tests. |
 | TR-SEC | Validated locally | SSRF/DNS/XML/decompression/path/credential and no-overwrite tests; deployment threat review remains required. |
 | TR-OBS | Validated locally | Readiness, storage and outbox alarm tests. |
@@ -42,16 +42,17 @@ docker compose -f deploy/docker/compose.yaml up --build -d --wait
 CAMERA_ADAPTER_DOCKER_E2E=1 CAMERA_ADAPTER_DOCKER_E2E_HOST=127.0.0.1 CAMERA_ADAPTER_DOCKER_E2E_PORT=1884 cargo test --locked --no-default-features --features standalone --test docker_capture_submit
 simulators/run-rtsp-native-coverage.ps1 -CoverageOutput C:\tmp\camera-adapter-rtsp-coverage
 bash simulators/run-native-all-validation.sh --skip-build --coverage-output /home/marc/camera-adapter-native-all-validation-20260712T092046/coverage
+bash simulators/run-capacity-validation-container.sh --artifact-dir /home/marc/camera-adapter-capacity-validation-20260712T153000/artifacts --source-revision 7dadd09c35e96abfa7fdfedc9c7a9d65cc11a421 --source-bundle /home/marc/camera-adapter-capacity-validation-20260712T153000/camera-adapter-capacity-lab-20260712T153000.tar.gz --soak-duration 15m
 ```
 
 No physical camera is represented as passing. Physical-camera validation is waived because hardware is not
 available; the [compatibility register](reference/compatibility.md) records the resulting exclusion from
 hardware-compatibility claims.
 
-## Available capacity command
+## Repeatable capacity command
 
-The following is an unexecuted Linux/lab command, not recorded evidence. It writes a new
-`short-capacity-summary.json` artifact and refuses to overwrite an existing one:
+The following Linux/lab command writes a new `short-capacity-summary.json` artifact and refuses to
+overwrite existing evidence:
 
 ```bash
 bash simulators/run-capacity-validation-container.sh \
