@@ -32,6 +32,8 @@ The test container mounts the whole workspace read-only, writes only to the
 explicit evidence directory and named Cargo volumes, drops all capabilities,
 uses no-new-privileges, a read-only root filesystem, tmpfs /tmp, and no network.
 The wrapper computes the manifest bundle SHA-256 directly from `--source-bundle`.
+Cargo volumes and both workload containers use the invoking host uid:gid; a
+temporary root setup container initializes only the named Cargo volumes.
 EOF
 }
 
@@ -63,11 +65,15 @@ done
 [[ -z $soak_duration || $soak_duration == 15m ]] || fail '--soak-duration currently accepts only 15m; the 24-hour soak is deferred'
 command -v docker >/dev/null || fail 'docker is required'
 command -v sha256sum >/dev/null || fail 'sha256sum is required to bind the staged source tarball'
+command -v id >/dev/null || fail 'id is required to select the workload identity'
 
 source_revision=$(tr '[:upper:]' '[:lower:]' <<<"$source_revision")
 source_bundle=$(cd -- "$(dirname -- "$source_bundle")" && pwd)/$(basename -- "$source_bundle")
 source_bundle_sha256=$(sha256sum -- "$source_bundle" | awk '{print $1}')
 [[ $source_bundle_sha256 =~ ^[[:xdigit:]]{64}$ ]] || fail 'could not compute a SHA-256 for --source-bundle'
+host_uid=$(id -u)
+host_gid=$(id -g)
+[[ $host_uid =~ ^[0-9]+$ && $host_gid =~ ^[0-9]+$ ]] || fail 'host uid:gid must be numeric'
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 adapter_root=$(cd -- "$script_dir/.." && pwd)
 workspace_root=$(cd -- "$adapter_root/.." && pwd)
@@ -87,6 +93,11 @@ docker build --pull=false \
 
 for volume in "$target_volume" "$registry_volume" "$git_volume"; do
     docker volume create "$volume" >/dev/null
+    docker run --rm --read-only \
+        --user 0:0 --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges:true \
+        -v "$volume:/volume" \
+        --entrypoint /bin/chown "$image" \
+        -R --no-dereference -- "$host_uid:$host_gid" /volume
 done
 
 source_mount="$workspace_root:/edgecommons:ro"
@@ -99,6 +110,7 @@ common_run=(
     --tmpfs /tmp:rw,nosuid,nodev,noexec,size=2g,mode=1777
     --cap-drop ALL --security-opt no-new-privileges:true
     --pids-limit 2048
+    --user "$host_uid:$host_gid"
     -v "$source_mount"
     -v "$target_mount"
     -v "$registry_mount"
@@ -106,9 +118,29 @@ common_run=(
     -w /edgecommons/camera-adapter
     -e CARGO_TARGET_DIR=/capacity-target
     -e TMPDIR=/tmp
+    -e HOME=/tmp
     -e CAMERA_ADAPTER_SOURCE_REVISION="$source_revision"
     -e CAMERA_ADAPTER_SOURCE_BUNDLE_SHA256="$source_bundle_sha256"
 )
+
+test_run=("${common_run[@]}" --network none -v "$artifact_mount")
+probe_name=".camera-adapter-capacity-artifact-probe-${host_uid}-${host_gid}-$$"
+probe_path="$artifact_root/$probe_name"
+cleanup_probe() {
+    rm -f -- "$probe_path" 2>/dev/null || true
+}
+trap cleanup_probe EXIT
+"${test_run[@]}" --entrypoint /bin/sh "$image" -c '
+    set -eu
+    probe=$1
+    [ ! -e "$probe" ]
+    : > "$probe"
+    [ -f "$probe" ]
+    rm -- "$probe"
+    [ ! -e "$probe" ]
+' sh "/capacity-artifacts/$probe_name"
+[[ ! -e $probe_path ]] || fail 'artifact writable-identity preflight left a probe behind'
+trap - EXIT
 
 # Populate only named Cargo cache volumes before the isolated workload starts.
 # The source mount remains read-only, and `--locked` retains Cargo.lock as the
@@ -116,7 +148,6 @@ common_run=(
 prefetch_run=("${common_run[@]}" --network bridge)
 "${prefetch_run[@]}" --entrypoint cargo "$image" fetch --locked
 
-test_run=("${common_run[@]}" --network none -v "$artifact_mount")
 inner_args=(
     /edgecommons/camera-adapter/simulators/run-capacity-validation.sh
     --artifact-dir /capacity-artifacts

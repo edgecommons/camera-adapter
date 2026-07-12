@@ -48,7 +48,11 @@ keeps Cargo target/registry/git state in named volumes, and runs the workload wi
 filesystem, `/tmp` tmpfs, all Linux capabilities dropped, no-new-privileges, and `--network none`.
 The in-process MQTT fixture uses loopback and continues to work in that namespace. A preceding bridge-only
 `cargo fetch --locked` may populate named Cargo cache volumes; it does not run the workload or write
-evidence. This removes any dependency on host Cargo or Python.
+evidence. This removes any dependency on host Cargo or Python. To work with rootless/user-namespace Docker,
+the wrapper determines the invoking host uid:gid, uses a temporary root setup container with only `CHOWN`
+to initialize the three named Cargo volumes, and then runs prefetch and workload as that uid:gid with
+`HOME=/tmp`. Before Cargo runs, the workload identity creates and removes a private probe in the new/empty
+host-owned artifact directory. The wrapper never makes evidence directories or files world-writable.
 
 The inner `run-capacity-validation.sh` enables the non-default `capacity-harness` feature, which isolates
 this live-lab-only workload from ordinary `cargo llvm-cov --lib` coverage. No production code is excluded:
