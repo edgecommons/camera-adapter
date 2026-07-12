@@ -8,6 +8,10 @@ services:
     image: docker.io/emqx/emqx@sha256:9e4b8176519eecbada12174a38dd605964259fd3fdfd2f24e6557d90c67de0fa
     environment:
       EMQX_ALLOW_ANONYMOUS: "true"
+    # This broker exists only for the local acceptance harness.  Keep the anonymous listener
+    # reachable from the host test process without exposing it beyond loopback.
+    ports:
+      - "127.0.0.1:1884:1883"
     read_only: true
     mem_limit: 256m
     pids_limit: 192

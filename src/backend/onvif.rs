@@ -57,6 +57,7 @@ const MAX_XML_ELEMENTS: usize = 32_768;
 const MAX_XML_ATTRIBUTES: usize = 65_536;
 const MAX_DISCOVERY_XADDRS: usize = 64;
 const MAX_DISCOVERY_XADDR_BYTES: usize = 8 * 1024;
+const DEFAULT_PTZ_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MEDIA1_NAMESPACE: &str = "http://www.onvif.org/ver10/media/wsdl";
 const MEDIA2_NAMESPACE: &str = "http://www.onvif.org/ver20/media/wsdl";
 const PTZ_NAMESPACE: &str = "http://www.onvif.org/ver20/ptz/wsdl";
@@ -3275,7 +3276,12 @@ impl OnvifSession {
         }
     }
 
-    async fn ptz_call(&mut self, request: &PtzRequest) -> Result<PtzResult> {
+    async fn ptz_call(
+        &mut self,
+        request: &PtzRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<PtzResult> {
         self.ensure_open()?;
         let endpoint = self.ptz_endpoint.clone().ok_or_else(|| {
             CameraError::rejected(
@@ -3308,8 +3314,6 @@ impl OnvifSession {
         let (body, mutating, response_kind) =
             build_ptz_request(request, &self.media_profile_token, ranges)?;
         let action_name = ptz_action_name(request);
-        let cancellation = CancellationToken::new();
-        let deadline = Instant::now() + Duration::from_secs(10);
         let response = self
             .client
             .soap_call(
@@ -3318,7 +3322,7 @@ impl OnvifSession {
                 &body,
                 mutating,
                 deadline,
-                &cancellation,
+                cancellation,
             )
             .await
             .map_err(map_ptz_error)?;
@@ -3411,7 +3415,14 @@ impl CameraSession for OnvifSession {
     async fn status(&mut self) -> Result<CameraStatus> {
         self.ensure_open()?;
         let ptz = if self.ptz_endpoint.is_some() {
-            match self.ptz_call(&PtzRequest::Status).await? {
+            match self
+                .ptz_call(
+                    &PtzRequest::Status,
+                    Instant::now() + DEFAULT_PTZ_REQUEST_TIMEOUT,
+                    &CancellationToken::new(),
+                )
+                .await?
+            {
                 PtzResult::Status(status) => Some(status),
                 _ => {
                     return Err(backend_error(
@@ -3548,7 +3559,21 @@ impl CameraSession for OnvifSession {
     }
 
     async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
-        self.ptz_call(&request).await
+        self.ptz_call(
+            &request,
+            Instant::now() + DEFAULT_PTZ_REQUEST_TIMEOUT,
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
+    async fn ptz_bounded(
+        &mut self,
+        request: PtzRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<PtzResult> {
+        self.ptz_call(&request, deadline, cancellation).await
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -4175,6 +4200,8 @@ mod tests {
 
     use chrono::TimeZone;
     use image::{DynamicImage, Rgb, RgbImage};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     use super::*;
     use crate::config::{CaptureProfile, RtspSessionPolicy, TlsConfig};
@@ -4251,6 +4278,7 @@ mod tests {
     struct MockTransport {
         responses: Mutex<VecDeque<OnvifHttpResponse>>,
         observations: Mutex<Vec<HttpObservation>>,
+        next_request_blocked: Mutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
     impl MockTransport {
@@ -4263,6 +4291,13 @@ mod tests {
 
         fn observations(&self) -> Vec<HttpObservation> {
             self.observations.lock().expect("request lock").clone()
+        }
+
+        fn block_next_request(&self, started: Arc<tokio::sync::Notify>) {
+            *self
+                .next_request_blocked
+                .lock()
+                .expect("blocked request lock") = Some(started);
         }
     }
 
@@ -4282,6 +4317,15 @@ mod tests {
                     authorization,
                     body: String::from_utf8_lossy(&request.body).into_owned(),
                 });
+            let blocked = self
+                .next_request_blocked
+                .lock()
+                .expect("blocked request lock")
+                .take();
+            if let Some(started) = blocked {
+                started.notify_one();
+                std::future::pending().await
+            }
             self.responses
                 .lock()
                 .expect("response lock")
@@ -4394,6 +4438,62 @@ mod tests {
         output.into_inner()
     }
 
+    async fn serve_loopback_http(response: Vec<u8>) -> (u16, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback HTTP fixture");
+        let port = listener
+            .local_addr()
+            .expect("inspect loopback HTTP fixture port")
+            .port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept HTTP client");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.expect("read HTTP request");
+                assert!(read > 0, "HTTP client closed before request headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(&response)
+                .await
+                .expect("write HTTP response");
+            request
+        });
+        (port, server)
+    }
+
+    fn loopback_http_request(
+        port: u16,
+        method: OnvifHttpMethod,
+        maximum_body_bytes: u64,
+    ) -> OnvifHttpRequest {
+        OnvifHttpRequest {
+            target: PinnedUri {
+                url: Url::parse(&format!("http://127.0.0.1:{port}/onvif?view=main"))
+                    .expect("loopback URL"),
+                host: "127.0.0.1".to_owned(),
+                port,
+                address: "127.0.0.1".parse().expect("loopback IP"),
+            },
+            method,
+            headers: BTreeMap::from([("x-adapter-test".to_owned(), "onvif".to_owned())]),
+            authorization: Some(SecretBytes::new("Bearer adapter-test")),
+            body: b"<soap/>".to_vec(),
+            max_header_bytes: 4_096,
+            max_body_bytes: maximum_body_bytes,
+            max_decompression_ratio: 100,
+            deadline: Instant::now() + Duration::from_secs(2),
+            cancellation: CancellationToken::new(),
+            tls: RequestTlsPolicy {
+                verify_hostname: true,
+                allow_invalid_certificates: false,
+                ca_pem: None,
+            },
+        }
+    }
+
     async fn test_client(
         resolver: Arc<dyn OnvifResolver>,
         transport: Arc<dyn OnvifHttpTransport>,
@@ -4453,6 +4553,377 @@ mod tests {
         let rendered = format!("{pinned:?}");
         assert!(!rendered.contains("private"));
         assert!(!rendered.contains("top-secret"));
+    }
+
+    #[tokio::test]
+    async fn production_http_transport_uses_pinned_loopback_and_enforces_response_bounds() {
+        let transport = ReqwestOnvifTransport;
+        let (port, server) = serve_loopback_http(
+            b"HTTP/1.1 200 OK\r\nX-Result: one\r\nX-Result: two\r\nContent-Length: 5\r\n\r\nhello"
+                .to_vec(),
+        )
+        .await;
+        let response = transport
+            .send(loopback_http_request(port, OnvifHttpMethod::Post, 32))
+            .await
+            .expect("pinned loopback request must complete");
+        let request =
+            String::from_utf8(server.await.expect("HTTP server task")).expect("HTTP text");
+        assert!(request.starts_with("POST /onvif?view=main HTTP/1.1\r\n"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer adapter-test")
+        );
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"hello");
+        assert!(
+            response
+                .header("x-result")
+                .is_some_and(|value| value.contains("one") && value.contains("two"))
+        );
+
+        let (port, server) = serve_loopback_http(
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await;
+        assert!(
+            transport
+                .send(loopback_http_request(port, OnvifHttpMethod::Get, 32))
+                .await
+                .is_err()
+        );
+        let _ = server.await.expect("compressed-response server task");
+
+        let (port, server) =
+            serve_loopback_http(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec())
+                .await;
+        assert!(
+            transport
+                .send(loopback_http_request(port, OnvifHttpMethod::Get, 4))
+                .await
+                .is_err()
+        );
+        let _ = server.await.expect("oversized-response server task");
+
+        let mut invalid = loopback_http_request(1, OnvifHttpMethod::Get, 32);
+        invalid
+            .headers
+            .insert("host".to_owned(), "forbidden".to_owned());
+        assert!(transport.send(invalid).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn public_discovery_normalizes_duplicate_identity_before_exposing_a_candidate() {
+        let factory = OnvifBackendFactory::new(OnvifBackendDependencies {
+            resolver: Arc::new(SequenceResolver::new(&[])),
+            discovery: Arc::new(FixedDiscovery(vec![
+                DiscoveryProbeMatch {
+                    endpoint_reference: "urn:uuid:camera-1".to_owned(),
+                    xaddrs: vec!["http://camera.test/onvif/device_service".to_owned()],
+                    vendor: Some("Edge Commons".to_owned()),
+                    model: Some("Simulator".to_owned()),
+                },
+                DiscoveryProbeMatch {
+                    endpoint_reference: "urn:uuid:camera-1".to_owned(),
+                    xaddrs: vec!["http://camera.test/onvif/device_service".to_owned()],
+                    vendor: Some("Edge Commons".to_owned()),
+                    model: Some("Simulator".to_owned()),
+                },
+            ])),
+            transport: Arc::new(MockTransport::default()),
+            credentials: None,
+            clock: Arc::new(FixedClock),
+            nonce_source: Arc::new(FixedNonce),
+            security: SecurityConfig::default(),
+        });
+        let candidates = factory
+            .discover(DiscoveryRequest {
+                eligible_interfaces: vec!["eth0".to_owned()],
+                timeout: Duration::from_secs(1),
+                max_results: 2,
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("equivalent discovery observations must coalesce");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].selector["endpointReference"],
+            "urn:uuid:camera-1"
+        );
+        assert_eq!(candidates[0].vendor.as_deref(), Some("Edge Commons"));
+        assert_eq!(candidates[0].capabilities["xaddrCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_credentials_and_system_primitives_have_real_deadline_paths() {
+        let reference = SecretRef {
+            secret: "camera/login".to_owned(),
+            field: None,
+        };
+        let provider = FixedCredentials;
+        let credentials = resolve_login_bounded(
+            &provider,
+            &reference,
+            Instant::now() + Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("bounded login resolution");
+        assert_eq!(credentials.username().expect("username"), "operator");
+        assert!(
+            resolve_bytes_bounded(
+                &provider,
+                &reference,
+                Instant::now() + Duration::from_secs(1),
+                &CancellationToken::new(),
+            )
+            .await
+            .is_err()
+        );
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            resolve_login_bounded(
+                &provider,
+                &reference,
+                Instant::now() + Duration::from_secs(1),
+                &cancelled,
+            )
+            .await
+            .expect_err("cancelled credential lookup")
+            .code(),
+            ErrorCode::CaptureCancelled
+        );
+        assert_eq!(
+            resolve_login_bounded(
+                &provider,
+                &reference,
+                Instant::now(),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("expired credential lookup")
+            .code(),
+            ErrorCode::CaptureTimeout
+        );
+
+        let resolved = SystemResolver
+            .resolve("127.0.0.1", 80)
+            .await
+            .expect("numeric loopback lookup");
+        assert!(resolved.iter().any(IpAddr::is_loopback));
+        assert_eq!(SystemNonceSource.nonce(24).expect("nonce").len(), 24);
+        assert!(SystemOnvifClock.now() <= Utc::now());
+    }
+
+    #[test]
+    fn snapshot_frame_validation_covers_fallback_fatal_and_ratio_boundaries() {
+        let observed_at = FixedClock.now();
+        let decode = |headers: BTreeMap<String, String>, body: Vec<u8>, limit, ratio| {
+            snapshot_to_frame(
+                OnvifHttpResponse {
+                    status: 200,
+                    headers,
+                    body,
+                },
+                limit,
+                ratio,
+                observed_at,
+                "camera.test",
+            )
+        };
+        assert!(matches!(
+            decode(BTreeMap::new(), Vec::new(), 1_024, 100),
+            Err(SnapshotAttemptFailure::Fallback {
+                reason: SnapshotFallbackReason::CorruptImage,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode(
+                BTreeMap::from([("content-type".to_owned(), "text/plain".to_owned())]),
+                b"not-an-image".to_vec(),
+                1_024,
+                100,
+            ),
+            Err(SnapshotAttemptFailure::Fallback {
+                reason: SnapshotFallbackReason::UnsupportedContentType,
+                ..
+            })
+        ));
+        assert!(matches!(
+            decode(
+                BTreeMap::from([("content-type".to_owned(), "image/jpeg".to_owned())]),
+                png(8, 8),
+                1_024_000,
+                100,
+            ),
+            Err(SnapshotAttemptFailure::Fatal(_))
+        ));
+        let mut truncated_png = png(8, 8);
+        truncated_png.truncate(24);
+        assert!(matches!(
+            decode(
+                BTreeMap::from([("content-type".to_owned(), "image/png".to_owned())]),
+                truncated_png,
+                1_024,
+                100,
+            ),
+            Err(SnapshotAttemptFailure::Fallback {
+                reason: SnapshotFallbackReason::CorruptImage,
+                ..
+            })
+        ));
+
+        let image = RgbImage::from_pixel(32, 32, Rgb([1, 2, 3]));
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .expect("encode compact PNG");
+        assert!(matches!(
+            decode(
+                BTreeMap::from([("content-type".to_owned(), "image/png".to_owned())]),
+                encoded.into_inner(),
+                1_024_000,
+                1,
+            ),
+            Err(SnapshotAttemptFailure::Fatal(error)) if error.code() == ErrorCode::ResourceLimit
+        ));
+    }
+
+    #[tokio::test]
+    async fn soap_response_terminal_statuses_reject_unsafe_or_invalid_responses() {
+        let config = test_config(Some("http://camera.test/onvif/device_service"));
+        let (mut client, endpoint) = test_client(
+            Arc::new(SequenceResolver::new(&[("camera.test", 80, &["10.0.0.2"])])),
+            Arc::new(MockTransport::default()),
+            &config,
+            None,
+            SecurityConfig::default(),
+        )
+        .await;
+        for response in [
+            OnvifHttpResponse {
+                status: 302,
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+            },
+            OnvifHttpResponse {
+                status: 401,
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+            },
+            OnvifHttpResponse {
+                status: 500,
+                headers: BTreeMap::new(),
+                body: b"not XML".to_vec(),
+            },
+        ] {
+            assert!(client.finish_soap_response(response).is_err());
+        }
+        assert_eq!(
+            client
+                .finish_soap_response(soap_ok("<GetServicesResponse/>"))
+                .expect("valid SOAP response"),
+            soap_envelope("<GetServicesResponse/>", None)
+        );
+        assert_eq!(
+            client
+                .credentials()
+                .expect_err("missing credentials are rejected")
+                .code(),
+            ErrorCode::BackendError
+        );
+        assert!(!client.basic_is_allowed(&endpoint));
+        assert!(
+            client
+                .authorization_for_session(OnvifHttpMethod::Post, &endpoint)
+                .expect("no established authentication")
+                .is_none()
+        );
+        assert!(
+            client
+                .wsse_for_session(&endpoint)
+                .expect("no established WS-Security authentication")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_session_rejects_work_after_safe_no_ptz_status() {
+        let config = test_config(Some("http://camera.test/onvif/device_service"));
+        let (client, endpoint) = test_client(
+            Arc::new(SequenceResolver::new(&[("camera.test", 80, &["10.0.0.2"])])),
+            Arc::new(MockTransport::default()),
+            &config,
+            None,
+            SecurityConfig::default(),
+        )
+        .await;
+        let mut session = OnvifSession {
+            instance_id: "camera-a".to_owned(),
+            client,
+            media_endpoint: endpoint,
+            media_version: MediaVersion::Media1,
+            media_profile_token: "main".to_owned(),
+            snapshot_endpoint: None,
+            max_snapshot_bytes: 1_024,
+            ptz_endpoint: None,
+            ptz_ranges: None,
+            ptz_home: false,
+            capabilities: CameraCapabilities {
+                capture_modes: vec![CaptureMode::SnapshotUri],
+                pixel_formats: vec![PixelFormat::Jpeg],
+                software_trigger: false,
+                snapshot_uri: false,
+                rtsp: false,
+                ptz: false,
+                ptz_status: false,
+                presets: false,
+                preset_mutation: false,
+                vendor: None,
+                model: None,
+                firmware: None,
+                serial: None,
+                warnings: Vec::new(),
+            },
+            closed: false,
+        };
+        assert!(
+            session
+                .status()
+                .await
+                .expect("status without PTZ")
+                .ptz
+                .is_none()
+        );
+        let profile: CaptureProfile = serde_json::from_value(json!({
+            "captureMode": "software-trigger",
+            "output": { "encoding": "jpeg" }
+        }))
+        .expect("capture profile");
+        assert_eq!(
+            session
+                .capture(CaptureRequest {
+                    capture_id: "closed-session".to_owned(),
+                    profile,
+                    maximum_frame_bytes: 1_024,
+                    timeout: Duration::from_secs(1),
+                    cancellation: CancellationToken::new(),
+                })
+                .await
+                .expect_err("unsupported capture mode")
+                .code(),
+            ErrorCode::UnsupportedCapability
+        );
+        session.close().await.expect("first close");
+        session.close().await.expect("idempotent close");
+        assert_eq!(
+            session.status().await.expect_err("closed status").code(),
+            ErrorCode::CameraUnavailable
+        );
     }
 
     #[tokio::test]
@@ -4758,6 +5229,135 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.starts_with("Basic "))
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_wsse_and_read_only_digest_retry_are_established_before_use() {
+        let config = test_config(Some("http://camera.test/onvif/device_service"));
+        let credentials =
+            Arc::new(OnvifCredentials::new("operator", "camera-secret").expect("test credentials"));
+
+        let wsse_transport = Arc::new(MockTransport::default());
+        wsse_transport.push(soap_ok("<GetServicesResponse/>"));
+        let mut wsse_config = config.clone();
+        wsse_config.authentication_mode = AuthenticationMode::WsseDigest;
+        let (mut wsse, endpoint) = test_client(
+            Arc::new(SequenceResolver::new(&[("camera.test", 80, &["10.0.0.2"])])),
+            wsse_transport.clone(),
+            &wsse_config,
+            Some(Arc::clone(&credentials)),
+            SecurityConfig::default(),
+        )
+        .await;
+        wsse.establish_authentication(
+            endpoint,
+            "urn:test/GetServices",
+            "<GetServices/>",
+            Instant::now() + Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("WS-Security establishment");
+        assert!(
+            wsse_transport.observations()[0]
+                .body
+                .contains("UsernameToken")
+        );
+
+        let digest_transport = Arc::new(MockTransport::default());
+        digest_transport.push(unauthorized(
+            r#"Digest realm="camera", nonce="n1", algorithm=MD5, qop="auth""#,
+        ));
+        digest_transport.push(soap_ok("<GetStatusResponse/>"));
+        let (mut digest, endpoint) = test_client(
+            Arc::new(SequenceResolver::new(&[("camera.test", 80, &["10.0.0.2"])])),
+            digest_transport.clone(),
+            &config,
+            Some(credentials),
+            SecurityConfig::default(),
+        )
+        .await;
+        digest
+            .soap_call(
+                endpoint,
+                "urn:test/GetStatus",
+                "<GetStatus/>",
+                false,
+                Instant::now() + Duration::from_secs(2),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("read-only Digest retry");
+        let observations = digest_transport.observations();
+        assert_eq!(observations.len(), 2);
+        assert!(observations[0].authorization.is_none());
+        assert!(
+            observations[1]
+                .authorization
+                .as_deref()
+                .is_some_and(|value| value.starts_with("Digest "))
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_endpoint_fault_and_redirect_paths_stay_in_the_pinned_origin() {
+        let config = test_config(Some("http://camera.test/onvif/device_service"));
+        let fault_transport = Arc::new(MockTransport::default());
+        fault_transport.push(soap_ok(
+            "<s:Fault xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\"><s:Code><s:Value>ter:ActionNotSupported</s:Value></s:Code></s:Fault>",
+        ));
+        let (mut client, endpoint) = test_client(
+            Arc::new(SequenceResolver::new(&[("camera.test", 80, &["10.0.0.2"])])),
+            fault_transport,
+            &config,
+            None,
+            SecurityConfig::default(),
+        )
+        .await;
+        assert!(matches!(
+            client
+                .resolve_snapshot_endpoint(
+                    endpoint,
+                    "urn:test/GetSnapshotUri",
+                    "<GetSnapshotUri/>",
+                    Instant::now() + Duration::from_secs(2),
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect("snapshot SOAP fault must become a fallback reason"),
+            SnapshotEndpointAvailability::Unavailable(SnapshotFallbackReason::ActionNotSupported)
+        ));
+
+        let redirect_transport = Arc::new(MockTransport::default());
+        redirect_transport.push(OnvifHttpResponse {
+            status: 302,
+            headers: BTreeMap::from([("location".to_owned(), "/snapshot/final.png".to_owned())]),
+            body: Vec::new(),
+        });
+        redirect_transport.push(OnvifHttpResponse {
+            status: 200,
+            headers: BTreeMap::from([("content-type".to_owned(), "image/png".to_owned())]),
+            body: png(8, 8),
+        });
+        let (redirect_client, endpoint) = test_client(
+            Arc::new(SequenceResolver::new(&[("camera.test", 80, &["10.0.0.2"])])),
+            redirect_transport,
+            &config,
+            None,
+            SecurityConfig::default(),
+        )
+        .await;
+        let (_, final_target) = redirect_client
+            .fetch_snapshot(
+                endpoint,
+                1_048_576,
+                Instant::now() + Duration::from_secs(2),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("same-origin snapshot redirect");
+        assert_eq!(final_target.host(), "camera.test");
+        assert_eq!(final_target.url().path(), "/snapshot/final.png");
     }
 
     #[tokio::test]
@@ -5474,7 +6074,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn factory_connects_media2_snapshot_and_ptz_then_captures() {
+    async fn factory_connects_media2_snapshot_and_ptz_then_captures_with_bounded_cancellation() {
         let resolver: Arc<dyn OnvifResolver> =
             Arc::new(SequenceResolver::new(&[("camera.test", 80, &["10.0.0.2"])]));
         let transport = Arc::new(MockTransport::default());
@@ -5543,7 +6143,113 @@ mod tests {
             .expect("capture snapshot");
         assert_eq!(frame.pixel_format, PixelFormat::Rgb8);
         assert_eq!((frame.width, frame.height), (16, 8));
-        assert_eq!(transport.observations().len(), 8);
+
+        transport.push(soap_ok(&format!(
+            "<tptz:GetStatusResponse xmlns:tptz=\"{PTZ_NAMESPACE}\" xmlns:tt=\"http://www.onvif.org/ver10/schema\"><tptz:PTZStatus><tt:Position><tt:PanTilt x=\"0.25\" y=\"-0.5\"/><tt:Zoom x=\"0.75\"/></tt:Position><tt:MoveStatus><tt:PanTilt>MOVING</tt:PanTilt><tt:Zoom>IDLE</tt:Zoom></tt:MoveStatus></tptz:PTZStatus></tptz:GetStatusResponse>"
+        )));
+        let status = session.status().await.expect("read ONVIF PTZ status");
+        assert!(status.ptz.is_some_and(|ptz| ptz.moving == Some(true)));
+
+        transport.push(soap_ok(&format!(
+            "<tptz:GetPresetsResponse xmlns:tptz=\"{PTZ_NAMESPACE}\" xmlns:tt=\"http://www.onvif.org/ver10/schema\"><tptz:Preset token=\"preset-1\"><tt:Name>Loading bay</tt:Name></tptz:Preset></tptz:GetPresetsResponse>"
+        )));
+        assert!(matches!(
+            session
+                .ptz(PtzRequest::ListPresets)
+                .await
+                .expect("list ONVIF presets"),
+            PtzResult::Presets(ref presets) if presets.len() == 1 && presets[0].token == "preset-1"
+        ));
+
+        transport.push(soap_ok(&format!(
+            "<tptz:SetPresetResponse xmlns:tptz=\"{PTZ_NAMESPACE}\"><tptz:PresetToken>preset-2</tptz:PresetToken></tptz:SetPresetResponse>"
+        )));
+        assert!(matches!(
+            session
+                .ptz(PtzRequest::SetPreset("Dock".to_owned()))
+                .await
+                .expect("set ONVIF preset"),
+            PtzResult::PresetToken(ref token) if token == "preset-2"
+        ));
+
+        transport.push(soap_ok(&format!(
+            "<tptz:RemovePresetResponse xmlns:tptz=\"{PTZ_NAMESPACE}\"/>"
+        )));
+        assert!(matches!(
+            session
+                .ptz(PtzRequest::RemovePreset("preset-2".to_owned()))
+                .await
+                .expect("remove ONVIF preset"),
+            PtzResult::Removed
+        ));
+        for request in [
+            PtzRequest::Continuous {
+                velocity: PtzVector {
+                    pan: 0.25,
+                    tilt: -0.25,
+                    zoom: 0.5,
+                },
+                timeout: Duration::from_millis(250),
+            },
+            PtzRequest::Absolute {
+                position: PtzVector {
+                    pan: 0.2,
+                    tilt: -0.2,
+                    zoom: 0.6,
+                },
+                speed: Some(PtzVector {
+                    pan: 0.4,
+                    tilt: 0.4,
+                    zoom: 0.4,
+                }),
+            },
+            PtzRequest::Relative {
+                translation: PtzVector {
+                    pan: 0.1,
+                    tilt: 0.1,
+                    zoom: -0.1,
+                },
+                speed: None,
+            },
+            PtzRequest::Stop {
+                pan: true,
+                tilt: false,
+                zoom: true,
+            },
+            PtzRequest::Home,
+            PtzRequest::GotoPreset("preset-1".to_owned()),
+        ] {
+            transport.push(soap_ok(&format!(
+                "<tptz:Response xmlns:tptz=\"{PTZ_NAMESPACE}\"/>"
+            )));
+            assert!(matches!(
+                session.ptz(request).await.expect("issue ONVIF PTZ command"),
+                PtzResult::Commanded
+            ));
+        }
+        let transport_started = Arc::new(tokio::sync::Notify::new());
+        transport.block_next_request(Arc::clone(&transport_started));
+        let cancellation = CancellationToken::new();
+        let ptz_cancellation = cancellation.clone();
+        let ptz = tokio::spawn(async move {
+            session
+                .ptz_bounded(
+                    PtzRequest::Status,
+                    Instant::now() + Duration::from_secs(1),
+                    &ptz_cancellation,
+                )
+                .await
+        });
+        transport_started.notified().await;
+        cancellation.cancel();
+        assert_eq!(
+            ptz.await
+                .expect("bounded PTZ task must not panic")
+                .expect_err("cancelled ONVIF PTZ must not wait for a transport response")
+                .code(),
+            ErrorCode::CaptureCancelled
+        );
+        assert_eq!(transport.observations().len(), 19);
     }
 
     #[test]

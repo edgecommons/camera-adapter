@@ -9,6 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use edgecommons::credentials::CredentialService;
@@ -130,6 +131,46 @@ pub trait CameraSession: Send + 'static {
 
     /// Executes or observes a capability-gated PTZ operation.
     async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult>;
+
+    /// Executes a PTZ operation with a caller-owned deadline and cancellation signal.
+    ///
+    /// The default preserves the legacy [`Self::ptz`] implementation contract for simple backends
+    /// while ensuring a non-cooperative implementation cannot keep its owning camera actor blocked
+    /// past the caller's bound. Protocol backends should override this method to pass the same
+    /// deadline and cancellation into their transport layer.
+    async fn ptz_bounded(
+        &mut self,
+        request: PtzRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<PtzResult> {
+        if cancellation.is_cancelled() {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::CaptureCancelled,
+                "PTZ operation was cancelled before execution",
+            ));
+        }
+        if deadline <= Instant::now() {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::PtzTimeout,
+                "PTZ operation exceeded its deadline",
+            ));
+        }
+        let operation = self.ptz(request);
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(crate::CameraError::rejected(
+                crate::ErrorCode::CaptureCancelled,
+                "PTZ operation was cancelled",
+            )),
+            _ = tokio::time::sleep_until(deadline) => Err(crate::CameraError::rejected(
+                crate::ErrorCode::PtzTimeout,
+                "PTZ operation exceeded its deadline",
+            )),
+            result = &mut operation => result,
+        }
+    }
 
     /// Best-effort protocol close. It must be idempotent.
     async fn close(&mut self) -> Result<()>;

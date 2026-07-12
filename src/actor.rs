@@ -243,16 +243,22 @@ impl CameraActor {
         while let Some(control) = self.shared.controls.pop_next() {
             match control {
                 ControlWork::SafetyStop(stop) => {
-                    let operation = self.session.ptz(PtzRequest::Stop {
-                        pan: stop.pan,
-                        tilt: stop.tilt,
-                        zoom: stop.zoom,
-                    });
-                    tokio::pin!(operation);
-                    tokio::select! {
-                        _ = tokio::time::sleep_until(stop.deadline) => {}
-                        _ = &mut operation => {}
-                    }
+                    // A shutdown safety stop must be allowed to reach the transport even though
+                    // the component cancellation token is already tripped. Its own tightened
+                    // safety deadline remains the absolute bound.
+                    let cancellation = CancellationToken::new();
+                    let _ = self
+                        .session
+                        .ptz_bounded(
+                            PtzRequest::Stop {
+                                pan: stop.pan,
+                                tilt: stop.tilt,
+                                zoom: stop.zoom,
+                            },
+                            stop.deadline,
+                            &cancellation,
+                        )
+                        .await;
                 }
                 ControlWork::Ordinary(operation) => {
                     let _ = operation.result.send(Err(CameraError::rejected(
@@ -276,29 +282,43 @@ impl CameraActor {
                     tilt: stop.tilt,
                     zoom: stop.zoom,
                 };
-                let operation = self.session.ptz(request);
-                tokio::pin!(operation);
-                tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => {}
-                    _ = tokio::time::sleep_until(stop.deadline) => {}
-                    _ = &mut operation => {}
-                }
+                // Safety stops intentionally outlive shutdown cancellation so a moving camera
+                // is still given one bounded stop attempt. `ptz_bounded` prevents a hung
+                // protocol call from blocking the reserved safety lane.
+                let cancellation = CancellationToken::new();
+                let _ = self
+                    .session
+                    .ptz_bounded(request, stop.deadline, &cancellation)
+                    .await;
             }
             ControlWork::Ordinary(operation) => {
-                let future = self.session.ptz(operation.request);
+                let backend_cancellation = operation.cancellation.child_token();
+                let future = self.session.ptz_bounded(
+                    operation.request,
+                    operation.deadline,
+                    &backend_cancellation,
+                );
                 tokio::pin!(future);
                 let result = tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => Err(CameraError::rejected(
-                        ErrorCode::ComponentStopping,
-                        "camera actor is stopping",
-                    )),
-                    _ = operation.cancellation.cancelled() => Err(CameraError::rejected(
-                        ErrorCode::CaptureCancelled,
-                        "control operation cancelled",
-                    )),
-                    _ = tokio::time::sleep_until(operation.deadline) => Err(ptz_timeout()),
+                    _ = shutdown.cancelled() => {
+                        backend_cancellation.cancel();
+                        Err(CameraError::rejected(
+                            ErrorCode::ComponentStopping,
+                            "camera actor is stopping",
+                        ))
+                    },
+                    _ = operation.cancellation.cancelled() => {
+                        backend_cancellation.cancel();
+                        Err(CameraError::rejected(
+                            ErrorCode::CaptureCancelled,
+                            "control operation cancelled",
+                        ))
+                    },
+                    _ = tokio::time::sleep_until(operation.deadline) => {
+                        backend_cancellation.cancel();
+                        Err(ptz_timeout())
+                    },
                     result = &mut future => result,
                 };
                 let _ = operation.result.send(result);
@@ -377,7 +397,7 @@ struct ActorDispatchReservation {
 }
 
 impl DispatchReservation for ActorDispatchReservation {
-    fn commit(mut self: Box<Self>, descriptor: CaptureDescriptor) -> Result<()> {
+    fn commit(mut self: Box<Self>, descriptor: CaptureDescriptor) -> Result<usize> {
         if descriptor.instance() != self.shared.instance {
             return Err(CameraError::rejected(
                 ErrorCode::UnknownInstance,
@@ -399,7 +419,7 @@ impl DispatchReservation for ActorDispatchReservation {
             QueuedDescriptor { descriptor, slot },
         )?;
         self.shared.notify.notify_one();
-        Ok(())
+        Ok(self.shared.slots.used.load(Ordering::Acquire))
     }
 }
 
@@ -420,7 +440,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::admission::{AdmissionController, FilesystemSpaceProbe};
+    use crate::admission::{AdmissionController, FilesystemSpaceProbe, SafetyStop};
     use crate::backend::sim::SimBackendFactory;
     use crate::backend::{
         CameraBackendFactory, CameraSession, CameraStatus, CaptureRequest, ConnectRequest,
@@ -575,6 +595,45 @@ mod tests {
 
         async fn ptz(&mut self, _request: PtzRequest) -> Result<PtzResult> {
             Ok(PtzResult::Commanded)
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct HungControlSession {
+        capabilities: CameraCapabilities,
+        ordinary_started: Arc<AtomicBool>,
+        safety_stops: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CameraSession for HungControlSession {
+        fn capabilities(&self) -> &CameraCapabilities {
+            &self.capabilities
+        }
+
+        async fn status(&mut self) -> Result<CameraStatus> {
+            unreachable!("the control-lane regression test only invokes PTZ")
+        }
+
+        async fn capture(&mut self, _request: CaptureRequest) -> Result<CaptureFrame> {
+            unreachable!("the control-lane regression test does not capture")
+        }
+
+        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
+            match request {
+                PtzRequest::Continuous { .. } => {
+                    self.ordinary_started.store(true, Ordering::Release);
+                    std::future::pending().await
+                }
+                PtzRequest::Stop { .. } => {
+                    self.safety_stops.fetch_add(1, Ordering::AcqRel);
+                    Ok(PtzResult::Commanded)
+                }
+                _ => unreachable!("the control-lane regression test only moves then stops"),
+            }
         }
 
         async fn close(&mut self) -> Result<()> {
@@ -1266,6 +1325,86 @@ mod tests {
         );
         shutdown.cancel();
         actor_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_ordinary_ptz_cannot_block_the_safety_lane_past_its_deadline() {
+        let harness = harness(sim(1, false, false), 2, 2, false, false).await;
+        let ordinary_started = Arc::new(AtomicBool::new(false));
+        let safety_stops = Arc::new(AtomicUsize::new(0));
+        let session = HungControlSession {
+            capabilities: CameraCapabilities {
+                capture_modes: vec![CaptureMode::Simulated],
+                pixel_formats: vec![PixelFormat::Rgb8],
+                software_trigger: false,
+                snapshot_uri: false,
+                rtsp: false,
+                ptz: true,
+                ptz_status: true,
+                presets: false,
+                preset_mutation: false,
+                vendor: None,
+                model: None,
+                firmware: None,
+                serial: None,
+                warnings: Vec::new(),
+            },
+            ordinary_started: Arc::clone(&ordinary_started),
+            safety_stops: Arc::clone(&safety_stops),
+        };
+        let (actor, handle) =
+            CameraActor::new("cam-a", Box::new(session), harness.engine.clone(), 2, 2)
+                .expect("test actor");
+        let shutdown = CancellationToken::new();
+        let actor_task = tokio::spawn(actor.run(shutdown.clone()));
+        let control_handle = handle.clone();
+        let control_cancellation = CancellationToken::new();
+        let control = tokio::spawn(async move {
+            control_handle
+                .ptz(
+                    PtzRequest::Continuous {
+                        velocity: PtzVector {
+                            pan: 0.5,
+                            tilt: 0.0,
+                            zoom: 0.0,
+                        },
+                        timeout: Duration::from_secs(1),
+                    },
+                    Instant::now() + Duration::from_millis(100),
+                    &control_cancellation,
+                )
+                .await
+        });
+        while !ordinary_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        handle
+            .safety_stop(SafetyStop {
+                pan: true,
+                tilt: true,
+                zoom: true,
+                deadline: Instant::now() + Duration::from_millis(200),
+            })
+            .expect("safety stop must use its independent lane");
+
+        tokio::time::advance(Duration::from_millis(101)).await;
+        assert_eq!(
+            control
+                .await
+                .expect("control task must not panic")
+                .expect_err("hung ordinary PTZ must time out")
+                .code(),
+            ErrorCode::PtzTimeout
+        );
+        while safety_stops.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(safety_stops.load(Ordering::Acquire), 1);
+        shutdown.cancel();
+        actor_task
+            .await
+            .expect("actor task must not panic")
+            .expect("actor must shut down cleanly");
     }
 
     #[tokio::test]

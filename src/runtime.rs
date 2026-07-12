@@ -17,8 +17,11 @@ use edgecommons::commands::{
     CommandError, CommandInbox, CommandOutcome, DeferredReplyRegistry, DeferredReplyToken,
     outcome_handler,
 };
-use edgecommons::config::ConfigurationChangeListener;
-use edgecommons::config::{Config, ConfigurationValidationPhase, ConfigurationValidationResult};
+use edgecommons::config::{
+    Config, ConfigurationApplicationError, ConfigurationApplicationResult,
+    ConfigurationApplyListener, ConfigurationValidationPhase, ConfigurationValidationResult,
+    PreparedConfigurationApply,
+};
 use edgecommons::facades::{AppFacade, EventsFacade, Severity};
 use edgecommons::messaging::Message;
 use edgecommons::platform::Platform;
@@ -35,7 +38,7 @@ use crate::{
     config::AdapterConfig,
     jobs::{
         AcceptanceHook, AppTerminalEnvelopeEncoder, CaptureDescriptor, CaptureDispatcher,
-        DispatchReservation, JobEngine, JobHooks,
+        CaptureJobSpec, DispatchReservation, JobEngine, JobHooks,
     },
     outbox::{EdgeCommonsConfirmedPublisher, OutboxDurability, OutboxPressure, OutboxPublisher},
     registry::{CameraConnectionState, CameraRegistry, CameraStatusError},
@@ -59,22 +62,42 @@ const MAX_RETAINED_CURSORS: usize = 256;
 const MAX_RETAINED_SNAPSHOT_VALUES: usize = 10_000;
 const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SCHEDULER_MISFIRE_GRACE: Duration = Duration::from_secs(5);
+// Lifecycle events are diagnostic-only. Keep their detached work bounded so a stalled broker
+// cannot delay a durable acceptance, physical acquisition, or consume unbounded task memory.
+const MAX_LIFECYCLE_EVENT_PUBLISHES: usize = 64;
+const LIFECYCLE_EVENT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
 type ReadySetter = dyn Fn(bool) + Send + Sync;
+
+#[derive(Clone, Copy)]
+struct RuntimeReadinessState {
+    startup_complete: bool,
+    catalog_available: bool,
+    outbox_available: bool,
+    state_storage_available: bool,
+    stopping: bool,
+}
+
+impl RuntimeReadinessState {
+    fn is_ready(self) -> bool {
+        self.startup_complete
+            && self.catalog_available
+            && self.outbox_available
+            && self.state_storage_available
+            && !self.stopping
+    }
+}
 
 /// Combines the one-way startup gate with independently observed durable-state availability.
 ///
 /// A recovered outbox catalog pass cannot make the component ready before every startup gate has
 /// completed, and it cannot re-enable readiness after shutdown begins. This keeps the core's
 /// single boolean readiness flag honest without treating ordinary broker pressure as a storage
-/// failure.
+/// failure. State changes and the external publication are serialized so a delayed older callback
+/// cannot overwrite a newer unavailable state with stale readiness.
 #[derive(Clone)]
 pub struct RuntimeReadiness {
-    startup_complete: Arc<AtomicBool>,
-    catalog_available: Arc<AtomicBool>,
-    outbox_available: Arc<AtomicBool>,
-    state_storage_available: Arc<AtomicBool>,
-    stopping: Arc<AtomicBool>,
+    state: Arc<Mutex<RuntimeReadinessState>>,
     set_ready: Arc<ReadySetter>,
 }
 
@@ -83,58 +106,56 @@ impl RuntimeReadiness {
     #[must_use]
     pub fn new(set_ready: Arc<ReadySetter>) -> Self {
         Self {
-            startup_complete: Arc::new(AtomicBool::new(false)),
-            catalog_available: Arc::new(AtomicBool::new(true)),
-            outbox_available: Arc::new(AtomicBool::new(true)),
-            state_storage_available: Arc::new(AtomicBool::new(true)),
-            stopping: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(RuntimeReadinessState {
+                startup_complete: false,
+                catalog_available: true,
+                outbox_available: true,
+                state_storage_available: true,
+                stopping: false,
+            })),
             set_ready,
         }
     }
 
     /// Opens readiness after command routing and all runtime startup gates have completed.
     pub fn complete_startup(&self) {
-        if !self.startup_complete.swap(true, Ordering::AcqRel) {
-            self.publish();
-        }
+        self.transition(|state| !std::mem::replace(&mut state.startup_complete, true));
     }
 
     /// Permanently closes readiness for ordered shutdown.
     pub fn begin_shutdown(&self) {
-        if !self.stopping.swap(true, Ordering::AcqRel) {
-            self.publish();
-        }
+        self.transition(|state| !std::mem::replace(&mut state.stopping, true));
     }
 
     fn set_catalog_available(&self, available: bool) {
-        if self.catalog_available.swap(available, Ordering::AcqRel) != available {
-            self.publish();
-        }
+        self.transition(|state| {
+            std::mem::replace(&mut state.catalog_available, available) != available
+        });
     }
 
     fn set_outbox_available(&self, available: bool) {
-        if self.outbox_available.swap(available, Ordering::AcqRel) != available {
-            self.publish();
-        }
+        self.transition(|state| {
+            std::mem::replace(&mut state.outbox_available, available) != available
+        });
     }
 
     fn set_state_storage_available(&self, available: bool) {
-        if self
-            .state_storage_available
-            .swap(available, Ordering::AcqRel)
-            != available
-        {
-            self.publish();
-        }
+        self.transition(|state| {
+            std::mem::replace(&mut state.state_storage_available, available) != available
+        });
     }
 
-    fn publish(&self) {
-        let ready = self.startup_complete.load(Ordering::Acquire)
-            && self.catalog_available.load(Ordering::Acquire)
-            && self.outbox_available.load(Ordering::Acquire)
-            && self.state_storage_available.load(Ordering::Acquire)
-            && !self.stopping.load(Ordering::Acquire);
-        (self.set_ready)(ready);
+    fn transition(&self, transition: impl FnOnce(&mut RuntimeReadinessState) -> bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if transition(&mut state) {
+            // Hold the lock while publishing. This defines the linearization point: no newer
+            // availability transition can publish `false` and then be overwritten by this older
+            // transition's delayed `true` callback.
+            (self.set_ready)(state.is_ready());
+        }
     }
 
     #[cfg(test)]
@@ -633,7 +654,32 @@ pub struct CameraRuntime {
     cursors: CursorStore,
     reload_gate: tokio::sync::Mutex<()>,
     reloading: AtomicBool,
+    #[cfg(test)]
+    fail_next_reload_after_supervisor_retirement: AtomicBool,
     self_reference: OnceLock<Weak<Self>>,
+}
+
+/// Clears the command/schedule reload fence even if an async reload future is cancelled while it
+/// awaits a supervisor.  Core can then invoke the prepared transaction's rollback rather than
+/// leaving every subsequent command permanently rejected as "reloading".
+struct ReloadInProgressGuard<'a>(&'a AtomicBool);
+
+impl Drop for ReloadInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// The mutable runtime state needed to restore a prior committed camera generation after a
+/// prepared replacement fails.  Durable job records are deliberately not cloned: a failed
+/// transition never reaches the incompatible-queue interruption stage, and a successful
+/// transition is never rolled back after Core publishes its new snapshot.
+#[derive(Clone)]
+struct RuntimeReloadCheckpoint {
+    config: AdapterConfig,
+    engines: BTreeMap<String, JobEngine>,
+    events: BTreeMap<String, EventsFacade>,
+    dispatchers: BTreeMap<String, Arc<SupervisorDispatcher>>,
 }
 
 /// Process-local core deferred tokens paired with durable waiter records. The durable row makes
@@ -641,6 +687,8 @@ pub struct CameraRuntime {
 /// the EdgeCommons command inbox.
 struct RuntimeJobHooks {
     catalog: Catalog,
+    runtime: Mutex<Weak<CameraRuntime>>,
+    lifecycle_event_slots: Arc<Semaphore>,
     tokens: Mutex<HashMap<String, Vec<(String, DeferredReplyToken)>>>,
     group_tokens: Mutex<HashMap<String, Vec<DeferredReplyToken>>>,
     pending: Mutex<HashMap<(String, String), PendingDeferredWaiter>>,
@@ -652,10 +700,23 @@ impl RuntimeJobHooks {
     fn new(catalog: Catalog) -> Self {
         Self {
             catalog,
+            runtime: Mutex::new(Weak::new()),
+            lifecycle_event_slots: Arc::new(Semaphore::new(MAX_LIFECYCLE_EVENT_PUBLISHES)),
             tokens: Mutex::new(HashMap::new()),
             group_tokens: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn attach_runtime(&self, runtime: Weak<CameraRuntime>) {
+        match self.runtime.lock() {
+            Ok(mut attached) => *attached = runtime,
+            Err(_) => tracing::warn!("could not attach lifecycle-event routing to runtime hooks"),
+        }
+    }
+
+    fn runtime(&self) -> Option<Arc<CameraRuntime>> {
+        self.runtime.lock().ok()?.upgrade()
     }
 
     fn register(
@@ -782,6 +843,42 @@ impl RuntimeJobHooks {
 
 #[async_trait]
 impl JobHooks for RuntimeJobHooks {
+    async fn capture_queued(
+        &self,
+        record: &crate::catalog::JobRecord,
+        spec: &CaptureJobSpec,
+        queue_position: usize,
+    ) {
+        let Ok(permit) = Arc::clone(&self.lifecycle_event_slots).try_acquire_owned() else {
+            return;
+        };
+        let Some(runtime) = self.runtime() else {
+            return;
+        };
+        let record = record.clone();
+        let spec = spec.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            runtime
+                .emit_capture_queued(record, spec, queue_position)
+                .await;
+        });
+    }
+
+    async fn capture_started(&self, spec: &CaptureJobSpec) {
+        let Ok(permit) = Arc::clone(&self.lifecycle_event_slots).try_acquire_owned() else {
+            return;
+        };
+        let Some(runtime) = self.runtime() else {
+            return;
+        };
+        let spec = spec.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            runtime.emit_capture_started(spec).await;
+        });
+    }
+
     async fn settle_waiters(
         &self,
         record: &crate::catalog::JobRecord,
@@ -864,6 +961,23 @@ pub struct RuntimeServices {
     pub messaging: Arc<dyn edgecommons::messaging::MessagingService>,
 }
 
+fn capture_trigger_type(trigger: &crate::messages::CaptureTrigger) -> &'static str {
+    match trigger {
+        crate::messages::CaptureTrigger::Command { .. } => "command",
+        crate::messages::CaptureTrigger::GroupCommand { .. } => "group-command",
+        crate::messages::CaptureTrigger::Schedule { .. } => "schedule",
+    }
+}
+
+fn capture_mode_type(mode: crate::model::CaptureMode) -> &'static str {
+    match mode {
+        crate::model::CaptureMode::Simulated => "simulated",
+        crate::model::CaptureMode::SoftwareTrigger => "software-trigger",
+        crate::model::CaptureMode::SnapshotUri => "snapshot-uri",
+        crate::model::CaptureMode::RtspFrame => "rtsp-frame",
+    }
+}
+
 impl CameraRuntime {
     fn config_snapshot(&self) -> Result<AdapterConfig> {
         self.config
@@ -872,6 +986,116 @@ impl CameraRuntime {
             .map_err(|_| {
                 crate::CameraError::Catalog("runtime configuration lock is unavailable".to_string())
             })
+    }
+
+    fn lifecycle_events(&self, instance: &str) -> Option<EventsFacade> {
+        let config = match self.config_snapshot() {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    instance,
+                    error = %error,
+                    "could not read capture lifecycle-event policy"
+                );
+                return None;
+            }
+        };
+        if !config.global.operator_events.capture_lifecycle {
+            return None;
+        }
+        match self.events.read() {
+            Ok(events) => match events.get(instance).cloned() {
+                Some(events) => Some(events),
+                None => {
+                    tracing::warn!(
+                        instance,
+                        "capture lifecycle events are enabled but no event facade is installed"
+                    );
+                    None
+                }
+            },
+            Err(_) => {
+                tracing::warn!(instance, "could not access capture lifecycle-event facade");
+                None
+            }
+        }
+    }
+
+    async fn emit_capture_queued(
+        &self,
+        record: crate::catalog::JobRecord,
+        spec: CaptureJobSpec,
+        queue_position: usize,
+    ) {
+        let Some(events) = self.lifecycle_events(&spec.instance) else {
+            return;
+        };
+        let context = serde_json::json!({
+            "captureId": record.capture_id,
+            "trigger": capture_trigger_type(&spec.trigger),
+            "captureProfile": spec.profile.name,
+            "queuePosition": queue_position,
+        });
+        match tokio::time::timeout(
+            LIFECYCLE_EVENT_PUBLISH_TIMEOUT,
+            events.emit(Severity::Debug, "capture-queued", None, Some(context)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    instance = %spec.instance,
+                    capture_id = %spec.capture_id,
+                    error = %error,
+                    "could not publish best-effort capture-queued lifecycle event"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    instance = %spec.instance,
+                    capture_id = %spec.capture_id,
+                    timeout_ms = LIFECYCLE_EVENT_PUBLISH_TIMEOUT.as_millis(),
+                    "best-effort capture-queued lifecycle event timed out"
+                );
+            }
+        }
+    }
+
+    async fn emit_capture_started(&self, spec: CaptureJobSpec) {
+        let Some(events) = self.lifecycle_events(&spec.instance) else {
+            return;
+        };
+        let context = serde_json::json!({
+            "captureId": spec.capture_id,
+            "trigger": capture_trigger_type(&spec.trigger),
+            "captureProfile": spec.profile.name,
+            "captureMode": capture_mode_type(spec.profile.capture_mode),
+        });
+        match tokio::time::timeout(
+            LIFECYCLE_EVENT_PUBLISH_TIMEOUT,
+            events.emit(Severity::Info, "capture-started", None, Some(context)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    instance = %spec.instance,
+                    capture_id = %spec.capture_id,
+                    error = %error,
+                    "could not publish best-effort capture-started lifecycle event"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    instance = %spec.instance,
+                    capture_id = %spec.capture_id,
+                    timeout_ms = LIFECYCLE_EVENT_PUBLISH_TIMEOUT.as_millis(),
+                    "best-effort capture-started lifecycle event timed out"
+                );
+            }
+        }
     }
 
     fn new_engine(&self, app: Arc<AppFacade>) -> JobEngine {
@@ -972,13 +1196,16 @@ impl CameraRuntime {
             cancellation: CancellationToken::new(),
             tasks: Mutex::new(Vec::new()),
             connect_gate: Arc::new(Semaphore::new(max_connection_attempts)),
-            waiters,
+            waiters: Arc::clone(&waiters),
             cursors: CursorStore::default(),
             reload_gate: tokio::sync::Mutex::new(()),
             reloading: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_reload_after_supervisor_retirement: AtomicBool::new(false),
             self_reference: OnceLock::new(),
         });
         let _ = runtime.self_reference.set(Arc::downgrade(&runtime));
+        waiters.attach_runtime(Arc::downgrade(&runtime));
 
         runtime.refresh_storage_pressure().await;
         runtime.start_storage_pressure_monitor()?;
@@ -2555,21 +2782,25 @@ impl CameraRuntime {
                 "a configuration replacement is already draining camera work",
             ));
         }
-        let result = self
-            .apply_reloaded_config_inner(replacement, apps, events)
-            .await;
-        self.reloading.store(false, Ordering::Release);
-        result
+        let _reloading = ReloadInProgressGuard(&self.reloading);
+        self.apply_reloaded_config_inner(replacement, apps, events)
+            .await
     }
 
-    async fn apply_reloaded_config_inner(
-        self: &Arc<Self>,
-        replacement: AdapterConfig,
-        apps: BTreeMap<String, Arc<AppFacade>>,
-        events: BTreeMap<String, EventsFacade>,
-    ) -> Result<crate::registry::RegistryDiff> {
-        let _reload = self.reload_gate.lock().await;
-        self.backend_context.validate_config(&replacement)?;
+    /// Performs the candidate-only half of a reload without altering any live camera generation.
+    ///
+    /// Core invokes this from its pre-commit application coordinator.  This method deliberately
+    /// excludes supervisor cancellation, catalog changes, registry replacement, schedule changes,
+    /// and readiness publication: a rejected candidate must leave the complete prior service able
+    /// to keep accepting and completing captures (R-04).  The corresponding live transition is
+    /// performed only from the post-commit configuration listener.
+    fn preflight_reloaded_config(
+        &self,
+        replacement: &AdapterConfig,
+        apps: &BTreeMap<String, Arc<AppFacade>>,
+        events: &BTreeMap<String, EventsFacade>,
+    ) -> Result<()> {
+        self.backend_context.validate_config(replacement)?;
         let previous = self.config_snapshot()?;
         if previous.global.state.directory != replacement.global.state.directory
             || previous.global.output.root_directory != replacement.global.output.root_directory
@@ -2581,6 +2812,161 @@ impl CameraRuntime {
                 "state/output root security settings require component restart",
             ));
         }
+
+        // Constructibility of every new runtime dependency is part of candidate validation.  Do
+        // not retain these temporary values: the committed transition constructs its own objects
+        // after Core has atomically advanced the configuration snapshot.
+        let existing_engine_ids = self
+            .engines
+            .read()
+            .map_err(|_| {
+                crate::CameraError::Catalog("camera engine map is unavailable".to_string())
+            })?
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for camera in &replacement.instances {
+            if existing_engine_ids.contains(&camera.id) {
+                continue;
+            }
+            if !apps.contains_key(&camera.id) {
+                return Err(crate::CameraError::Catalog(format!(
+                    "missing application facade for reloaded camera '{}'",
+                    camera.id
+                )));
+            }
+            if !events.contains_key(&camera.id) {
+                return Err(crate::CameraError::Catalog(format!(
+                    "missing events facade for reloaded camera '{}'",
+                    camera.id
+                )));
+            }
+            let _ = SupervisorDispatcher::new(
+                camera.id.clone(),
+                replacement.global.limits.max_queued_captures_per_camera,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Captures only in-memory generation state before a prepared transaction begins its live
+    /// transition. All locks are released before any await in the commit/rollback path.
+    fn reload_checkpoint(&self) -> Result<RuntimeReloadCheckpoint> {
+        let config = self.config_snapshot()?;
+        let engines = self
+            .engines
+            .read()
+            .map_err(|_| {
+                crate::CameraError::Catalog("camera engine map is unavailable".to_string())
+            })?
+            .clone();
+        let events = self
+            .events
+            .read()
+            .map_err(|_| {
+                crate::CameraError::Catalog("camera events map is unavailable".to_string())
+            })?
+            .clone();
+        let dispatchers = self
+            .dispatchers
+            .read()
+            .map_err(|_| {
+                crate::CameraError::Catalog("camera dispatcher map is unavailable".to_string())
+            })?
+            .clone();
+        Ok(RuntimeReloadCheckpoint {
+            config,
+            engines,
+            events,
+            dispatchers,
+        })
+    }
+
+    /// Restores a checkpoint after a prepared candidate fails before Core publishes it.
+    ///
+    /// Every currently-live supervisor is first retired and confirmed stopped. Reinstalling the
+    /// prior maps/configuration before starting fresh prior-generation supervisors avoids a stale
+    /// actor controlling a camera concurrently with a rollback actor. The method is idempotent:
+    /// Core may call it after a commit error even when the transition did not reach a destructive
+    /// stage.
+    async fn restore_reload_checkpoint(
+        self: &Arc<Self>,
+        checkpoint: RuntimeReloadCheckpoint,
+    ) -> Result<()> {
+        if self.reloading.swap(true, Ordering::AcqRel) {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::CameraUnavailable,
+                "a configuration replacement is still active while restoring the prior generation",
+            ));
+        }
+        let _reloading = ReloadInProgressGuard(&self.reloading);
+        let _reload = self.reload_gate.lock().await;
+        let current = self
+            .config_snapshot()
+            .unwrap_or_else(|_| checkpoint.config.clone());
+        let mut instances = current
+            .instances
+            .iter()
+            .map(|camera| camera.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        instances.extend(
+            checkpoint
+                .config
+                .instances
+                .iter()
+                .map(|camera| camera.id.clone()),
+        );
+        let instances = instances.into_iter().collect::<Vec<_>>();
+        let timeout =
+            Duration::from_millis(checkpoint.config.global.timeouts.reload_drain_timeout_ms);
+        self.replace_supervisors(&instances, timeout).await?;
+
+        // All direct map writes happen after supervisor retirement. No lock is held across the
+        // preceding await, and a poisoned map is reported so Core retains the prior snapshot.
+        self.registry.apply_validated_config(&checkpoint.config)?;
+        *self.engines.write().map_err(|_| {
+            crate::CameraError::Catalog(
+                "camera engine map is unavailable during rollback".to_string(),
+            )
+        })? = checkpoint.engines;
+        *self.events.write().map_err(|_| {
+            crate::CameraError::Catalog(
+                "camera events map is unavailable during rollback".to_string(),
+            )
+        })? = checkpoint.events;
+        *self.dispatchers.write().map_err(|_| {
+            crate::CameraError::Catalog(
+                "camera dispatcher map is unavailable during rollback".to_string(),
+            )
+        })? = checkpoint.dispatchers;
+        *self.config.write().map_err(|_| {
+            crate::CameraError::Catalog(
+                "runtime configuration lock is unavailable during rollback".to_string(),
+            )
+        })? = checkpoint.config.clone();
+
+        self.restart_schedulers()?;
+        self.restart_periodic_discovery()?;
+        for camera in checkpoint
+            .config
+            .instances
+            .iter()
+            .filter(|camera| camera.enabled)
+        {
+            self.start_supervisor(camera.id.clone(), self.engine(&camera.id)?)?;
+        }
+        Ok(())
+    }
+
+    async fn apply_reloaded_config_inner(
+        self: &Arc<Self>,
+        replacement: AdapterConfig,
+        apps: BTreeMap<String, Arc<AppFacade>>,
+        events: BTreeMap<String, EventsFacade>,
+    ) -> Result<crate::registry::RegistryDiff> {
+        let _reload = self.reload_gate.lock().await;
+        self.preflight_reloaded_config(&replacement, &apps, &events)?;
+        let previous = self.config_snapshot()?;
 
         let replacement_by_id = replacement
             .instances
@@ -2672,73 +3058,126 @@ impl CameraRuntime {
                 )?),
             ));
         }
-        for instance in &incompatible {
-            self.interrupt_reload_queued(instance).await?;
+        // Core calls this method from its pre-commit application gate. Retire every old
+        // supervisor before touching any published runtime generation: a timeout must veto the
+        // candidate while Core and the runtime still expose the same previous configuration.
+        // Cancellation itself may leave an affected camera unavailable until the old generation
+        // exits and the configuration source retries, but it must never permit two generations to
+        // control one camera concurrently.
+        let drain_timeout =
+            Duration::from_millis(replacement.global.timeouts.reload_drain_timeout_ms);
+        self.wait_for_active_jobs(&restarting, drain_timeout)
+            .await?;
+        self.replace_supervisors(&restarting, drain_timeout).await?;
+
+        #[cfg(test)]
+        if self
+            .fail_next_reload_after_supervisor_retirement
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::BackendError,
+                "controlled reload transition failure after supervisor retirement",
+            ));
         }
 
+        // The retirement barrier above has confirmed that no old generation can mutate a camera
+        // after this point. All remaining fallible preparation has completed, so the registry and
+        // runtime configuration can now advance as one candidate generation.
         let diff = self.registry.apply_validated_config(&replacement)?;
         {
-            let mut engines = self.engines.write().map_err(|_| {
-                crate::CameraError::Catalog("camera engine map is unavailable".to_string())
-            })?;
-            for (instance, engine) in added_engines {
-                engines.insert(instance, engine);
-            }
-        }
-        {
-            let mut dispatchers = self.dispatchers.write().map_err(|_| {
-                crate::CameraError::Catalog("camera dispatcher map is unavailable".to_string())
-            })?;
-            for (instance, dispatcher) in added_dispatchers {
-                dispatchers.insert(instance, dispatcher);
-            }
-        }
-        {
-            let mut runtime_events = self.events.write().map_err(|_| {
-                crate::CameraError::Catalog("camera events facade map is unavailable".to_string())
-            })?;
-            // The listener supplies fresh facades for all retained instances so their core
-            // configuration snapshot stays current; tests and internal callers may omit
-            // retained entries, in which case the established facade remains valid.  Newly
-            // added cameras were required above and are therefore never installed without an
-            // event publishing path.
-            for (instance, event) in events {
-                if replacement_by_id.contains_key(instance.as_str()) {
-                    runtime_events.insert(instance, event);
+            match self.engines.write() {
+                Ok(mut engines) => {
+                    for (instance, engine) in added_engines {
+                        engines.insert(instance, engine);
+                    }
+                }
+                Err(_) => {
+                    tracing::error!("camera engine map became unavailable while committing reload");
                 }
             }
-            for (instance, event) in added_events {
-                runtime_events.insert(instance, event);
+        }
+        {
+            match self.dispatchers.write() {
+                Ok(mut dispatchers) => {
+                    for (instance, dispatcher) in added_dispatchers {
+                        dispatchers.insert(instance, dispatcher);
+                    }
+                }
+                Err(_) => {
+                    tracing::error!(
+                        "camera dispatcher map became unavailable while committing reload"
+                    );
+                }
             }
         }
         {
-            let mut config = self.config.write().map_err(|_| {
-                crate::CameraError::Catalog("runtime configuration lock is unavailable".to_string())
-            })?;
-            *config = replacement.clone();
+            match self.events.write() {
+                Ok(mut runtime_events) => {
+                    // The listener supplies fresh facades for all retained instances so their core
+                    // configuration snapshot stays current; tests and internal callers may omit
+                    // retained entries, in which case the established facade remains valid. Newly
+                    // added cameras were required above and are therefore never installed without
+                    // an event publishing path.
+                    for (instance, event) in events {
+                        if replacement_by_id.contains_key(instance.as_str()) {
+                            runtime_events.insert(instance, event);
+                        }
+                    }
+                    for (instance, event) in added_events {
+                        runtime_events.insert(instance, event);
+                    }
+                }
+                Err(_) => {
+                    tracing::error!(
+                        "camera events facade map became unavailable while committing reload"
+                    );
+                }
+            }
+        }
+        {
+            match self.config.write() {
+                Ok(mut config) => *config = replacement.clone(),
+                Err(_) => {
+                    tracing::error!(
+                        "runtime configuration lock became unavailable while committing reload"
+                    );
+                }
+            }
+        }
+
+        for instance in &incompatible {
+            if let Err(error) = self.interrupt_reload_queued(instance).await {
+                tracing::error!(instance, error = %error, "could not terminalize incompatible queued jobs during reload");
+            }
         }
 
         // Schedule plans are immutable.  Canceling the prior generation before constructing the
         // new plans prevents a schedule-only reload from admitting an old cron/profile after the
         // registry generation has changed.
-        self.restart_schedulers()?;
-        self.restart_periodic_discovery()?;
+        if let Err(error) = self.restart_schedulers() {
+            tracing::error!(error = %error, "could not restart schedules after committed reload");
+        }
+        if let Err(error) = self.restart_periodic_discovery() {
+            tracing::error!(error = %error, "could not restart periodic discovery after committed reload");
+        }
 
-        let drain_timeout =
-            Duration::from_millis(replacement.global.timeouts.reload_drain_timeout_ms);
-        self.wait_for_active_jobs(&restarting, drain_timeout)
-            .await?;
-
-        // Retire connecting, backing-off, and live supervisor generations alike.  The wait keeps
-        // an old cleanup path from deleting a freshly published actor map entry for the same ID.
-        self.replace_supervisors(&restarting, drain_timeout).await?;
-
-        // New supervisors are started only after the full swap and old-generation retirement.
+        // The pre-commit retirement barrier confirmed every old supervisor exit before the
+        // registry/configuration swap. New supervisors therefore cannot overlap a stale camera
+        // generation or let a stale cleanup path remove their actor entry.
         for instance in &diff.added {
             if let Ok(camera) = self.registry.camera_config(instance) {
                 if camera.enabled {
-                    let engine = self.engine(instance)?;
-                    self.start_supervisor(instance.clone(), engine)?;
+                    match self.engine(instance) {
+                        Ok(engine) => {
+                            if let Err(error) = self.start_supervisor(instance.clone(), engine) {
+                                tracing::error!(instance, error = %error, "could not start added camera supervisor after committed reload");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(instance, error = %error, "added camera has no runtime engine after committed reload");
+                        }
+                    }
                 }
             }
         }
@@ -2749,46 +3188,33 @@ impl CameraRuntime {
                     .camera_config(instance)
                     .is_ok_and(|camera| camera.enabled)
         }) {
-            let engine = self.engine(instance)?;
-            self.start_supervisor(instance.clone(), engine)?;
+            match self.engine(instance) {
+                Ok(engine) => {
+                    if let Err(error) = self.start_supervisor(instance.clone(), engine) {
+                        tracing::error!(instance, error = %error, "could not restart camera supervisor after committed reload");
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(instance, error = %error, "restarted camera has no runtime engine after committed reload");
+                }
+            }
         }
         if !diff.removed.is_empty() {
-            self.engines
-                .write()
-                .map_err(|_| {
-                    crate::CameraError::Catalog("camera engine map is unavailable".to_string())
-                })?
-                .retain(|instance, _| !diff.removed.contains(instance));
-            self.dispatchers
-                .write()
-                .map_err(|_| {
-                    crate::CameraError::Catalog("camera dispatcher map is unavailable".to_string())
-                })?
-                .retain(|instance, _| !diff.removed.contains(instance));
-            self.events
-                .write()
-                .map_err(|_| {
-                    crate::CameraError::Catalog(
-                        "camera events facade map is unavailable".to_string(),
-                    )
-                })?
-                .retain(|instance, _| !diff.removed.contains(instance));
-            self.supervisor_cancellations
-                .write()
-                .map_err(|_| {
-                    crate::CameraError::Catalog(
-                        "supervisor cancellation map is unavailable".to_string(),
-                    )
-                })?
-                .retain(|instance, _| !diff.removed.contains(instance));
-            self.supervisor_finished
-                .write()
-                .map_err(|_| {
-                    crate::CameraError::Catalog(
-                        "supervisor completion map is unavailable".to_string(),
-                    )
-                })?
-                .retain(|instance, _| !diff.removed.contains(instance));
+            if let Ok(mut engines) = self.engines.write() {
+                engines.retain(|instance, _| !diff.removed.contains(instance));
+            }
+            if let Ok(mut dispatchers) = self.dispatchers.write() {
+                dispatchers.retain(|instance, _| !diff.removed.contains(instance));
+            }
+            if let Ok(mut events) = self.events.write() {
+                events.retain(|instance, _| !diff.removed.contains(instance));
+            }
+            if let Ok(mut cancellations) = self.supervisor_cancellations.write() {
+                cancellations.retain(|instance, _| !diff.removed.contains(instance));
+            }
+            if let Ok(mut finished) = self.supervisor_finished.write() {
+                finished.retain(|instance, _| !diff.removed.contains(instance));
+            }
             if let Ok(mut sessions) = self.session_cancellations.write() {
                 sessions.retain(|instance, _| !diff.removed.contains(instance));
             }
@@ -4436,22 +4862,20 @@ struct SupervisorReservation {
 }
 
 impl DispatchReservation for SupervisorReservation {
-    fn commit(mut self: Box<Self>, descriptor: CaptureDescriptor) -> Result<()> {
+    fn commit(mut self: Box<Self>, descriptor: CaptureDescriptor) -> Result<usize> {
         if descriptor.instance() != self.dispatcher.instance {
             return Err(crate::CameraError::rejected(
                 crate::ErrorCode::UnknownInstance,
                 "capture descriptor was dispatched to the wrong camera supervisor",
             ));
         }
-        self.dispatcher
-            .queue
-            .lock()
-            .map_err(|_| {
-                crate::CameraError::Catalog("supervisor capture queue is unavailable".to_string())
-            })?
-            .push_back(descriptor);
+        let mut queue = self.dispatcher.queue.lock().map_err(|_| {
+            crate::CameraError::Catalog("supervisor capture queue is unavailable".to_string())
+        })?;
+        queue.push_back(descriptor);
+        let queue_position = queue.len();
         self.committed = true;
-        Ok(())
+        Ok(queue_position)
     }
 }
 
@@ -4746,13 +5170,84 @@ pub trait CameraCommandService: Send + Sync + 'static {
     ) -> CommandOutcome;
 }
 
-type AppFacadeFactory = dyn Fn(&str) -> edgecommons::Result<Arc<AppFacade>> + Send + Sync;
-type EventsFacadeFactory = dyn Fn(&str) -> edgecommons::Result<EventsFacade> + Send + Sync;
+type AppFacadeFactory =
+    dyn Fn(&str, Arc<Config>) -> edgecommons::Result<Arc<AppFacade>> + Send + Sync;
+type EventsFacadeFactory =
+    dyn Fn(&str, Arc<Config>) -> edgecommons::Result<EventsFacade> + Send + Sync;
 
-/// Bridges the core's post-commit configuration notification to one fully serialized adapter
-/// reload.  Candidate vetoing is still performed by [`validate_configuration_candidate`] before
-/// the core replaces its snapshot; this listener only applies a generation already accepted by
-/// that gate.
+/// A fully preflighted runtime reload held while Core retains the prior configuration snapshot.
+/// `commit` either completes the adapter generation transition or restores its captured prior
+/// service before Core rejects the candidate; only a successful return permits Core to swap its
+/// own snapshot.
+struct RuntimeReloadTransaction {
+    runtime: Arc<CameraRuntime>,
+    replacement: AdapterConfig,
+    apps: BTreeMap<String, Arc<AppFacade>>,
+    events: BTreeMap<String, EventsFacade>,
+    checkpoint: Option<RuntimeReloadCheckpoint>,
+}
+
+impl RuntimeReloadTransaction {
+    fn application_error(error: &crate::CameraError) -> ConfigurationApplicationError {
+        ConfigurationApplicationError::new(error.code().as_str(), error.to_string())
+    }
+
+    async fn restore(&mut self) -> ConfigurationApplicationResult<()> {
+        let Some(checkpoint) = self.checkpoint.take() else {
+            return Ok(());
+        };
+        self.runtime
+            .restore_reload_checkpoint(checkpoint)
+            .await
+            .map_err(|error| Self::application_error(&error))
+    }
+}
+
+#[async_trait]
+impl PreparedConfigurationApply for RuntimeReloadTransaction {
+    async fn commit(&mut self) -> ConfigurationApplicationResult<()> {
+        match self
+            .runtime
+            .apply_reloaded_config(
+                self.replacement.clone(),
+                self.apps.clone(),
+                self.events.clone(),
+            )
+            .await
+        {
+            Ok(_) => {
+                // A successful adapter transition is now waiting only for Core's infallible
+                // ArcSwap store. Rollback is no longer permitted after this point.
+                self.checkpoint = None;
+                Ok(())
+            }
+            Err(error) => {
+                let application_error = Self::application_error(&error);
+                if let Err(rollback_error) = self.restore().await {
+                    return Err(ConfigurationApplicationError::new(
+                        "CONFIG_APPLICATION_ROLLBACK_FAILED",
+                        format!(
+                            "candidate transition failed [{}]; prior runtime restoration failed [{}]: {}",
+                            application_error.code, rollback_error.code, rollback_error.message
+                        ),
+                    ));
+                }
+                Err(application_error)
+            }
+        }
+    }
+
+    async fn rollback(&mut self) -> ConfigurationApplicationResult<()> {
+        self.restore().await
+    }
+}
+
+/// Bridges Core's prepared configuration-application coordinator to the runtime transaction.
+///
+/// Candidate validation remains side-effect-free in [`validate_configuration_candidate`]. The
+/// pre-commit hook constructs candidate-scoped facades, validates the complete runtime plan, and
+/// captures the prior in-memory generation. Core invokes the returned transaction while retaining
+/// its prior snapshot, so an unsuccessful live transition cannot expose a mixed generation.
 pub struct RuntimeConfigListener {
     runtime: Weak<CameraRuntime>,
     app_factory: Arc<AppFacadeFactory>,
@@ -4760,8 +5255,8 @@ pub struct RuntimeConfigListener {
 }
 
 impl RuntimeConfigListener {
-    /// Creates a listener whose factory obtains instance-scoped `app()` facades from the current
-    /// core snapshot, including cameras added by a later reload.
+    /// Creates a listener whose factories obtain candidate-scoped facades for cameras added by a
+    /// later reload.
     #[must_use]
     pub fn new(
         runtime: Weak<CameraRuntime>,
@@ -4777,48 +5272,72 @@ impl RuntimeConfigListener {
 }
 
 #[async_trait]
-impl ConfigurationChangeListener for RuntimeConfigListener {
-    async fn on_configuration_change(&self, config: Arc<Config>) -> bool {
+impl ConfigurationApplyListener for RuntimeConfigListener {
+    async fn prepare_configuration_apply(
+        &self,
+        config: Arc<Config>,
+    ) -> ConfigurationApplicationResult<Box<dyn PreparedConfigurationApply>> {
         let Some(runtime) = self.runtime.upgrade() else {
-            return true;
+            return Err(ConfigurationApplicationError::new(
+                "CONFIG_APPLICATION_UNAVAILABLE",
+                "camera runtime is no longer available",
+            ));
         };
         let replacement = match AdapterConfig::from_core_reload(&config) {
             Ok(config) => config,
             Err(error) => {
                 tracing::error!(error = %error, "accepted core configuration was invalid for camera runtime");
-                return false;
+                return Err(ConfigurationApplicationError::new(
+                    error.code().as_str(),
+                    error.to_string(),
+                ));
             }
         };
         let mut apps = BTreeMap::new();
         let mut events = BTreeMap::new();
         for camera in &replacement.instances {
-            match (self.app_factory)(&camera.id) {
+            match (self.app_factory)(&camera.id, Arc::clone(&config)) {
                 Ok(app) => {
                     apps.insert(camera.id.clone(), app);
                 }
                 Err(error) => {
                     tracing::error!(instance = %camera.id, error = %error, "could not construct application facade for reloaded camera");
-                    return false;
+                    return Err(ConfigurationApplicationError::new(
+                        "CONFIG_APPLICATION_PREPARE_FAILED",
+                        error.to_string(),
+                    ));
                 }
             }
-            match (self.events_factory)(&camera.id) {
+            match (self.events_factory)(&camera.id, Arc::clone(&config)) {
                 Ok(event) => {
                     events.insert(camera.id.clone(), event);
                 }
                 Err(error) => {
                     tracing::error!(instance = %camera.id, error = %error, "could not construct events facade for reloaded camera");
-                    return false;
+                    return Err(ConfigurationApplicationError::new(
+                        "CONFIG_APPLICATION_PREPARE_FAILED",
+                        error.to_string(),
+                    ));
                 }
             }
         }
-        if let Err(error) = runtime
-            .apply_reloaded_config(replacement, apps, events)
-            .await
-        {
-            tracing::error!(error = %error, "camera runtime rejected an accepted configuration generation");
-            return false;
+        if let Err(error) = runtime.preflight_reloaded_config(&replacement, &apps, &events) {
+            tracing::error!(error = %error, "camera runtime rejected configuration candidate during non-destructive preflight");
+            return Err(ConfigurationApplicationError::new(
+                error.code().as_str(),
+                error.to_string(),
+            ));
         }
-        true
+        let checkpoint = runtime.reload_checkpoint().map_err(|error| {
+            ConfigurationApplicationError::new(error.code().as_str(), error.to_string())
+        })?;
+        Ok(Box::new(RuntimeReloadTransaction {
+            runtime,
+            replacement,
+            apps,
+            events,
+            checkpoint: Some(checkpoint),
+        }))
     }
 }
 
@@ -5261,6 +5780,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn readiness_publication_is_linearizable_across_concurrent_availability_changes() {
+        use std::sync::mpsc;
+
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&updates);
+        let (true_entered_tx, true_entered_rx) = mpsc::channel();
+        let (release_true_tx, release_true_rx) = mpsc::channel();
+        let release_true_rx = Arc::new(Mutex::new(release_true_rx));
+        let (false_published_tx, false_published_rx) = mpsc::channel();
+        let block_next_true = Arc::new(AtomicBool::new(false));
+        let observe_false = Arc::new(AtomicBool::new(false));
+        let readiness = RuntimeReadiness::new(Arc::new({
+            let block_next_true = Arc::clone(&block_next_true);
+            let observe_false = Arc::clone(&observe_false);
+            move |ready| {
+                if ready && block_next_true.swap(false, Ordering::AcqRel) {
+                    true_entered_tx
+                        .send(())
+                        .expect("the test must await the blocked ready publication");
+                    release_true_rx
+                        .lock()
+                        .unwrap()
+                        .recv()
+                        .expect("the test must release the blocked ready publication");
+                }
+                if !ready && observe_false.load(Ordering::Acquire) {
+                    let _ = false_published_tx.send(());
+                }
+                recorded.lock().unwrap().push(ready);
+            }
+        }));
+
+        readiness.set_catalog_available(false);
+        readiness.complete_startup();
+        updates.lock().unwrap().clear();
+        block_next_true.store(true, Ordering::Release);
+        observe_false.store(true, Ordering::Release);
+
+        let recovering = readiness.clone();
+        let recovering_thread = std::thread::spawn(move || {
+            recovering.set_catalog_available(true);
+        });
+        true_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ready publication did not enter its controlled delay");
+
+        let becoming_unavailable = readiness.clone();
+        let unavailable_thread = std::thread::spawn(move || {
+            becoming_unavailable.set_outbox_available(false);
+        });
+        assert!(
+            false_published_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "a newer unavailable transition must not publish before the older ready callback completes"
+        );
+
+        release_true_tx
+            .send(())
+            .expect("the ready publication must still be waiting for release");
+        recovering_thread
+            .join()
+            .expect("the recovering readiness transition must finish");
+        unavailable_thread
+            .join()
+            .expect("the unavailable readiness transition must finish");
+        false_published_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the unavailable transition must publish after the ready callback");
+        assert_eq!(*updates.lock().unwrap(), vec![true, false]);
+    }
+
     fn reload_config(root_directory: &str) -> serde_json::Value {
         json!({
             "component": {
@@ -5493,13 +6085,16 @@ mod tests {
                 cancellation: CancellationToken::new(),
                 tasks: Mutex::new(Vec::new()),
                 connect_gate: Arc::new(Semaphore::new(1)),
-                waiters,
+                waiters: Arc::clone(&waiters),
                 cursors: CursorStore::default(),
                 reload_gate: tokio::sync::Mutex::new(()),
                 reloading: AtomicBool::new(false),
+                #[cfg(test)]
+                fail_next_reload_after_supervisor_retirement: AtomicBool::new(false),
                 self_reference: OnceLock::new(),
             });
             let _ = runtime.self_reference.set(Arc::downgrade(&runtime));
+            waiters.attach_runtime(Arc::downgrade(&runtime));
             runtime
         }
 
@@ -5800,7 +6395,6 @@ mod tests {
         /// Builds the loopback core fixture, optionally configuring the adapter router before
         /// the core command inbox can subscribe. This keeps the startup race test faithful to
         /// the binary's construction order rather than registering test handlers after startup.
-        #[cfg(all(feature = "standalone", feature = "onvif"))]
         async fn facade_core_with_router(
             directory: &TempDir,
             port: u16,
@@ -6012,7 +6606,6 @@ mod tests {
             }
         }
 
-        #[cfg(all(feature = "standalone", feature = "onvif"))]
         async fn wait_for_group_terminal(
             runtime: &CameraRuntime,
             group_id: &str,
@@ -6032,7 +6625,6 @@ mod tests {
             }
         }
 
-        #[cfg(all(feature = "standalone", feature = "onvif"))]
         async fn wait_for_recorded_reply(
             publishes: &RecordedMqttPublishes,
             first_index: usize,
@@ -7159,6 +7751,93 @@ mod tests {
             runtime.shutdown().await;
         }
 
+        #[tokio::test]
+        async fn reload_timeout_preserves_prior_generation_until_a_safe_retry() {
+            let directory = TempDir::new().unwrap();
+            let initial = config(directory.path(), &["camera-a"], false);
+            let runtime = runtime(initial, &directory).await;
+            let generation_before = runtime.registry.snapshot("camera-a").unwrap().generation;
+
+            // Model an old supervisor that has accepted cancellation but cannot yet prove that
+            // every backend/session task has exited. A zero drain budget makes the timeout
+            // deterministic without depending on executor scheduling.
+            let old_cancellation = CancellationToken::new();
+            let old_finished = CancellationToken::new();
+            runtime
+                .supervisor_cancellations
+                .write()
+                .unwrap()
+                .insert("camera-a".to_string(), old_cancellation.clone());
+            runtime
+                .supervisor_finished
+                .write()
+                .unwrap()
+                .insert("camera-a".to_string(), old_finished.clone());
+
+            let mut replacement = config(directory.path(), &["camera-a"], false);
+            replacement.global.timeouts.reload_drain_timeout_ms = 0;
+            let crate::config::BackendConfig::Sim(sim) = &mut replacement.instances[0].backend
+            else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.seed = Some(991);
+
+            let error = runtime
+                .apply_reloaded_config(replacement.clone(), BTreeMap::new(), BTreeMap::new())
+                .await
+                .expect_err("a candidate must be vetoed while an old supervisor is unconfirmed");
+            assert_eq!(error.code(), crate::ErrorCode::CameraUnavailable);
+            assert!(old_cancellation.is_cancelled());
+            assert!(
+                runtime
+                    .supervisor_cancellations
+                    .read()
+                    .unwrap()
+                    .get("camera-a")
+                    .is_some_and(CancellationToken::is_cancelled),
+                "timeout must not install a replacement supervisor token"
+            );
+            assert_eq!(
+                runtime.registry.snapshot("camera-a").unwrap().generation,
+                generation_before,
+                "a rejected pre-commit candidate must not advance the runtime registry"
+            );
+            let crate::config::BackendConfig::Sim(sim) =
+                &runtime.config_snapshot().unwrap().instances[0].backend
+            else {
+                panic!("test fixture must use the simulator backend");
+            };
+            assert_eq!(
+                sim.seed, None,
+                "runtime configuration must remain on Core's prior generation"
+            );
+
+            // Once termination is confirmed, a retry may atomically advance the candidate and
+            // only then install its replacement generation.
+            old_finished.cancel();
+            let diff = runtime
+                .apply_reloaded_config(replacement, BTreeMap::new(), BTreeMap::new())
+                .await
+                .expect("a confirmed old-supervisor exit must permit retry");
+            assert_eq!(diff.lifecycle_changed, vec!["camera-a".to_string()]);
+            assert!(
+                !runtime
+                    .supervisor_cancellations
+                    .read()
+                    .unwrap()
+                    .get("camera-a")
+                    .is_some_and(CancellationToken::is_cancelled),
+                "the replacement supervisor starts only after the old completion signal"
+            );
+            let crate::config::BackendConfig::Sim(sim) =
+                &runtime.config_snapshot().unwrap().instances[0].backend
+            else {
+                panic!("test fixture must use the simulator backend");
+            };
+            assert_eq!(sim.seed, Some(991));
+            runtime.shutdown().await;
+        }
+
         #[cfg(not(feature = "genicam"))]
         #[tokio::test]
         async fn supervisor_reports_unavailable_genicam_as_backoff_without_creating_an_actor() {
@@ -7518,7 +8197,7 @@ mod tests {
                 Arc::downgrade(&runtime),
                 {
                     let app_calls = Arc::clone(&app_calls);
-                    Arc::new(move |_instance| {
+                    Arc::new(move |_instance, _config| {
                         app_calls.fetch_add(1, Ordering::AcqRel);
                         Err(edgecommons::EdgeCommonsError::Facade(
                             "controlled application facade failure".to_string(),
@@ -7527,7 +8206,7 @@ mod tests {
                 },
                 {
                     let event_calls = Arc::clone(&event_calls);
-                    Arc::new(move |_instance| {
+                    Arc::new(move |_instance, _config| {
                         event_calls.fetch_add(1, Ordering::AcqRel);
                         Err(edgecommons::EdgeCommonsError::Facade(
                             "controlled events facade failure".to_string(),
@@ -7544,7 +8223,7 @@ mod tests {
                     .expect("core accepts opaque adapter-specific backend configuration"),
             );
             assert!(
-                !listener.on_configuration_change(invalid).await,
+                listener.prepare_configuration_apply(invalid).await.is_err(),
                 "an adapter-invalid core generation must be vetoed without facade construction"
             );
             assert_eq!(app_calls.load(Ordering::Acquire), 0);
@@ -7560,13 +8239,14 @@ mod tests {
             );
 
             assert!(
-                !listener
-                    .on_configuration_change(Arc::new(core_config(
+                listener
+                    .prepare_configuration_apply(Arc::new(core_config(
                         directory.path(),
                         &["camera-a", "camera-b"],
                         false,
                     )))
-                    .await,
+                    .await
+                    .is_err(),
                 "a facade-factory failure must reject the generation before runtime mutation"
             );
             assert_eq!(
@@ -7679,6 +8359,193 @@ mod tests {
 
         #[cfg(all(feature = "standalone", feature = "onvif"))]
         #[tokio::test]
+        async fn capture_lifecycle_events_are_opt_in_and_use_the_event_facade() {
+            let directory = TempDir::new().unwrap();
+            let (port, publishes) = spawn_recording_mqtt_broker().await;
+            let core = facade_core(&directory, port).await;
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            configuration.global.operator_events.capture_lifecycle = true;
+            let runtime = runtime(configuration, &directory).await;
+            runtime.events.write().unwrap().insert(
+                "camera-a".to_string(),
+                core.instance("camera-a").unwrap().events(),
+            );
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "lifecycle-events-enabled".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "lifecycle-events-enabled-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let crate::catalog::AcceptJobOutcome::Inserted(record) = accepted else {
+                panic!("the first lifecycle capture must be newly accepted");
+            };
+            let capture_id = record.capture_id;
+            let terminal = wait_for_terminal(&runtime, &capture_id).await;
+            assert_eq!(terminal.state, crate::model::JobState::Succeeded);
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let lifecycle = loop {
+                let lifecycle = publishes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(topic, _)| {
+                        topic.ends_with("/evt/debug/capture-queued")
+                            || topic.ends_with("/evt/info/capture-started")
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if lifecycle.len() == 2 {
+                    break lifecycle;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "enabled capture lifecycle events were not routed through the event facade"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            let queued = lifecycle
+                .iter()
+                .find(|(topic, _)| topic.ends_with("/evt/debug/capture-queued"))
+                .expect("exactly one queued event must be published");
+            let queued = Message::from_slice(&queued.1).unwrap();
+            assert_eq!(queued.header.name, "evt");
+            assert_eq!(queued.body["severity"], "debug");
+            assert_eq!(queued.body["type"], "capture-queued");
+            assert_eq!(queued.body["context"]["captureId"], capture_id);
+            assert_eq!(queued.body["context"]["trigger"], "command");
+            assert_eq!(queued.body["context"]["captureProfile"], "main");
+            assert_eq!(queued.body["context"]["queuePosition"], 1);
+            let started = lifecycle
+                .iter()
+                .find(|(topic, _)| topic.ends_with("/evt/info/capture-started"))
+                .expect("exactly one started event must be published");
+            let started = Message::from_slice(&started.1).unwrap();
+            assert_eq!(started.header.name, "evt");
+            assert_eq!(started.body["severity"], "info");
+            assert_eq!(started.body["type"], "capture-started");
+            assert_eq!(started.body["context"]["captureId"], capture_id);
+            assert_eq!(started.body["context"]["trigger"], "command");
+            assert_eq!(started.body["context"]["captureProfile"], "main");
+            assert_eq!(started.body["context"]["captureMode"], "simulated");
+
+            let outbox = runtime
+                .catalog
+                .pending_outbox(chrono::Utc::now().timestamp_millis(), 10)
+                .await
+                .unwrap();
+            assert_eq!(outbox.len(), 1);
+            assert_eq!(outbox[0].message_kind, "terminal");
+            assert!(outbox[0].topic.ends_with("/app/image/captured"));
+            runtime.shutdown().await;
+        }
+
+        #[cfg(all(feature = "standalone", feature = "onvif"))]
+        #[tokio::test]
+        async fn disabled_capture_lifecycle_events_do_not_publish_or_change_terminal_delivery() {
+            let directory = TempDir::new().unwrap();
+            let (port, publishes) = spawn_recording_mqtt_broker().await;
+            let core = facade_core(&directory, port).await;
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+            runtime.events.write().unwrap().insert(
+                "camera-a".to_string(),
+                core.instance("camera-a").unwrap().events(),
+            );
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "lifecycle-events-disabled".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "lifecycle-events-disabled-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let crate::catalog::AcceptJobOutcome::Inserted(record) = accepted else {
+                panic!("the first disabled lifecycle capture must be newly accepted");
+            };
+            let terminal = wait_for_terminal(&runtime, &record.capture_id).await;
+            assert_eq!(terminal.state, crate::model::JobState::Succeeded);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                publishes.lock().unwrap().iter().all(|(topic, _)| {
+                    !topic.ends_with("/evt/debug/capture-queued")
+                        && !topic.ends_with("/evt/info/capture-started")
+                }),
+                "disabled lifecycle diagnostics must not publish"
+            );
+            let outbox = runtime
+                .catalog
+                .pending_outbox(chrono::Utc::now().timestamp_millis(), 10)
+                .await
+                .unwrap();
+            assert_eq!(outbox.len(), 1);
+            assert_eq!(outbox[0].message_kind, "terminal");
+            assert!(outbox[0].topic.ends_with("/app/image/captured"));
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn unavailable_lifecycle_event_routing_does_not_change_terminal_capture_outcome() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            configuration.global.operator_events.capture_lifecycle = true;
+            let runtime = runtime(configuration, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "lifecycle-events-unavailable".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "lifecycle-events-unavailable-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let crate::catalog::AcceptJobOutcome::Inserted(record) = accepted else {
+                panic!("the first unavailable lifecycle capture must be newly accepted");
+            };
+            let terminal = wait_for_terminal(&runtime, &record.capture_id).await;
+            assert_eq!(terminal.state, crate::model::JobState::Succeeded);
+            let outbox = runtime
+                .catalog
+                .pending_outbox(chrono::Utc::now().timestamp_millis(), 10)
+                .await
+                .unwrap();
+            assert_eq!(outbox.len(), 1);
+            assert_eq!(outbox[0].message_kind, "terminal");
+            runtime.shutdown().await;
+        }
+
+        #[cfg(all(feature = "standalone", feature = "onvif"))]
+        #[tokio::test]
         async fn reload_adds_and_removes_event_facades_with_the_camera_roster() {
             let directory = TempDir::new().unwrap();
             let (port, _) = spawn_recording_mqtt_broker().await;
@@ -7723,6 +8590,175 @@ mod tests {
             runtime.shutdown().await;
         }
 
+        #[tokio::test]
+        async fn rejected_reload_preflight_keeps_the_prior_supervisor_serving_captures() {
+            let directory = TempDir::new().unwrap();
+            let mut initial = config(directory.path(), &["camera-a"], false);
+            let crate::config::BackendConfig::Sim(sim) = &mut initial.instances[0].backend else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.capture_delay_ms = 1;
+            let runtime = runtime(initial, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+            let generation_before = runtime.registry.snapshot("camera-a").unwrap().generation;
+            let supervisor = runtime
+                .supervisor_cancellations
+                .read()
+                .unwrap()
+                .get("camera-a")
+                .cloned()
+                .expect("the live camera must have a supervisor cancellation token");
+
+            let listener = RuntimeConfigListener::new(
+                Arc::downgrade(&runtime),
+                Arc::new(|_instance, _config| {
+                    Err(edgecommons::EdgeCommonsError::Config(
+                        "test candidate facade construction failure".to_string(),
+                    ))
+                }),
+                Arc::new(|_instance, _config| -> edgecommons::Result<EventsFacade> {
+                    unreachable!("the application facade rejection occurs first")
+                }),
+            );
+            let candidate = Arc::new(core_config(directory.path(), &["camera-a"], false));
+            assert!(
+                listener
+                    .prepare_configuration_apply(candidate)
+                    .await
+                    .is_err(),
+                "a candidate that cannot build its required facades must be rejected before Core commits it"
+            );
+            assert!(
+                !supervisor.is_cancelled(),
+                "a rejected preflight must not cancel the previous service generation"
+            );
+            assert_eq!(
+                runtime.registry.snapshot("camera-a").unwrap().generation,
+                generation_before,
+                "a rejected preflight must not advance the prior runtime generation"
+            );
+
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "rejected-reload-still-serves".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "rejected-reload-still-serves-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .expect("the prior service must continue accepting captures after rejection");
+            let crate::catalog::AcceptJobOutcome::Inserted(record) = accepted else {
+                panic!("the first capture after a rejected reload must be newly accepted");
+            };
+            assert_eq!(
+                wait_for_terminal(&runtime, &record.capture_id).await.state,
+                crate::model::JobState::Succeeded,
+                "the prior service must also complete captures after rejection"
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn failed_reload_transition_restores_prior_config_and_capture_service() {
+            let directory = TempDir::new().unwrap();
+            let mut initial = config(directory.path(), &["camera-a"], false);
+            let crate::config::BackendConfig::Sim(sim) = &mut initial.instances[0].backend else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.capture_delay_ms = 1;
+            let runtime = runtime(initial, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+            let retired_supervisor = runtime
+                .supervisor_cancellations
+                .read()
+                .unwrap()
+                .get("camera-a")
+                .cloned()
+                .expect("the initial runtime must have a supervisor token");
+
+            let mut replacement = config(directory.path(), &["camera-a"], false);
+            let crate::config::BackendConfig::Sim(sim) = &mut replacement.instances[0].backend
+            else {
+                panic!("test fixture must use the simulator backend");
+            };
+            sim.seed = Some(712);
+            let checkpoint = runtime.reload_checkpoint().unwrap();
+            runtime
+                .fail_next_reload_after_supervisor_retirement
+                .store(true, Ordering::Release);
+            let mut transaction = RuntimeReloadTransaction {
+                runtime: Arc::clone(&runtime),
+                replacement,
+                apps: BTreeMap::new(),
+                events: BTreeMap::new(),
+                checkpoint: Some(checkpoint),
+            };
+
+            assert!(
+                transaction.commit().await.is_err(),
+                "the controlled post-retirement transition failure must reject the candidate"
+            );
+            // Core calls rollback after any failed commit. It is intentionally idempotent because
+            // commit performed the restoration before returning its error.
+            transaction.rollback().await.unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+            let crate::config::BackendConfig::Sim(sim) =
+                &runtime.config_snapshot().unwrap().instances[0].backend
+            else {
+                panic!("test fixture must use the simulator backend");
+            };
+            assert_eq!(
+                sim.seed, None,
+                "the prior runtime configuration must be restored"
+            );
+            assert!(
+                retired_supervisor.is_cancelled(),
+                "rollback must retire the failed candidate's predecessor before installing a fresh prior supervisor"
+            );
+            assert!(
+                !runtime
+                    .supervisor_cancellations
+                    .read()
+                    .unwrap()
+                    .get("camera-a")
+                    .is_some_and(CancellationToken::is_cancelled),
+                "rollback must install a live prior-config supervisor rather than revive a cancelled actor"
+            );
+
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "failed-transition-restored-service".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "failed-transition-restored-service-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .expect("the restored prior service must accept captures");
+            let crate::catalog::AcceptJobOutcome::Inserted(record) = accepted else {
+                panic!("the first capture after rollback must be newly accepted");
+            };
+            assert_eq!(
+                wait_for_terminal(&runtime, &record.capture_id).await.state,
+                crate::model::JobState::Succeeded,
+                "the restored prior service must complete captures"
+            );
+            runtime.shutdown().await;
+        }
+
         #[cfg(all(feature = "standalone", feature = "onvif"))]
         #[tokio::test]
         async fn runtime_config_listener_refreshes_retained_facades_and_applies_roster_and_session_changes()
@@ -7749,30 +8785,35 @@ mod tests {
                 {
                     let core = Arc::clone(&core);
                     let app_calls = Arc::clone(&app_calls);
-                    Arc::new(move |instance| {
+                    Arc::new(move |instance, config| {
                         app_calls.lock().unwrap().push(instance.to_string());
-                        Ok(Arc::new(core.instance(instance)?.app()))
+                        Ok(Arc::new(
+                            core.instance_from_config_snapshot(instance, config)?.app(),
+                        ))
                     })
                 },
                 {
                     let core = Arc::clone(&core);
                     let event_calls = Arc::clone(&event_calls);
-                    Arc::new(move |instance| {
+                    Arc::new(move |instance, config| {
                         event_calls.lock().unwrap().push(instance.to_string());
-                        Ok(core.instance(instance)?.events())
+                        Ok(core
+                            .instance_from_config_snapshot(instance, config)?
+                            .events())
                     })
                 },
             );
 
-            assert!(
-                listener
-                    .on_configuration_change(Arc::new(core_config(
-                        directory.path(),
-                        &["camera-a", "camera-c"],
-                        false,
-                    )))
-                    .await
-            );
+            let roster_candidate = Arc::new(core_config(
+                directory.path(),
+                &["camera-a", "camera-c"],
+                false,
+            ));
+            let mut roster_transaction = listener
+                .prepare_configuration_apply(roster_candidate)
+                .await
+                .unwrap();
+            roster_transaction.commit().await.unwrap();
             assert_eq!(
                 runtime.registry.ids().unwrap(),
                 vec!["camera-a".to_string(), "camera-c".to_string()]
@@ -7801,13 +8842,13 @@ mod tests {
             let mut session_replacement =
                 core_config_value(directory.path(), &["camera-a", "camera-c"], false);
             session_replacement["component"]["instances"][0]["backend"]["seed"] = json!(919);
-            assert!(
-                listener
-                    .on_configuration_change(Arc::new(
-                        Config::from_value(COMPONENT_NAME, "gw-01", session_replacement).unwrap(),
-                    ))
-                    .await
-            );
+            let session_candidate =
+                Arc::new(Config::from_value(COMPONENT_NAME, "gw-01", session_replacement).unwrap());
+            let mut session_transaction = listener
+                .prepare_configuration_apply(session_candidate)
+                .await
+                .unwrap();
+            session_transaction.commit().await.unwrap();
             assert_eq!(
                 app_calls.lock().unwrap().as_slice(),
                 ["camera-a", "camera-c", "camera-a", "camera-c"],
@@ -8417,7 +9458,6 @@ mod tests {
             runtime.shutdown().await;
         }
 
-        #[cfg(all(feature = "standalone", feature = "onvif"))]
         #[tokio::test]
         async fn runtime_startup_router_and_deferred_capture_flows_use_real_core_facades() {
             let directory = TempDir::new().unwrap();

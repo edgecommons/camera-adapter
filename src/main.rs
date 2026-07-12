@@ -109,17 +109,24 @@ async fn main() -> anyhow::Result<()> {
     router.install(runtime.clone())?;
     let app_factory = {
         let gg = Arc::clone(&gg);
-        Arc::new(move |instance: &str| gg.instance(instance).map(|handle| Arc::new(handle.app())))
+        Arc::new(move |instance: &str, config| {
+            gg.instance_from_config_snapshot(instance, config)
+                .map(|handle| Arc::new(handle.app()))
+        })
     };
     let events_factory = {
         let gg = Arc::clone(&gg);
-        Arc::new(move |instance: &str| gg.instance(instance).map(|handle| handle.events()))
+        Arc::new(move |instance: &str, config| {
+            gg.instance_from_config_snapshot(instance, config)
+                .map(|handle| handle.events())
+        })
     };
-    gg.add_config_change_listener(Arc::new(RuntimeConfigListener::new(
+    let runtime_config_listener = Arc::new(RuntimeConfigListener::new(
         Arc::downgrade(&runtime),
         app_factory,
         events_factory,
-    )));
+    ));
+    gg.add_config_apply_listener(runtime_config_listener)?;
     readiness.complete_startup();
     tracing::info!("camera-adapter runtime installed and ready");
     gg.shutdown_signal().await;

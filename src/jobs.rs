@@ -105,8 +105,9 @@ pub struct JobSubmission {
 
 /// Reservation for one actor descriptor slot.
 pub trait DispatchReservation: Send {
-    /// Makes a durably queued descriptor visible to the actor.
-    fn commit(self: Box<Self>, descriptor: CaptureDescriptor) -> Result<()>;
+    /// Makes a durably queued descriptor visible to the actor and returns a bounded, one-based
+    /// queue-position snapshot taken at commitment.
+    fn commit(self: Box<Self>, descriptor: CaptureDescriptor) -> Result<usize>;
 }
 
 /// Bounded actor-dispatch seam used before the first catalog commit.
@@ -150,6 +151,24 @@ impl TerminalEnvelopeEncoder for AppTerminalEnvelopeEncoder {
 /// Post-commit integration hooks. Implementations must be idempotent by waiter/member identity.
 #[async_trait]
 pub trait JobHooks: Send + Sync {
+    /// Observes a capture after durable queueing and dispatcher commitment both succeeded.
+    ///
+    /// Implementations are diagnostic only: an observation failure must never alter the accepted
+    /// capture's durable state or prevent its actor from running.
+    async fn capture_queued(
+        &self,
+        _record: &JobRecord,
+        _spec: &CaptureJobSpec,
+        _queue_position: usize,
+    ) {
+    }
+
+    /// Observes a capture after it durably enters `ACQUIRING`.
+    ///
+    /// Implementations are diagnostic only: an observation failure must never alter the durable
+    /// capture outcome.
+    async fn capture_started(&self, _spec: &CaptureJobSpec) {}
+
     /// Settles active deferred waiters after the durable terminal transaction wins.
     async fn settle_waiters(&self, _record: &JobRecord, _terminal_body: &Value) {}
 
@@ -449,17 +468,23 @@ impl JobEngine {
             runtime: Arc::clone(&runtime),
             priority: submission.priority,
         };
-        if let Err(error) = reservation.commit(descriptor) {
-            let _ = self
-                .finish_failure(
-                    &runtime,
-                    ErrorCode::QueueFull,
-                    "durably queued job could not enter its reserved actor slot",
-                )
-                .await;
-            return Err(error);
-        }
-        self.spawn_terminal_deadline(runtime);
+        let queue_position = match reservation.commit(descriptor) {
+            Ok(position) => position,
+            Err(error) => {
+                let _ = self
+                    .finish_failure(
+                        &runtime,
+                        ErrorCode::QueueFull,
+                        "durably queued job could not enter its reserved actor slot",
+                    )
+                    .await;
+                return Err(error);
+            }
+        };
+        self.spawn_terminal_deadline(Arc::clone(&runtime));
+        self.hooks
+            .capture_queued(&queued, runtime.spec.as_ref(), queue_position)
+            .await;
         Ok(AcceptJobOutcome::Inserted(queued))
     }
 
@@ -535,17 +560,23 @@ impl JobEngine {
             runtime: Arc::clone(&runtime),
             priority: submission.priority,
         };
-        if let Err(error) = reservation.commit(descriptor) {
-            let _ = self
-                .finish_failure(
-                    &runtime,
-                    ErrorCode::QueueFull,
-                    "durably queued group job could not enter its reserved actor slot",
-                )
-                .await;
-            return Err(error);
-        }
-        self.spawn_terminal_deadline(runtime);
+        let queue_position = match reservation.commit(descriptor) {
+            Ok(position) => position,
+            Err(error) => {
+                let _ = self
+                    .finish_failure(
+                        &runtime,
+                        ErrorCode::QueueFull,
+                        "durably queued group job could not enter its reserved actor slot",
+                    )
+                    .await;
+                return Err(error);
+            }
+        };
+        self.spawn_terminal_deadline(Arc::clone(&runtime));
+        self.hooks
+            .capture_queued(&queued, runtime.spec.as_ref(), queue_position)
+            .await;
         Ok(queued)
     }
 
@@ -903,9 +934,12 @@ impl JobEngine {
             .await?
         {
             StateCasOutcome::Changed(_) => {
-                let mut trace = lock(&runtime.trace);
-                trace.stage = JobStage::Acquiring;
-                trace.acquisition_started_at_ms = Some(now_ms());
+                {
+                    let mut trace = lock(&runtime.trace);
+                    trace.stage = JobStage::Acquiring;
+                    trace.acquisition_started_at_ms = Some(now_ms());
+                }
+                self.hooks.capture_started(runtime.spec.as_ref()).await;
             }
             StateCasOutcome::NotChanged(record) if record.state.is_terminal() => {
                 self.complete_runtime(&runtime);
@@ -1120,7 +1154,10 @@ impl JobEngine {
             return Ok(());
         }
         let mut status_available = true;
-        let moving = match session.ptz(PtzRequest::Status).await {
+        let moving = match self
+            .capture_interlock_ptz(session, runtime, PtzRequest::Status)
+            .await
+        {
             Ok(PtzResult::Status(status)) => status.moving.unwrap_or(false),
             Ok(_) => {
                 return Err(CameraError::rejected(
@@ -1147,12 +1184,16 @@ impl JobEngine {
         if !moving && status_available {
             return Ok(());
         }
-        match session
-            .ptz(PtzRequest::Stop {
-                pan: true,
-                tilt: true,
-                zoom: true,
-            })
+        match self
+            .capture_interlock_ptz(
+                session,
+                runtime,
+                PtzRequest::Stop {
+                    pan: true,
+                    tilt: true,
+                    zoom: true,
+                },
+            )
             .await?
         {
             PtzResult::Commanded => {}
@@ -1172,9 +1213,23 @@ impl JobEngine {
                         "camera did not become idle before capture deadline",
                     ));
                 }
-                match session.ptz(PtzRequest::Status).await? {
+                match self
+                    .capture_interlock_ptz(session, runtime, PtzRequest::Status)
+                    .await?
+                {
                     PtzResult::Status(status) if status.moving != Some(true) => break,
-                    PtzResult::Status(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    PtzResult::Status(_) => {
+                        self.await_with_deadline(
+                            runtime.spec.deadlines.capture_at_ms,
+                            &runtime.cancellation,
+                            async {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                Ok(())
+                            },
+                            "PTZ interlock",
+                        )
+                        .await?;
+                    }
                     _ => {
                         return Err(CameraError::rejected(
                             ErrorCode::CameraMoving,
@@ -1184,8 +1239,35 @@ impl JobEngine {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(runtime.spec.profile.settle_ms)).await;
-        Ok(())
+        self.await_with_deadline(
+            runtime.spec.deadlines.capture_at_ms,
+            &runtime.cancellation,
+            async {
+                tokio::time::sleep(Duration::from_millis(runtime.spec.profile.settle_ms)).await;
+                Ok(())
+            },
+            "PTZ settle",
+        )
+        .await
+    }
+
+    async fn capture_interlock_ptz(
+        &self,
+        session: &mut dyn CameraSession,
+        runtime: &Arc<JobRuntime>,
+        request: PtzRequest,
+    ) -> Result<PtzResult> {
+        let deadline = instant_for_epoch(runtime.spec.deadlines.capture_at_ms);
+        match session
+            .ptz_bounded(request, deadline, &runtime.cancellation)
+            .await
+        {
+            Err(error) if error.code() == ErrorCode::PtzTimeout => Err(CameraError::rejected(
+                ErrorCode::CameraMoving,
+                "PTZ operation did not complete before the capture deadline",
+            )),
+            result => result,
+        }
     }
 
     /// Converts a caught actor/session panic into one durable terminal failure.
@@ -1692,6 +1774,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
     use bytes::Bytes;
     use edgecommons::messaging::MessageBuilder;
     use serde_json::json;
@@ -1699,12 +1784,101 @@ mod tests {
 
     use super::*;
     use crate::admission::FilesystemSpaceProbe;
+    use crate::backend::{CameraSession, CameraStatus, CaptureRequest};
     use crate::catalog::{CatalogOptions, LedgerKey};
     use crate::config::ProfileOutputConfig;
     use crate::idempotency::RequestHash;
     use crate::messages::TERMINAL_ENVELOPE_VERSION;
     use crate::model::OutputEncoding;
     use crate::storage::StorageRoot;
+
+    fn test_capabilities() -> crate::model::CameraCapabilities {
+        crate::model::CameraCapabilities {
+            capture_modes: vec![CaptureMode::Simulated],
+            pixel_formats: vec![PixelFormat::Rgb8],
+            software_trigger: false,
+            snapshot_uri: false,
+            rtsp: false,
+            ptz: true,
+            ptz_status: true,
+            presets: false,
+            preset_mutation: false,
+            vendor: None,
+            model: None,
+            firmware: None,
+            serial: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    struct HungPtzSession {
+        capabilities: crate::model::CameraCapabilities,
+        calls: Arc<Mutex<Vec<PtzRequest>>>,
+    }
+
+    #[async_trait]
+    impl CameraSession for HungPtzSession {
+        fn capabilities(&self) -> &crate::model::CameraCapabilities {
+            &self.capabilities
+        }
+
+        async fn status(&mut self) -> Result<CameraStatus> {
+            unreachable!("the interlock issues PTZ status directly")
+        }
+
+        async fn capture(&mut self, _request: CaptureRequest) -> Result<CaptureFrame> {
+            unreachable!("the interlock must finish before capture")
+        }
+
+        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
+            lock(&self.calls).push(request);
+            std::future::pending().await
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct StopAcknowledgementSession {
+        capabilities: crate::model::CameraCapabilities,
+        calls: Arc<Mutex<Vec<PtzRequest>>>,
+        stop_seen: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl CameraSession for StopAcknowledgementSession {
+        fn capabilities(&self) -> &crate::model::CameraCapabilities {
+            &self.capabilities
+        }
+
+        async fn status(&mut self) -> Result<CameraStatus> {
+            unreachable!("the interlock issues PTZ status directly")
+        }
+
+        async fn capture(&mut self, _request: CaptureRequest) -> Result<CaptureFrame> {
+            unreachable!("the interlock must finish before capture")
+        }
+
+        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
+            lock(&self.calls).push(request.clone());
+            match request {
+                PtzRequest::Status => Err(CameraError::rejected(
+                    ErrorCode::UnsupportedCapability,
+                    "test camera has no PTZ status capability",
+                )),
+                PtzRequest::Stop { .. } => {
+                    self.stop_seen.store(true, Ordering::Release);
+                    Ok(PtzResult::Commanded)
+                }
+                _ => unreachable!("the interlock only reads status and stops"),
+            }
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
 
     fn profile() -> CaptureProfile {
         CaptureProfile {
@@ -1828,15 +2002,16 @@ mod tests {
     }
 
     impl DispatchReservation for RecordingReservation {
-        fn commit(self: Box<Self>, descriptor: CaptureDescriptor) -> Result<()> {
+        fn commit(self: Box<Self>, descriptor: CaptureDescriptor) -> Result<usize> {
             if self.fail_commit {
                 return Err(CameraError::rejected(
                     ErrorCode::QueueFull,
                     "test actor queue rejected descriptor",
                 ));
             }
-            lock(&self.descriptors).push(descriptor);
-            Ok(())
+            let mut descriptors = lock(&self.descriptors);
+            descriptors.push(descriptor);
+            Ok(descriptors.len())
         }
     }
 
@@ -1943,6 +2118,19 @@ mod tests {
         })
     }
 
+    fn stop_and_settle_runtime(
+        capture_deadline_after: Duration,
+        settle_ms: u64,
+    ) -> Arc<JobRuntime> {
+        let now = now_ms();
+        let mut submission = command_submission("cap-interlock", now);
+        submission.spec.profile.capture_interlock = CaptureInterlock::StopAndSettle;
+        submission.spec.profile.settle_ms = settle_ms;
+        submission.spec.deadlines.capture_at_ms = now
+            + i64::try_from(capture_deadline_after.as_millis()).expect("test deadline fits i64");
+        runtime_from(submission.spec)
+    }
+
     fn artifact(capture_id: &str) -> ImageArtifact {
         ImageArtifact {
             absolute_path: format!("/captures/camera-a/{capture_id}.jpg"),
@@ -1954,6 +2142,100 @@ mod tests {
             sha256: "ab".repeat(32),
             metadata_sidecar_relative_path: Some(format!("camera-a/{capture_id}.jpg.json")),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_and_settle_bounds_a_hung_ptz_status_by_the_capture_deadline() {
+        let (engine, _directory) = engine().await;
+        let runtime = stop_and_settle_runtime(Duration::from_millis(100), 0);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut session = HungPtzSession {
+            capabilities: test_capabilities(),
+            calls: Arc::clone(&calls),
+        };
+        let task = tokio::spawn({
+            let engine = engine.clone();
+            let runtime = Arc::clone(&runtime);
+            async move {
+                engine
+                    .enforce_capture_interlock(&mut session, &runtime)
+                    .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(matches!(lock(&calls).as_slice(), [PtzRequest::Status]));
+        tokio::time::advance(Duration::from_millis(101)).await;
+        let error = task
+            .await
+            .expect("interlock task must not panic")
+            .expect_err("hung PTZ status must not outlive the capture deadline");
+        assert_eq!(error.code(), ErrorCode::CameraMoving);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_and_settle_cancels_a_hung_ptz_status_without_waiting_for_its_deadline() {
+        let (engine, _directory) = engine().await;
+        let runtime = stop_and_settle_runtime(Duration::from_secs(10), 0);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut session = HungPtzSession {
+            capabilities: test_capabilities(),
+            calls: Arc::clone(&calls),
+        };
+        let task = tokio::spawn({
+            let engine = engine.clone();
+            let runtime = Arc::clone(&runtime);
+            async move {
+                engine
+                    .enforce_capture_interlock(&mut session, &runtime)
+                    .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(matches!(lock(&calls).as_slice(), [PtzRequest::Status]));
+        runtime.cancellation.cancel();
+        let error = task
+            .await
+            .expect("interlock task must not panic")
+            .expect_err("cancelled interlock must stop waiting for PTZ status");
+        assert_eq!(error.code(), ErrorCode::CaptureCancelled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_and_settle_bounds_the_post_stop_settle_delay_by_the_capture_deadline() {
+        let (engine, _directory) = engine().await;
+        let runtime = stop_and_settle_runtime(Duration::from_millis(100), 200);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let stop_seen = Arc::new(AtomicBool::new(false));
+        let mut session = StopAcknowledgementSession {
+            capabilities: test_capabilities(),
+            calls: Arc::clone(&calls),
+            stop_seen: Arc::clone(&stop_seen),
+        };
+        let task = tokio::spawn({
+            let engine = engine.clone();
+            let runtime = Arc::clone(&runtime);
+            async move {
+                engine
+                    .enforce_capture_interlock(&mut session, &runtime)
+                    .await
+            }
+        });
+
+        while !stop_seen.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(101)).await;
+        let error = task
+            .await
+            .expect("interlock task must not panic")
+            .expect_err("settle delay must not outlive the capture deadline");
+        assert_eq!(error.code(), ErrorCode::CaptureTimeout);
+        assert!(matches!(
+            lock(&calls).as_slice(),
+            [PtzRequest::Status, PtzRequest::Stop { .. }]
+        ));
     }
 
     #[tokio::test]

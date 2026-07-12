@@ -169,5 +169,14 @@ curl --fail http://127.0.0.1:18081/readyz
 ```
 
 It uses an isolated no-auth ONVIF fixture, a pinned EMQX image, an initialized named data volume,
-and a loopback-only health port. It is an acceptance harness, not a camera or credential deployment
-recipe. See [the simulator README](../../simulators/README.md) for protocol and native test commands.
+and loopback-only health and MQTT ports. It is an acceptance harness, not a camera or credential
+deployment recipe. Exercise a real MQTT command/reply capture after the stack is healthy:
+
+```bash
+CAMERA_ADAPTER_DOCKER_E2E=1 \
+CAMERA_ADAPTER_DOCKER_E2E_HOST=127.0.0.1 \
+CAMERA_ADAPTER_DOCKER_E2E_PORT=1884 \
+cargo test --locked --no-default-features --features standalone --test docker_capture_submit
+```
+
+See [the simulator README](../../simulators/README.md) for protocol and native test commands.
