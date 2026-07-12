@@ -223,6 +223,10 @@ samples = value.get("resourceSamples")
 require(isinstance(samples, list), "resourceSamples")
 phases = {sample.get("phase") for sample in samples if isinstance(sample, dict)}
 require({"soak-roster-online", "soak-complete"}.issubset(phases), "resourceSamples phases")
+complete = [sample for sample in samples if isinstance(sample, dict) and sample.get("phase") == "soak-complete"]
+require(len(complete) == 1, "resourceSamples soak-complete count")
+require(complete[0].get("onlineCameras") == 256, "resourceSamples soak-complete online cameras")
+require(complete[0].get("liveActorCount") == 256, "resourceSamples soak-complete live actors")
 latency = value.get("commandLatency")
 require(isinstance(latency, dict), "commandLatency")
 for verb in ("sb/list", "sb/status", "sb/ptz-stop"):

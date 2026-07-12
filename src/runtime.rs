@@ -11014,6 +11014,11 @@ mod tests {
                     reloads = reloads.saturating_add(1);
                 }
             }
+            // The final workload tick can deliberately request a reconnect.  Do not label the
+            // smoke complete until that bounded lifecycle transition has converged back to the
+            // full configured roster; otherwise the final report would confuse an in-progress
+            // reconnect with lost capacity.
+            let _ = wait_for_capacity_roster(&runtime).await;
             samples.push(capacity_sample(&runtime, "soak-complete", started));
             let mut scheduled_jobs_by_camera = BTreeMap::new();
             for instance in instance_ids.iter().take(8) {
