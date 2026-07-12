@@ -9,6 +9,7 @@ FROM ${ARAVIS_RUNTIME_IMAGE}
 
 ARG CARGO_LLVM_COV_VERSION=0.8.7
 ARG LLVM_COV_TOOLCHAIN=1.87.0
+ARG GREENGRASS_TOOLCHAIN=1.90.0
 
 USER root
 COPY --from=rust /usr/local/cargo /usr/local/cargo
@@ -25,6 +26,7 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
     && apt-get install -y --no-install-recommends build-essential libglib2.0-dev libusb-1.0-0-dev libxml2-dev pkg-config \
     && rm -rf /var/lib/apt/lists/* \
     && rustup toolchain install "${LLVM_COV_TOOLCHAIN}" --profile minimal --component llvm-tools-preview \
+    && rustup toolchain install "${GREENGRASS_TOOLCHAIN}" --profile minimal \
     && cargo +"${LLVM_COV_TOOLCHAIN}" install --locked cargo-llvm-cov --version "${CARGO_LLVM_COV_VERSION}"
 
 ENV PATH=/usr/local/cargo/bin:$PATH \
