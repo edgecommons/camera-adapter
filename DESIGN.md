@@ -2236,7 +2236,14 @@ versioned benchmark baseline.
 
 ### 23.6 Physical camera compatibility matrix
 
-Before general release, validate at least:
+**Project validation decision — 2026-07-12.** The project owner has waived physical-camera tests because
+no camera hardware is available. This removes the following matrix from this project's completion gates,
+but does not permit any claim of compatibility with a camera model, firmware, NIC, USB topology, encoder,
+optics, exposure behavior, sensor noise, lens distortion, or device timing. The compatibility register
+must record the waiver and preserve the excluded claims. A future hardware-certified release must restore
+and complete this matrix.
+
+For a hardware-certified release, validate at least:
 
 - two GigE Vision models from different vendors;
 - two USB3 Vision models from different vendors;
@@ -2248,7 +2255,8 @@ Before general release, validate at least:
 - simultaneous capture on a representative NIC and USB topology.
 
 For each model, record firmware, protocol/profile version, working selector, capabilities, formats,
-known quirks, required network settings, and pass/fail evidence. Simulator green does not waive this matrix.
+known quirks, required network settings, and pass/fail evidence. Simulator green does not establish this
+matrix.
 
 ### 23.7 Platform validation matrix
 
@@ -2271,7 +2279,8 @@ A phase is not complete based only on unit tests. The review record must include
 - simulator configurations;
 - sample request, reply, terminal-application, and operator-event envelopes;
 - image checksum and file metadata evidence;
-- physical camera model/firmware results where required;
+- the recorded physical-camera waiver and excluded compatibility claims, or model/firmware results for a
+  hardware-certified release;
 - resource graphs for scale tests;
 - Greengrass and Kubernetes deployment evidence;
 - explicit gaps when a required lab path could not run.
@@ -2283,9 +2292,9 @@ A phase is not complete based only on unit tests. The review record must include
 | P0 — dependency and capacity spike | Rust skeleton; Aravis and GStreamer packaging; ONVIF client approach; SimBackend; SQLite; Windows feasibility; baseline memory/threads | Native stacks capture one frame; SimBackend proves 256 sessions; dependencies and supported OS matrix approved. |
 | P1 — core messaging plumbing | Four-language deferred commands, correlated application messages, and acknowledgement-capable publish | Unit coverage, local 4×4 MQTT interop including PUBACK behavior, deployed 4-language Greengrass IPC interop; four-language skeletons and CLI component templates updated, compiled, and scaffold→build regression-tested against the new APIs; core docs-site developer guide and per-subsystem reference pages updated. |
 | P2 — common engine | Config, catalog/outbox, admission, schedules, storage, command/message surface, SimBackend | Complete contract green against simulator and EMQX; crash checkpoints and 90% coverage. |
-| P3 — ONVIF snapshot and PTZ | ONVIF discovery/services/auth, snapshot capture, PTZ/presets, simulator | Full ONVIF simulator suite, one physical ONVIF/PTZ camera, security tests. |
-| P4 — GenICam/Aravis | GigE Vision and USB3 Vision, feature profiles, buffer acquisition, formats | Aravis simulator, packet-fault tests, two-vendor GigE and USB hardware matrix. |
-| P5 — RTSP capture | GStreamer frame extraction and ONVIF fallback | RTSP simulator, codec/fault suite, physical fallback camera. |
+| P3 — ONVIF snapshot and PTZ | ONVIF discovery/services/auth, snapshot capture, PTZ/presets, simulator | Full ONVIF simulator suite and security tests; physical ONVIF/PTZ compatibility is explicitly waived for this project. |
+| P4 — GenICam/Aravis | GigE Vision and USB3 Vision, feature profiles, buffer acquisition, formats | Aravis simulator and packet-fault tests; vendor hardware compatibility is explicitly waived for this project. |
+| P5 — RTSP capture | GStreamer frame extraction and ONVIF fallback | RTSP simulator and codec/fault suite; physical fallback-camera compatibility is explicitly waived for this project. |
 | P6 — deployments and system validation | Greengrass, Kubernetes, file-replicator and bottling-company integration, scale/soak | All platform gates, 24-hour fleet soak, docs and registry ready. |
 | P7 — general release | Compatibility register, security review, operational docs, registry status change | No unresolved blocking findings; release checklist signed off. |
 
@@ -2333,7 +2342,7 @@ Reviewers should explicitly decide:
 - [ ] Event types and at-least-once semantics are sufficient.
 - [ ] ONVIF snapshot timing semantics and RTSP fallback are described truthfully.
 - [ ] Storage, URI, credential, and PTZ security controls are adequate.
-- [ ] Simulator, physical-camera, Greengrass, Kubernetes, scale, and soak gates are sufficient.
+- [ ] Simulator, waived-physical, Greengrass, Kubernetes, scale, and soak gates are sufficient.
 - [ ] Tier-1 Linux and conditional Windows support are acceptable for v1.
 - [ ] Phase ordering is acceptable.
 
@@ -2348,7 +2357,8 @@ Reviewers should explicitly decide:
 5. Is Linux-only Tier-1 support acceptable for GenICam v1, with Windows HOST support staged after the
    native packaging spike?
 6. Should PTZ preset mutation stay disabled by default as proposed?
-7. Which physical camera models are available for the mandatory compatibility matrix?
+7. Physical-camera validation is waived for this project because no hardware is available; a future
+   hardware-certified release must select models for the compatibility matrix.
 8. Command addressing: should the org retire the approved-but-unshipped Phase 5 per-instance
    `cmd/sb/*` addressing (`core/docs/SOUTHBOUND.md` §2.2) in favor of the shipped
    `main`-inbox-plus-body-`instance` pattern this design uses, or must this adapter adopt per-instance

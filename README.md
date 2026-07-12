@@ -10,9 +10,9 @@ disk rather than sent over MQTT or Greengrass IPC.
 The component has a functional durable startup path, command-router startup gate, SQLite-backed
 catalog/outbox, deterministic simulated backend, ONVIF snapshot/RTSP backend, and an optional
 Linux GenICam/Aravis backend. It is **not a general-release component yet**: platform soak,
-physical-camera, Greengrass, Kubernetes, file-replicator, and full command/reload acceptance gates
-remain release requirements. The component must not be represented as hardware-certified based on
-the simulator results.
+Greengrass, Kubernetes, file-replicator, native-feature coverage, and full command/reload acceptance gates
+remain release requirements. Physical-camera validation is waived for this project because no hardware is
+available; the component must not be represented as hardware-certified based on simulator results.
 
 Configured output and state roots are monitored against the output free-space floors. A low or
 unreadable root raises the stateful critical `storage-low` alarm and rejects new captures with
@@ -38,7 +38,7 @@ Feature choices are explicit:
 # ONVIF plus native GStreamer RTSP capture (Linux native dependencies required)
 cargo build --locked --release --no-default-features --features standalone,onvif,rtsp
 
-# Linux Aravis GenICam support (Aravis 0.8.25 or newer required)
+# Linux Aravis GenICam support (Aravis 0.8.36 or newer required)
 cargo build --locked --release --no-default-features --features standalone,onvif,genicam
 ```
 

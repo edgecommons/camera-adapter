@@ -20,30 +20,30 @@ host/L2 networking. A Docker bridge/NAT success is not multicast or L2 discovery
 
 ## Physical camera register
 
-No physical camera model is recorded as passing in this repository. Required model classes remain
-`NOT RUN — HARDWARE UNAVAILABLE` until the release register captures model, firmware, selector,
-network/USB settings, format, capability, and result.
+The project owner has explicitly waived physical-camera testing because no hardware is available. No
+physical camera model is recorded as passing, and this waiver does not authorize a claim of compatibility
+with any model, firmware, NIC, USB topology, encoder, or device timing.
 
 | Required class | Status | Release claim permitted |
 |---|---|---|
-| Two GigE Vision vendor families | NOT RUN — HARDWARE UNAVAILABLE | None |
-| Two USB3 Vision vendor families | NOT RUN — HARDWARE UNAVAILABLE | None |
-| Two ONVIF Profile S/T vendor families | NOT RUN — HARDWARE UNAVAILABLE | None |
-| ONVIF PTZ camera (all operations/presets) | NOT RUN — HARDWARE UNAVAILABLE | None |
-| HTTPS/Digest ONVIF camera | NOT RUN — HARDWARE UNAVAILABLE | None |
-| ONVIF camera requiring RTSP fallback | NOT RUN — HARDWARE UNAVAILABLE | None |
-| High-resolution and supported pixel-format matrix | NOT RUN — HARDWARE UNAVAILABLE | None |
+| Two GigE Vision vendor families | WAIVED — NO HARDWARE AVAILABLE | None |
+| Two USB3 Vision vendor families | WAIVED — NO HARDWARE AVAILABLE | None |
+| Two ONVIF Profile S/T vendor families | WAIVED — NO HARDWARE AVAILABLE | None |
+| ONVIF PTZ camera (all operations/presets) | WAIVED — NO HARDWARE AVAILABLE | None |
+| HTTPS/Digest ONVIF camera | WAIVED — NO HARDWARE AVAILABLE | None |
+| ONVIF camera requiring RTSP fallback | WAIVED — NO HARDWARE AVAILABLE | None |
+| High-resolution and supported pixel-format matrix | WAIVED — NO HARDWARE AVAILABLE | None |
 
 ## Platform evidence status
 
 | Path | Current checked-in artifact | Validation status |
 |---|---|---|
-| HOST/Linux | Dockerfile, service guidance, native simulator stack | Simulator/native gates exist; scale/soak and physical camera gates remain required |
+| HOST/Linux | Dockerfile, service guidance, native simulator stack | Simulator/native gates exist; scale/soak remains required. Physical camera evidence is waived, with no hardware compatibility claim. |
 | HOST/Windows | ProgramData state path plus portable output profile and deployment ACL guidance | Unit tests cover the portable no-overwrite persistence profile; end-to-end service and hardware gates are not recorded, and it does not claim Linux hostile-local-actor containment |
 | Greengrass | Recipe template and IPC policy | Deployment/IPC hardware gate not recorded |
 | Kubernetes | ConfigMap, RWO PVC, single-replica Deployment template | kind and hardware-cluster gates not recorded |
 | Full system | No camera entry in the bottling-company harness yet | Not run |
 
 Before promotion, attach immutable command logs, image digests/package versions, test and coverage
-results, representative terminal envelopes, capture checksums/metadata, resource/soak graphs, and
-the physical-camera entries to the release record.
+results, representative terminal envelopes, capture checksums/metadata, resource/soak graphs, and the
+physical-camera waiver with its excluded claims to the release record.

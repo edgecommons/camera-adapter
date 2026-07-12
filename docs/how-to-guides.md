@@ -54,7 +54,7 @@ NAT as proof of GigE multicast discovery or UDP acquisition.
 Choose `captureMode: "snapshot-uri"` for normal ONVIF snapshots. Set `rtspFallback: true` to permit a
 safe RTSP fallback from that path, or use `captureMode: "rtsp-frame"` to require RTSP extraction. In each
 case, allow only explicit safe URI hosts and package the matching GStreamer runtime. The native RTSP feature
-has simulator evidence; physical encoder compatibility remains a release gate.
+has simulator evidence; physical encoder compatibility is waived for this project and is not claimed.
 
 ## Hand completed files to file-replicator
 

@@ -7,7 +7,7 @@ processes against the same `state.directory` or the same physical camera.
 
 Linux x86_64 and aarch64 are the Tier-1 packaging targets. ONVIF snapshot capture has no native
 camera SDK requirement. RTSP requires the matching GStreamer runtime; GenICam requires an
-architecture-matched Aravis installation at version 0.8.25 or newer. The native feature is not a
+architecture-matched Aravis installation at version 0.8.36 or newer. The native feature is not a
 license to substitute an older distribution package.
 
 Create two durable directories outside a repository, temporary filesystem, or container overlay.
@@ -138,8 +138,8 @@ icacls $root /grant:r `
 ```
 
 Keep the ownership/ACL record with the deployment. Windows GenICam and native GStreamer packaging
-are not claimed as release support, and Windows service plus physical-camera validation remains an
-explicit unrun release gate.
+are not claimed as release support. Physical-camera validation is waived for this project because no
+hardware is available; that waiver does not establish Windows service or hardware compatibility.
 
 ## Docker
 

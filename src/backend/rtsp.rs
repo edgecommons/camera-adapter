@@ -3172,6 +3172,7 @@ mod tests {
     use std::collections::{BTreeSet, VecDeque};
     use std::net::IpAddr;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use async_trait::async_trait;
 
@@ -3273,8 +3274,8 @@ mod tests {
             .expect("complete decoded RTSP frame");
         assert_eq!(frame.capture_mode, CaptureMode::RtspFrame);
         assert_eq!(frame.pixel_format, PixelFormat::Rgb8);
-        assert!(frame.width > 0 && frame.height > 0);
-        assert!(!frame.bytes.is_empty());
+        assert_eq!((frame.width, frame.height), (320, 240));
+        assert_eq!(frame.bytes.len(), 320 * 240 * 3);
         controller
             .close(Instant::now() + Duration::from_secs(2))
             .await;
@@ -3345,8 +3346,10 @@ mod tests {
         assert_eq!(second.capture_mode, CaptureMode::RtspFrame);
         assert_eq!(first.pixel_format, PixelFormat::Rgb8);
         assert_eq!(second.pixel_format, PixelFormat::Rgb8);
-        assert_eq!((first.width, first.height), (second.width, second.height));
-        assert!(!first.bytes.is_empty() && !second.bytes.is_empty());
+        assert_eq!((first.width, first.height), (320, 240));
+        assert_eq!((second.width, second.height), (320, 240));
+        assert_eq!(first.bytes.len(), 320 * 240 * 3);
+        assert_eq!(second.bytes.len(), 320 * 240 * 3);
         controller
             .close(Instant::now() + Duration::from_secs(2))
             .await;
@@ -3742,6 +3745,162 @@ mod tests {
         assert!(parse_sdp_track(duplicate_mapping, &policy.url, &policy).is_err());
     }
 
+    #[tokio::test]
+    async fn uri_policy_rejects_malformed_origins_addresses_and_cancelled_resolution() {
+        for candidate in [
+            "",
+            "relative-path",
+            "https://camera.test/live",
+            "rtsps://camera.test/live#fragment",
+            "rtsp://camera.test:0/live",
+            "rtsp://camera.test/live\nnext",
+        ] {
+            assert!(
+                parse_rtsp_uri(candidate, true).is_err(),
+                "{candidate:?} must not be an accepted RTSP origin"
+            );
+        }
+        let (secure, secure_host, secure_port) =
+            parse_rtsp_uri("rtsps://CAMERA.test/live", false).expect("secure origin");
+        assert_eq!(secure.scheme(), "rtsps");
+        assert_eq!(secure_host, "camera.test");
+        assert_eq!(secure_port, 322);
+        assert!(parse_rtsp_uri("rtsp://camera.test/live", false).is_err());
+
+        assert!(validate_rtsp_host("hostile.test", &anchor()).is_err());
+        validate_rtsp_host("media.test", &anchor()).expect("explicitly allowed hostname");
+        assert!(validate_rtsp_addresses("camera.test", &[], &anchor()).is_err());
+        assert!(validate_rtsp_addresses("media.test", &[address("127.0.0.1")], &anchor()).is_err());
+        validate_rtsp_addresses("media.test", &[address("10.0.0.3")], &anchor())
+            .expect("allowed CIDR address");
+
+        let resolver = SequenceResolver::new([vec![address("10.0.0.2")]]);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            resolve_rtsp_bounded(
+                &resolver,
+                "camera.test",
+                554,
+                Instant::now() + Duration::from_secs(1),
+                &cancelled,
+            )
+            .await
+            .expect_err("cancelled resolution must not run")
+            .code(),
+            ErrorCode::CaptureCancelled
+        );
+        assert_eq!(
+            resolve_rtsp_bounded(
+                &resolver,
+                "camera.test",
+                554,
+                Instant::now() - Duration::from_millis(1),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("elapsed resolution deadline")
+            .code(),
+            ErrorCode::CaptureTimeout
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_uri_exposes_only_approved_origin_fields_and_repinning_is_stable() {
+        let resolver =
+            SequenceResolver::new([vec![address("10.0.0.2")], vec![address("10.0.0.2")]]);
+        let (policy, pinned) = RtspUriPolicy::establish(
+            "rtsps://camera.test/live/private?token=redacted",
+            anchor(),
+            false,
+            &resolver,
+            Instant::now() + Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("approved secure origin");
+        assert_eq!(pinned.host(), "camera.test");
+        assert_eq!(pinned.url().scheme(), "rtsps");
+        assert!(pinned.is_tls());
+        assert_eq!(pinned.addresses, BTreeSet::from([address("10.0.0.2")]));
+        let debug = format!("{pinned:?}");
+        assert!(debug.contains("camera.test"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("token=redacted"));
+
+        let repinned = policy
+            .pin(
+                &resolver,
+                Instant::now() + Duration::from_secs(1),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("unchanged address set remains pinned");
+        assert_eq!(repinned.socket_address(), "10.0.0.2:322".parse().unwrap());
+        assert_eq!(RtspCodec::H264.encoding_name(), "H264");
+        assert_eq!(RtspCodec::H265.encoding_name(), "H265");
+        assert!(parse_rtsp_uri("rtsp:opaque", true).is_err());
+    }
+
+    #[tokio::test]
+    async fn sdp_and_codec_boundaries_fail_closed_for_malformed_camera_metadata() {
+        let policy = established_policy().await;
+        for sdp in [
+            b"".as_slice(),
+            b"\xff",
+            b"v=0\r\nm=video 0 RTP/AVP\r\n",
+            b"v=0\r\n\x01",
+            b"v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000/1\r\na=control:track\r\n",
+            b"v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:one\r\na=control:two\r\n",
+            b"v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 VP8/90000\r\na=control:track\r\n",
+            b"v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 x=1\r\na=fmtp:96 x=2\r\na=control:track\r\n",
+        ] {
+            assert!(parse_sdp_track(sdp, &policy.url, &policy).is_err());
+        }
+        assert!(parse_codec_fmtp(RtspCodec::H265, Some("sprop-vps=AQ==")).is_ok());
+        assert!(
+            parse_codec_fmtp(
+                RtspCodec::H264,
+                Some(&format!("x={}", "a".repeat(MAX_SDP_LINE_BYTES + 1))),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sdp_response_and_rtp_parsers_reject_protocol_boundary_violations() {
+        for response in [
+            b"RTSP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".as_slice(),
+            b"RTSP/1.0 200 OK\r\nContent-Length: nope\r\n\r\n",
+            b"RTSP/1.0 600 Out of range\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\n\r\n",
+            b"RTSP/1.0 200 OK\r\nBad Header: one\r\n\r\n",
+        ] {
+            assert!(parse_rtsp_response_head(response, 4096).is_err());
+        }
+        let oversized = format!(
+            "RTSP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_RTSP_BODY_BYTES + 1
+        );
+        assert!(parse_rtsp_response_head(oversized.as_bytes(), 4096).is_err());
+
+        let no_payload = rtp(1, 1, true, 96, &[]);
+        let bad_version = [0x40, 96, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1];
+        let mut truncated_csrc = rtp(1, 1, true, 96, &[1]);
+        truncated_csrc[0] |= 0x01;
+        let mut truncated_extension_body = rtp(1, 1, true, 96, &[1]);
+        truncated_extension_body[0] |= 0x10;
+        truncated_extension_body.splice(12..12, [0, 0, 0, 1]);
+        for packet in [
+            &no_payload,
+            &bad_version.to_vec(),
+            &truncated_csrc,
+            &truncated_extension_body,
+        ] {
+            assert!(parse_rtp_packet(packet).is_err());
+        }
+    }
+
     #[test]
     fn rtp_parser_handles_valid_csrc_extension_and_padding_without_exposing_them_as_media() {
         let mut bytes = rtp(33, 44, true, 96, &[9, 8]);
@@ -3797,6 +3956,86 @@ mod tests {
     }
 
     #[test]
+    fn h265_aggregation_sps_and_packetization_failures_are_bounded() {
+        let sps = h265_sps(1920, 1088, (0, 0, 0, 4));
+        assert_eq!(parse_h265_sps_dimensions(&sps).unwrap(), (1920, 1080));
+
+        let mut assembler = AccessUnitAssembler::new(&track(RtspCodec::H265), 4096).unwrap();
+        let mut access_point = vec![48 << 1, 1];
+        access_point.extend_from_slice(&(u16::try_from(sps.len()).unwrap()).to_be_bytes());
+        access_point.extend_from_slice(&sps);
+        access_point.extend_from_slice(&[0, 3, 19 << 1, 1, 0xaa]);
+        let packet = rtp(1, 25, true, 96, &access_point);
+        let unit = assembler
+            .push(parse_rtp_packet(&packet).unwrap())
+            .expect("H.265 aggregation packet")
+            .expect("IDR in aggregation packet completes the access unit");
+        assert_eq!(unit.dimensions, Some((1920, 1080)));
+        assert_eq!(unit.rtp_timestamp, 25);
+
+        for payload in [
+            vec![48 << 1, 1, 0],
+            vec![48 << 1, 1, 0, 1, 19 << 1],
+            vec![49 << 1, 1, 0x80 | 19],
+            vec![50 << 1, 1, 0xaa],
+        ] {
+            let packet = rtp(2, 26, true, 96, &payload);
+            assert!(
+                AccessUnitAssembler::new(&track(RtspCodec::H265), 4096)
+                    .unwrap()
+                    .push(parse_rtp_packet(&packet).unwrap())
+                    .is_err(),
+                "{payload:?} must not be accepted"
+            );
+        }
+        assert!(parse_h265_sps_dimensions(&[19 << 1, 1, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn fragmented_h264_and_h265_reject_protocol_violations_without_completing_frames() {
+        assert_eq!(
+            AccessUnitAssembler::new(&track(RtspCodec::H264), 0)
+                .expect_err("zero compressed-frame budget")
+                .code(),
+            ErrorCode::ResourceLimit
+        );
+        for payload in [
+            vec![0],
+            vec![24, 0],
+            vec![24, 0, 0],
+            vec![28, 0x85],
+            vec![28, 0xc5, 1],
+        ] {
+            let packet = rtp(1, 1, true, 96, &payload);
+            assert!(
+                AccessUnitAssembler::new(&track(RtspCodec::H264), 4096)
+                    .unwrap()
+                    .push(parse_rtp_packet(&packet).unwrap())
+                    .is_err(),
+                "{payload:?} must not be accepted"
+            );
+        }
+        let h264_start = rtp(1, 1, false, 96, &[28, 0x85, 1]);
+        let h264_repeat = rtp(2, 1, false, 96, &[28, 0x85, 2]);
+        let mut h264 = AccessUnitAssembler::new(&track(RtspCodec::H264), 4096).unwrap();
+        h264.push(parse_rtp_packet(&h264_start).unwrap()).unwrap();
+        assert!(h264.push(parse_rtp_packet(&h264_repeat).unwrap()).is_err());
+
+        let h265_start = rtp(1, 1, false, 96, &[49 << 1, 1, 0x80 | 19, 1]);
+        let h265_repeat = rtp(2, 1, false, 96, &[49 << 1, 1, 0x80 | 19, 2]);
+        let mut h265 = AccessUnitAssembler::new(&track(RtspCodec::H265), 4096).unwrap();
+        h265.push(parse_rtp_packet(&h265_start).unwrap()).unwrap();
+        assert!(h265.push(parse_rtp_packet(&h265_repeat).unwrap()).is_err());
+        let continuation = rtp(3, 1, true, 96, &[49 << 1, 1, 19, 3]);
+        assert!(
+            AccessUnitAssembler::new(&track(RtspCodec::H265), 4096)
+                .unwrap()
+                .push(parse_rtp_packet(&continuation).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn rbsp_reader_and_dimension_bounds_reject_truncation_without_wrapping() {
         let escaped = RbspBitReader::from_escaped(&[0, 0, 3, 0x80]).expect("escaped RBSP");
         assert_eq!(escaped.bytes, vec![0, 0, 0x80]);
@@ -3843,12 +4082,38 @@ mod tests {
         assert_eq!(parse_h264_sps_dimensions(&nal).unwrap(), (1920, 1080));
     }
 
+    fn h265_sps(width: u32, coded_height: u32, crop: (u32, u32, u32, u32)) -> Vec<u8> {
+        let mut bits = TestBits::default();
+        bits.zeros(4); // sps_video_parameter_set_id
+        bits.zeros(3); // sps_max_sub_layers_minus1
+        bits.bit(true); // sps_temporal_id_nesting_flag
+        bits.zeros(96); // general profile tier level
+        bits.ue(0); // sps_seq_parameter_set_id
+        bits.ue(1); // 4:2:0 chroma
+        bits.ue(width);
+        bits.ue(coded_height);
+        bits.bit(true); // conformance window
+        bits.ue(crop.0);
+        bits.ue(crop.1);
+        bits.ue(crop.2);
+        bits.ue(crop.3);
+        let mut nal = vec![33 << 1, 1];
+        nal.extend(bits.finish());
+        nal
+    }
+
     #[derive(Default)]
     struct TestBits {
         bytes: Vec<u8>,
         bit: usize,
     }
     impl TestBits {
+        fn zeros(&mut self, count: usize) {
+            for _ in 0..count {
+                self.bit(false);
+            }
+        }
+
         fn bit(&mut self, value: bool) {
             if self.bit % 8 == 0 {
                 self.bytes.push(0);

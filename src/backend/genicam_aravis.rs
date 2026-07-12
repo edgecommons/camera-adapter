@@ -1974,6 +1974,38 @@ mod tests {
         }
     }
 
+    fn fake_gige_profile() -> CaptureProfile {
+        CaptureProfile {
+            capture_mode: Some(CaptureMode::SoftwareTrigger),
+            offline_policy: Some(OfflinePolicy::FailFast),
+            queue_expiry_ms: None,
+            timeout_ms: Some(5_000),
+            maximum_frame_bytes: Some(76_800),
+            pixel_format: Some(PixelFormat::Mono8),
+            width: Some(320),
+            height: Some(240),
+            offset_x: Some(0),
+            offset_y: Some(0),
+            exposure_micros: None,
+            gain: None,
+            output: ProfileOutputConfig {
+                encoding: OutputEncoding::Raw,
+                jpeg_quality: 90,
+            },
+            capture_interlock: Some(CaptureInterlock::Reject),
+        }
+    }
+
+    fn fake_gige_request(capture_id: &str) -> CaptureRequest {
+        CaptureRequest {
+            capture_id: capture_id.to_owned(),
+            profile: fake_gige_profile(),
+            maximum_frame_bytes: 76_800,
+            timeout: Duration::from_secs(5),
+            cancellation: CancellationToken::new(),
+        }
+    }
+
     #[tokio::test]
     async fn every_native_session_call_stays_on_one_worker_thread_and_ptz_is_rejected() {
         let captured = Arc::new(AtomicBool::new(false));
@@ -2006,6 +2038,88 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::UnsupportedCapability);
         session.close().await.unwrap();
         session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the pinned Aravis fake GigE camera on a Linux host-network interface"]
+    async fn pinned_aravis_fake_discovers_and_captures_two_complete_mono8_frames() {
+        let interface = std::env::var("CAMERA_ADAPTER_ARAVIS_INTERFACE")
+            .expect("set CAMERA_ADAPTER_ARAVIS_INTERFACE to the fake camera interface");
+        let factory = GenicamAravisBackendFactory::default();
+        let candidates = factory
+            .discover(DiscoveryRequest {
+                eligible_interfaces: vec![interface.clone()],
+                max_results: 1,
+                timeout: Duration::from_secs(10),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("the pinned discovery helper must find the fake camera");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].backend, BackendKind::GenicamAravis);
+        assert_eq!(
+            candidates[0].selector,
+            json!({"deviceId": "Aravis-Fake-GV01"})
+        );
+        assert_eq!(
+            candidates[0].capabilities["interface"],
+            Value::String(interface.clone())
+        );
+
+        let mut session = factory
+            .connect(ConnectRequest {
+                instance_id: "aravis-fake-gv".to_owned(),
+                backend: BackendConfig::GenicamAravis(GenicamBackendConfig {
+                    selector: GenicamSelector {
+                        device_id: Some("Aravis-Fake-GV01".to_owned()),
+                        ..GenicamSelector::default()
+                    },
+                    transport: GenicamTransport::GigeVision,
+                    interface: Some(interface),
+                    packet_size: None,
+                    packet_delay_ns: None,
+                    buffer_count: Some(2),
+                    feature_overrides: BTreeMap::new(),
+                }),
+                timeout: Duration::from_secs(10),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("the fake camera must open through the production worker");
+        assert!(session.capabilities().software_trigger);
+        assert!(
+            session
+                .capabilities()
+                .pixel_formats
+                .contains(&PixelFormat::Mono8)
+        );
+
+        for capture_id in ["aravis-fake-first", "aravis-fake-second"] {
+            let frame = session
+                .capture(fake_gige_request(capture_id))
+                .await
+                .expect("the fake camera must return a complete software-triggered frame");
+            assert_eq!((frame.width, frame.height), (320, 240));
+            assert_eq!(frame.pixel_format, PixelFormat::Mono8);
+            assert_eq!(frame.capture_mode, CaptureMode::SoftwareTrigger);
+            assert_eq!(frame.bytes.len(), 76_800);
+            assert_eq!(
+                frame.backend_metadata.get("transport"),
+                Some(&json!(WireTransport::GigeVision))
+            );
+            assert!(frame.backend_metadata.contains_key("frameId"));
+        }
+
+        let status = session
+            .status()
+            .await
+            .expect("fake session status must succeed");
+        assert_eq!(status.backend["bufferCount"], json!(2));
+        assert_eq!(status.backend["acquisitionActive"], json!(true));
+        session
+            .close()
+            .await
+            .expect("fake session must close cleanly");
     }
 
     #[test]

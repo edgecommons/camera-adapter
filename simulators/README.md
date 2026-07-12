@@ -1,8 +1,9 @@
 # Camera adapter simulator stack
 
 This directory contains the deterministic protocol test stack required by
-`IMPLEMENTATION_SPEC.md` section 12. It is acceptance infrastructure, not a replacement for the
-physical-camera gates.
+`IMPLEMENTATION_SPEC.md` section 12. It is acceptance infrastructure, not hardware-compatibility evidence.
+Physical-camera validation is waived for this project because no hardware is available; simulator results
+do not change the excluded hardware claims.
 
 ## Services
 
@@ -42,8 +43,31 @@ The normal endpoints exposed on the host are:
 
 The Rust decoder is validated from a pinned Linux image, on the Compose network,
 so `onvif-sim` and `mediamtx` retain their service names and no host-network
-shortcut weakens the URI-pinning test. Build the ephemeral image after bringing
-up the stack, then run the ignored test once for each codec:
+shortcut weakens the URI-pinning test. The reproducible coverage runner starts
+MediaMTX, builds the image with pinned `cargo-llvm-cov 0.8.7` and matching
+`llvm-tools-preview`, runs both ignored decoder tests, and writes a separate
+LCOV artifact for each H.264/H.265 fixture and session policy:
+
+```powershell
+./simulators/run-rtsp-native-coverage.ps1 -CoverageOutput C:\tmp\camera-adapter-rtsp-coverage
+```
+
+It mounts the whole EdgeCommons workspace read-only (the adapter depends on
+the sibling Core crate), writes Cargo target and registry state only to named
+Docker volumes, and writes only the four requested LCOV artifacts to
+`CoverageOutput`. The volumes are intentionally retained for a repeatable fast
+rerun; remove them explicitly only when a clean native rebuild is required.
+These four fixture-level artifacts prove native decoder execution only. They
+are not an aggregate adapter coverage report and must not be used to claim the
+project's 90% coverage gate is satisfied.
+
+The image keeps the adapter's Rust 1.85.1 MSRV toolchain for ordinary native
+decoder tests. Since `cargo-llvm-cov 0.8.7` itself requires Rust 1.87, the
+runner invokes the separately pinned 1.87.0 coverage toolchain only for the
+LCOV runs; this is not an adapter MSRV change.
+
+For a one-off decoder-only run without coverage, build the ephemeral image
+after bringing up the stack, then run the ignored test once for each codec:
 
 ```powershell
 docker build -f simulators/rtsp_validation.Dockerfile -t camera-adapter-rtsp-validation .
@@ -57,7 +81,7 @@ foreach ($path in @('camera', 'camera-h265')) {
 }
 ```
 
-Each invocation must produce a non-empty RGB frame with non-zero dimensions.
+Each invocation must produce an exact 320x240 RGB frame of 230,400 bytes.
 This proves the native pinned decoder against the deterministic H.264/H.265
 streams; it does not replace a physical-camera compatibility test.
 

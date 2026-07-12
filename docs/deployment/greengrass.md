@@ -16,7 +16,7 @@ cargo build --locked --release --no-default-features --features greengrass,onvif
 ```
 
 For RTSP, add `rtsp` and package the matching GStreamer runtime libraries. For GenICam, package a
-reviewed native Aravis installation at 0.8.25 or newer with the binary; do not install arbitrary
+reviewed native Aravis installation at 0.8.36 or newer with the binary; do not install arbitrary
 native packages at component start. The recipe does not claim a prebuilt GenICam or RTSP artifact.
 
 ## Durable paths and ownership

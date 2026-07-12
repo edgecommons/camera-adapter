@@ -35,10 +35,11 @@ An implementation is complete only when:
 2. the required phase gates and validation evidence are present;
 3. all required cross-language core behavior is available and interoperable;
 4. all required documentation describes shipped behavior only; and
-5. every unrun physical-camera or lab gate is reported explicitly as an acceptance gap.
+5. every unrun lab gate is reported explicitly as an acceptance gap, and any owner-approved
+   physical-camera waiver is recorded with its excluded compatibility claims.
 
 Passing unit tests, compiling, or reaching a simulator milestone does not by itself satisfy the full
-design. See `DESIGN.md` §§23.8–26, lines 2258–2331.
+design. See `DESIGN.md` §§23.8–26, lines 2273–2347.
 
 ## 2. Resolved design decisions
 
@@ -68,10 +69,10 @@ design. See `DESIGN.md` §§23.8–26, lines 2258–2331.
 | `R-22` | Rust panics and reported callback errors are isolated at the supervisor boundary. Native segmentation faults and process aborts are not catchable in-process; sharding or process isolation is the mitigation. | §§17.3, 21.6: lines 1820–1828, 2034–2038 |
 | `R-23` | SQLite uses transactional migrations, WAL, `synchronous=FULL`, a bounded busy timeout, startup integrity checking, and an exclusive state-directory process lock. | §17.1: lines 1788–1811 |
 | `R-24` | Apply the Unix modes and deployment ownership rules in §9.3 of this addendum. Windows output ACL restriction is deployment guidance; the adapter does not enforce output DACLs. | §§18.3, 21: lines 1867–1875, 1957–2038 |
-| `R-25` | Physical-camera gates remain mandatory release evidence. Missing hardware is an explicit unrun gap, not an inferred pass. | §§23.6–23.8: lines 2230–2270 |
+| `R-25` | Physical-camera validation is waived for this project because the owner has no hardware. The register must retain the waiver and explicitly exclude all model, firmware, device-timing, and hardware-compatibility claims; a hardware-certified release must restore §23.6. | §§23.6–23.8 |
 | `R-26` | Keep 256 as the supported connected-camera target; retain 1,024-entry simulator coverage. | §§1, 16.1, 23.2, 23.5: lines 35–57, 1743–1757, 2137–2149, 2214–2228 |
 | `R-27` | Keep sidecars opt-in and `raw` in v1. A `raw` capture without a sidecar is still valid, but its interpretation remains available through status and terminal metadata. | §§9.4, 9.6, 27: lines 467–502, 2333–2340 |
-| `R-28` | Defer Bayer/PFNC demosaicing; keep Linux Tier 1; keep preset mutation false; do not add scatter-gather; do not extract the common engine into a reusable template during initial delivery. | §§21.3, 24, 27: lines 2004–2011, 2272–2283, 2333–2356 |
+| `R-28` | Defer Bayer/PFNC demosaicing; keep Linux Tier 1; keep preset mutation false; do not add scatter-gather; do not extract the common engine into a reusable template during initial delivery. | §§21.3, 24, 27: lines 2004–2011, 2288–2301, 2349–2372 |
 | `R-29` | P1 adds a four-language pre-commit configuration validator/veto. A rejected reload candidate never replaces current config, reaches effective-config publication, or invokes applied-config listeners. | §§10.5, 20.1: lines 690–698, 1934–1945 |
 | `R-30` | P1 adds builder control of initial readiness. Camera adapter construction uses `initialReady(false)` and readiness stays false until every startup gate succeeds. | §§7, 19.4: lines 295–297, 1924–1930 |
 | `R-31` | P1 makes CommandInbox startup observable. The adapter may become ready only after inbox subscription/registration reports success; startup failure is retained and reported. | §§13, 19.4: lines 1071–1082, 1924–1930 |
@@ -105,14 +106,14 @@ selected for the release is integrated with the real P1 APIs.
 
 | Phase | Required work | Hard exit evidence | Design trace |
 |---|---|---|---|
-| P0 | Rust skeleton; dependency/license inventory; pinned Aravis, GLib, GStreamer and SQLite approach; Windows feasibility; SimBackend memory/thread baseline | One frame through each native stack available on the development platform; 256 idle simulations; approved OS/feature matrix; versioned resource baseline | §24 P0, lines 2272–2277 |
-| P1 | Deferred command outcomes, correlation-aware `app`, confirmed publish, pre-commit config veto, initial readiness control, and observable CommandInbox startup in Java, Python, Rust, and TypeScript; update skeletons/templates and core docs | Per-language unit/coverage gates; reload-veto and startup-readiness races; 4×4 local MQTT requester/responder interop; PUBACK tests; four-language deployed Greengrass IPC interop; scaffold-to-build regression | §§10.5, 12.2, 19.4, 20.1, 23.3, 24 P1, lines 690–698, 960–1014, 1924–1945, 2186–2194, 2277 |
-| P2 | Config, SQLite catalog/ledger/outbox, job engine, scheduler, admission, safe storage, commands/messages, metrics/health, SimBackend | Full SimBackend and EMQX contract; crash checkpoints; property/fuzz tests; at least 90% line coverage | §24 P2, line 2278 |
-| P3 | WS-Discovery, ONVIF services/media/auth/TLS/snapshot, PTZ/presets, deterministic in-repo simulators | Simulator security/fault suite and one physical ONVIF/PTZ camera, or an explicit unrun physical gap | §24 P3, line 2279 |
-| P4 | Aravis GigE/USB3 backend, features, bounded buffers, timestamp quality, formats | Fake camera and packet faults; two-vendor GigE and USB evidence, or explicit physical gaps | §24 P4, line 2280 |
-| P5 | GStreamer RTSP extraction, bounded warm session, fallback | RTSP codec/fault suite and physical fallback camera, or explicit physical gap | §24 P5, line 2281 |
-| P6 | HOST, Greengrass, Kubernetes, file-replicator, bottling-company integration, scale/soak | All applicable platform gates, 24-hour fleet soak, docs and registry ready | §24 P6, line 2282 |
-| P7 | Compatibility register, threat/security review, operations, release status | No unresolved blocking findings; physical and lab gaps either closed or release explicitly withheld | §24 P7, line 2283 |
+| P0 | Rust skeleton; dependency/license inventory; pinned Aravis, GLib, GStreamer and SQLite approach; Windows feasibility; SimBackend memory/thread baseline | One frame through each native stack available on the development platform; 256 idle simulations; approved OS/feature matrix; versioned resource baseline | §24 P0, line 2292 |
+| P1 | Deferred command outcomes, correlation-aware `app`, confirmed publish, pre-commit config veto, initial readiness control, and observable CommandInbox startup in Java, Python, Rust, and TypeScript; update skeletons/templates and core docs | Per-language unit/coverage gates; reload-veto and startup-readiness races; 4×4 local MQTT requester/responder interop; PUBACK tests; four-language deployed Greengrass IPC interop; scaffold-to-build regression | §§10.5, 12.2, 19.4, 20.1, 23.3, 24 P1, lines 690–698, 960–1014, 1924–1945, 2186–2194, 2293 |
+| P2 | Config, SQLite catalog/ledger/outbox, job engine, scheduler, admission, safe storage, commands/messages, metrics/health, SimBackend | Full SimBackend and EMQX contract; crash checkpoints; property/fuzz tests; at least 90% line coverage | §24 P2, line 2294 |
+| P3 | WS-Discovery, ONVIF services/media/auth/TLS/snapshot, PTZ/presets, deterministic in-repo simulators | Simulator security/fault suite; physical ONVIF/PTZ compatibility is waived with no hardware claim | §24 P3 |
+| P4 | Aravis GigE/USB3 backend, features, bounded buffers, timestamp quality, formats | Fake camera and packet faults; physical vendor compatibility is waived with no hardware claim | §24 P4 |
+| P5 | GStreamer RTSP extraction, bounded warm session, fallback | RTSP codec/fault suite; physical fallback-camera compatibility is waived with no hardware claim | §24 P5 |
+| P6 | HOST, Greengrass, Kubernetes, file-replicator, bottling-company integration, scale/soak | All applicable platform gates, 24-hour fleet soak, docs and registry ready | §24 P6, line 2298 |
+| P7 | Compatibility register, threat/security review, operations, release status | No unresolved blocking findings; physical and lab gaps either closed or release explicitly withheld | §24 P7, line 2299 |
 
 ## 4. Implementation module map
 
@@ -920,9 +921,10 @@ Every image or package is pinned by digest or exact version and recorded in acce
 third-party software and codecs receive a license/security review before inclusion in build or release
 artifacts.
 
-Physical-camera validation remains as specified in `DESIGN.md` §23.6, lines 2230–2244. When the required
-models are unavailable, the compatibility register must state `NOT RUN — HARDWARE UNAVAILABLE` with the
-missing model class and affected release claim. Simulator evidence cannot change that status to pass.
+Physical-camera validation is waived for this project because the owner has no hardware, as recorded in
+`DESIGN.md` §23.6. The compatibility register must state `WAIVED — NO HARDWARE AVAILABLE` and explicitly
+exclude model, firmware, hardware, and device-timing compatibility claims. Simulator evidence cannot
+convert that waiver into a hardware pass.
 
 ## 13. Traceability and review plan
 
@@ -940,7 +942,7 @@ Each row links source files, tests, evidence artifacts, and status (`not started
 | `TR-JOB` | DESIGN §8, lines 308–409; addendum §§6.2–6.6 | jobs, catalog, actor | State/property tests, crash recovery, idempotency and cancellation races |
 | `TR-STORAGE` | DESIGN §9, lines 411–502; addendum §§6.4, 9 | storage, encoding, catalog | Path adversarial tests, no-clobber, fsync checkpoints, ENOSPC, sidecar ordering |
 | `TR-CONFIG` | DESIGN §10, lines 504–837; addendum §7 | config | Defaults/ranges/unknown fields/redaction/startup/reload matrix |
-| `TR-BACKEND` | DESIGN §11, lines 839–928; addendum §§7.2–7.3, 10 | backend modules | Sim, protocol simulator and physical compatibility evidence |
+| `TR-BACKEND` | DESIGN §11; addendum §§7.2–7.3, 10 | backend modules | Simulator/protocol evidence; physical compatibility waiver with excluded claims |
 | `TR-CORE-P1` | DESIGN §§10.5, 12.2, 19.4, 20.1, lines 690–698, 960–1014, 1924–1945; addendum §5 | four core language libraries and templates | Unit coverage, reload-veto/readiness/startup races, 4×4 MQTT, lab-5950x IPC |
 | `TR-MSG` | DESIGN §§12, 14–15, lines 930–1070 and 1448–1739 | commands, messages, outbox | Exact rooted/rootless topic/envelope vectors, correlation, late reply, broker outage |
 | `TR-CMD` | DESIGN §13, lines 1071–1446; addendum §8 | commands, jobs, catalog | Every success/error schema with independent client |
@@ -951,8 +953,8 @@ Each row links source files, tests, evidence artifacts, and status (`not started
 | `TR-RUNTIME` | DESIGN §§19.4–20, lines 1924–1955; addendum §§5.4, 7.5–7.6, 9.3 | runtime, config, supervisor, jobs | Initial-not-ready and command-start races, reload compatibility matrix, durable-path resolution, and timed shutdown/forced-stop tests |
 | `TR-DEPLOY` | DESIGN §21, lines 1957–2038 | packaging/deployment artifacts | HOST, Greengrass, kind, hardware runner evidence or explicit gaps |
 | `TR-INTEGRATION` | DESIGN §22, lines 2040–2108 | system tests, file-replicator docs/config | End-to-end metadata/file/checksum/group/replication evidence |
-| `TR-VALIDATION` | DESIGN §23, lines 2110–2270; addendum §12 | all test suites | Coverage, simulator versions/config, soak graphs, hardware register |
-| `TR-DOCS` | DESIGN §25, lines 2287–2305 | component and core docs | Diátaxis set reviewed against shipped behavior |
+| `TR-VALIDATION` | DESIGN §23; addendum §12 | all test suites | Portable and native-feature coverage, simulator versions/config, soak graphs, and the hardware-waiver register |
+| `TR-DOCS` | DESIGN §25, lines 2303–2321 | component and core docs | Diátaxis set reviewed against shipped behavior |
 
 ### 13.2 Adversarial review gates
 
@@ -990,7 +992,8 @@ The final local handoff contains:
 - broker-outage outbox evidence with stable envelope UUIDs;
 - four-language local MQTT and deployed Greengrass IPC interop evidence for P1;
 - HOST, Greengrass, kind, and applicable hardware-cluster evidence;
-- the physical-camera compatibility register with explicit `PASS`, `FAIL`, or `NOT RUN` per required
-  model/capability; and
+- the physical-camera compatibility register with explicit `WAIVED — NO HARDWARE AVAILABLE` and excluded
+  claims for this project, or `PASS`, `FAIL`, or `NOT RUN` per model/capability for a hardware-certified
+  release; and
 - an adversarial senior review that checks the original `DESIGN.md` and this addendum, not only an
   implementation summary.

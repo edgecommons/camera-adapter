@@ -4,9 +4,15 @@ FROM docker.io/library/rust@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b03509
 
 FROM camera-adapter-simulators-aravis-fake:latest
 
+ARG CARGO_LLVM_COV_VERSION=0.8.7
+ARG LLVM_COV_TOOLCHAIN=1.87.0
+
 USER root
 COPY --from=rust /usr/local/cargo /usr/local/cargo
 COPY --from=rust /usr/local/rustup /usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:$PATH \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo
 RUN rm -f /etc/apt/sources.list.d/debian.sources \
     && printf '%s\n' \
       "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260623T000000Z/ bookworm main" \
@@ -14,7 +20,9 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
       > /etc/apt/sources.list \
     && apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install -y --no-install-recommends build-essential libglib2.0-dev libusb-1.0-0-dev libxml2-dev pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup toolchain install "${LLVM_COV_TOOLCHAIN}" --profile minimal --component llvm-tools-preview \
+    && cargo +"${LLVM_COV_TOOLCHAIN}" install --locked cargo-llvm-cov --version "${CARGO_LLVM_COV_VERSION}"
 
 ENV PATH=/usr/local/cargo/bin:$PATH \
     RUSTUP_HOME=/usr/local/rustup \

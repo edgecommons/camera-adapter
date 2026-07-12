@@ -3,6 +3,14 @@
 # network; it is test infrastructure and is never shipped as an adapter image.
 FROM docker.io/library/rust@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4
 
+# Keep the coverage driver in the validation image rather than relying on a
+# mutable host-side Cargo installation. cargo-llvm-cov 0.8.7 requires Rust
+# 1.87, so the image retains its 1.85.1 default toolchain for MSRV-native test
+# runs and installs a separate, pinned coverage-only toolchain with matching
+# llvm-tools-preview.
+ARG CARGO_LLVM_COV_VERSION=0.8.7
+ARG LLVM_COV_TOOLCHAIN=1.87.0
+
 RUN rm -f /etc/apt/sources.list.d/debian.sources \
     && printf '%s\n' \
       "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260623T000000Z/ bookworm main" \
@@ -18,7 +26,9 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
       gstreamer1.0-plugins-good \
       gstreamer1.0-plugins-bad \
       gstreamer1.0-libav \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup toolchain install "${LLVM_COV_TOOLCHAIN}" --profile minimal --component llvm-tools-preview \
+    && cargo +"${LLVM_COV_TOOLCHAIN}" install --locked cargo-llvm-cov --version "${CARGO_LLVM_COV_VERSION}"
 
 WORKDIR /workspace
 ENTRYPOINT ["cargo"]

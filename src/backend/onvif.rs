@@ -4555,6 +4555,149 @@ mod tests {
         assert!(!rendered.contains("top-secret"));
     }
 
+    #[test]
+    fn protocol_boundary_helpers_normalize_hosts_reject_network_addresses_and_redact_requests() {
+        assert_eq!(
+            normalize_host_text("Camera.Example.").expect("normalized hostname"),
+            "camera.example"
+        );
+        for invalid in ["", "bad/host", "bad@host", "bad\u{0007}host"] {
+            assert!(
+                normalize_host_text(invalid).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+
+        assert!(is_forbidden_network_address(
+            "fe80::1".parse().expect("IPv6 link-local address")
+        ));
+        assert!(is_forbidden_network_address(
+            "::1".parse().expect("IPv6 loopback address")
+        ));
+        assert!(is_forbidden_network_address(
+            "ff02::1".parse().expect("IPv6 multicast address")
+        ));
+        assert!(!is_forbidden_network_address(
+            "2001:db8::1".parse().expect("ordinary IPv6 address")
+        ));
+
+        assert_eq!(OnvifHttpMethod::Get.as_str(), "GET");
+        assert_eq!(OnvifHttpMethod::Post.as_str(), "POST");
+        let tls = RequestTlsPolicy {
+            verify_hostname: true,
+            allow_invalid_certificates: false,
+            ca_pem: Some(Arc::new(SecretBytes::new("private-ca-pem"))),
+        };
+        let rendered_tls = format!("{tls:?}");
+        assert!(rendered_tls.contains("<redacted>"));
+        assert!(!rendered_tls.contains("private-ca-pem"));
+
+        let request = loopback_http_request(443, OnvifHttpMethod::Get, 1_024);
+        let rendered_request = format!("{request:?}");
+        assert!(rendered_request.contains("<redacted>"));
+        assert!(!rendered_request.contains("Bearer adapter-test"));
+        assert!(rendered_request.contains("body_bytes"));
+
+        let response = OnvifHttpResponse {
+            status: 204,
+            headers: BTreeMap::from([("x-camera".to_owned(), "ready".to_owned())]),
+            body: Vec::new(),
+        };
+        assert_eq!(response.header("X-Camera"), Some("ready"));
+        assert!(response.is_success());
+        assert!(
+            !OnvifHttpResponse {
+                status: 302,
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+            }
+            .is_success()
+        );
+    }
+
+    #[test]
+    fn xml_protocol_parsers_accept_bounded_content_and_reject_faults() {
+        let cdata = parse_bounded_xml(b"<Envelope><![CDATA[camera-ready]]></Envelope>", 1_024, 4)
+            .expect("CDATA is ordinary bounded XML content");
+        assert_eq!(cdata.text, "camera-ready");
+        assert!(parse_bounded_xml(b"<Envelope><?forbidden value?></Envelope>", 1_024, 4).is_err());
+        assert!(parse_bounded_xml(b"<one/><two/>", 1_024, 4).is_err());
+
+        let services = parse_services(
+            format!(
+                "<Envelope><Service><Namespace>{MEDIA1_NAMESPACE}</Namespace><XAddr>https://camera.test/media</XAddr></Service><Service><Namespace>{MEDIA1_NAMESPACE}</Namespace><XAddr>https://camera.test/media</XAddr></Service><Service><Namespace>{PTZ_NAMESPACE}</Namespace><XAddr>https://camera.test/ptz</XAddr></Service><Service><Namespace>urn:unsupported</Namespace><XAddr>https://camera.test/ignored</XAddr></Service></Envelope>"
+            )
+            .as_bytes(),
+            4_096,
+            8,
+        )
+        .expect("bounded service document");
+        assert_eq!(services.media1, vec!["https://camera.test/media"]);
+        assert!(services.media2.is_empty());
+        assert_eq!(services.ptz, vec!["https://camera.test/ptz"]);
+
+        let profiles = parse_profiles(
+            b"<Envelope><Profiles><token>profile-from-child</token><Name> Secondary </Name><PTZConfiguration token=\"ptz-config\" /></Profiles></Envelope>",
+            4_096,
+            8,
+        )
+        .expect("profile token child fallback");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].token, "profile-from-child");
+        assert_eq!(profiles[0].name.as_deref(), Some("Secondary"));
+        assert_eq!(
+            profiles[0].ptz_configuration_token.as_deref(),
+            Some("ptz-config")
+        );
+
+        let fault = parse_bounded_xml(
+            b"<Envelope><Fault><Value>ter:ActionNotSupported</Value><Text>camera refused operation</Text></Fault></Envelope>",
+            4_096,
+            8,
+        )
+        .expect("bounded SOAP fault document");
+        assert!(matches!(
+            snapshot_unavailability_from_fault(&fault),
+            Some(SnapshotFallbackReason::ActionNotSupported)
+        ));
+        let error = reject_soap_fault(&fault).expect_err("SOAP faults must become backend errors");
+        assert_eq!(error.code(), ErrorCode::BackendError);
+        assert!(error.to_string().contains("camera refused operation"));
+    }
+
+    #[test]
+    fn authentication_parameter_parser_handles_escaping_and_fails_closed() {
+        let parameters = split_auth_parameters(
+            r#"realm="camera\"operator", nonce="nonce-value", qop="auth,auth-int""#,
+        )
+        .expect("quoted commas and escapes are part of one challenge");
+        assert_eq!(parameters["realm"], "camera\"operator");
+        assert_eq!(parameters["nonce"], "nonce-value");
+        assert_eq!(parameters["qop"], "auth,auth-int");
+
+        for malformed in [
+            r#"realm="unterminated"#,
+            "realm",
+            r#"realm="ok"suffix"#,
+            "realm=first, realm=second",
+            "realm=bad\u{0007}",
+        ] {
+            assert!(
+                split_auth_parameters(malformed).is_err(),
+                "malformed challenge {malformed:?} must be rejected"
+            );
+        }
+
+        assert_eq!(
+            find_auth_scheme(
+                "Basic realm=\"camera\", Digest realm=\"operator\"",
+                "digest"
+            ),
+            Some("Basic realm=\"camera\", Digest".len())
+        );
+        assert!(find_auth_scheme("NotDigest realm=\"camera\"", "digest").is_none());
+    }
+
     #[tokio::test]
     async fn production_http_transport_uses_pinned_loopback_and_enforces_response_bounds() {
         let transport = ReqwestOnvifTransport;
@@ -4869,7 +5012,9 @@ mod tests {
             media_version: MediaVersion::Media1,
             media_profile_token: "main".to_owned(),
             snapshot_endpoint: None,
+            snapshot_unavailable: None,
             max_snapshot_bytes: 1_024,
+            rtsp: None,
             ptz_endpoint: None,
             ptz_ranges: None,
             ptz_home: false,
@@ -5542,6 +5687,156 @@ mod tests {
         assert!(requests[1].authorization.is_none());
     }
 
+    #[tokio::test]
+    async fn snapshot_digest_challenge_is_negotiated_once_then_reused_for_the_retry() {
+        let resolver: Arc<dyn OnvifResolver> =
+            Arc::new(SequenceResolver::new(&[("camera.test", 80, &["10.0.0.2"])]));
+        let transport = Arc::new(MockTransport::default());
+        transport.push(unauthorized(
+            r#"Digest realm="camera", nonce="snapshot-nonce", algorithm=MD5, qop="auth""#,
+        ));
+        transport.push(OnvifHttpResponse {
+            status: 200,
+            headers: BTreeMap::from([("content-type".to_owned(), "image/png".to_owned())]),
+            body: png(8, 8),
+        });
+        let mut config = test_config(Some("http://camera.test/onvif/device_service"));
+        config.allowed_uri_cidrs = vec!["10.0.0.0/24".parse().expect("CIDR")];
+        let credentials =
+            Arc::new(OnvifCredentials::new("operator", "camera-secret").expect("credentials"));
+        let (client, endpoint) = test_client(
+            resolver,
+            transport.clone(),
+            &config,
+            Some(credentials),
+            SecurityConfig::default(),
+        )
+        .await;
+        let cancellation = CancellationToken::new();
+        let (response, target) = client
+            .fetch_snapshot(
+                endpoint.clone(),
+                1_024,
+                Instant::now() + Duration::from_secs(2),
+                &cancellation,
+            )
+            .await
+            .expect("one Digest challenge retry must produce the snapshot");
+        assert_eq!(response.status, 200);
+        assert_eq!(target.host(), "camera.test");
+        let requests = transport.observations();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].authorization.is_none());
+        assert!(
+            requests[1]
+                .authorization
+                .as_deref()
+                .is_some_and(|value| value.starts_with("Digest "))
+        );
+
+        transport.push(OnvifHttpResponse {
+            status: 404,
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        });
+        let fallback = match client
+            .fetch_snapshot(
+                endpoint.clone(),
+                1_024,
+                Instant::now() + Duration::from_secs(2),
+                &cancellation,
+            )
+            .await
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("HTTP 404 must request the configured RTSP fallback"),
+        };
+        assert!(matches!(
+            fallback,
+            SnapshotAttemptFailure::Fallback {
+                reason: SnapshotFallbackReason::HttpNotFound,
+                ..
+            }
+        ));
+
+        transport.push(OnvifHttpResponse {
+            status: 500,
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        });
+        let fatal = match client
+            .fetch_snapshot(
+                endpoint,
+                1_024,
+                Instant::now() + Duration::from_secs(2),
+                &cancellation,
+            )
+            .await
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("unexpected snapshot HTTP failures must be fatal"),
+        };
+        assert_eq!(fatal.into_error().code(), ErrorCode::BackendError);
+        assert!(matches!(
+            classify_snapshot_transport_failure(timeout_error("test transport")),
+            SnapshotAttemptFailure::Fallback {
+                reason: SnapshotFallbackReason::TransportTimeout,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_snapshot_transport_failure(backend_error("test transport")),
+            SnapshotAttemptFailure::Fatal(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_basic_challenge_requires_both_plaintext_permissions_before_retrying() {
+        let resolver: Arc<dyn OnvifResolver> =
+            Arc::new(SequenceResolver::new(&[("camera.test", 80, &["10.0.0.2"])]));
+        let transport = Arc::new(MockTransport::default());
+        transport.push(unauthorized("Basic realm=\"camera\""));
+        transport.push(OnvifHttpResponse {
+            status: 200,
+            headers: BTreeMap::from([("content-type".to_owned(), "image/png".to_owned())]),
+            body: png(8, 8),
+        });
+        let mut config = test_config(Some("http://camera.test/onvif/device_service"));
+        config.allowed_uri_cidrs = vec!["10.0.0.0/24".parse().expect("CIDR")];
+        let credentials =
+            Arc::new(OnvifCredentials::new("operator", "camera-secret").expect("credentials"));
+        let (client, endpoint) = test_client(
+            resolver,
+            transport.clone(),
+            &config,
+            Some(credentials),
+            SecurityConfig {
+                allow_basic_over_plaintext: true,
+                ..SecurityConfig::default()
+            },
+        )
+        .await;
+        let response = client
+            .fetch_snapshot(
+                endpoint,
+                1_024,
+                Instant::now() + Duration::from_secs(2),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("explicitly permitted Basic retry must succeed");
+        assert_eq!(response.0.status, 200);
+        let requests = transport.observations();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].authorization.is_none());
+        assert!(
+            requests[1]
+                .authorization
+                .as_deref()
+                .is_some_and(|value| value.starts_with("Basic "))
+        );
+    }
+
     #[test]
     fn snapshot_png_is_validated_before_bounded_rgb_decode() {
         let response = OnvifHttpResponse {
@@ -5679,6 +5974,239 @@ mod tests {
         };
         assert_eq!(status.moving, Some(false));
         assert_eq!(status.position.expect("position").zoom, 1.0);
+    }
+
+    #[test]
+    fn ptz_response_parser_handles_presets_status_and_malformed_camera_replies() {
+        let range = |min, max| AxisRange { min, max };
+        let ranges = PtzRanges {
+            absolute_pan: range(-2.0, 2.0),
+            absolute_tilt: range(-4.0, 4.0),
+            absolute_zoom: range(0.0, 5.0),
+            relative_pan: range(-1.0, 1.0),
+            relative_tilt: range(-1.0, 1.0),
+            relative_zoom: range(-1.0, 1.0),
+            velocity_pan: range(-1.0, 1.0),
+            velocity_tilt: range(-1.0, 1.0),
+            velocity_zoom: range(-1.0, 1.0),
+        };
+        let observed_at = FixedClock.now();
+
+        assert!(matches!(
+            parse_ptz_response(
+                PtzResponseKind::Commanded,
+                b"<Envelope/>",
+                1_024,
+                8,
+                &ranges,
+                observed_at,
+            )
+            .expect("commanded response"),
+            PtzResult::Commanded
+        ));
+        assert!(matches!(
+            parse_ptz_response(
+                PtzResponseKind::Removed,
+                b"<Envelope/>",
+                1_024,
+                8,
+                &ranges,
+                observed_at,
+            )
+            .expect("removed response"),
+            PtzResult::Removed
+        ));
+        assert!(matches!(
+            parse_ptz_response(
+                PtzResponseKind::PresetToken,
+                b"<Envelope><PresetToken>preset-dock</PresetToken></Envelope>",
+                1_024,
+                8,
+                &ranges,
+                observed_at,
+            )
+            .expect("preset token response"),
+            PtzResult::PresetToken(token) if token == "preset-dock"
+        ));
+
+        let PtzResult::Presets(presets) = parse_ptz_response(
+            PtzResponseKind::Presets,
+            b"<Envelope><Preset token=\"preset-north\"><Name>North loading bay</Name></Preset><Preset><token>preset-south</token></Preset></Envelope>",
+            1_024,
+            8,
+            &ranges,
+            observed_at,
+        )
+        .expect("preset list with both token representations") else {
+            panic!("expected preset list");
+        };
+        assert_eq!(presets.len(), 2);
+        assert_eq!(presets[0].token, "preset-north");
+        assert_eq!(presets[0].name.as_deref(), Some("North loading bay"));
+        assert_eq!(presets[1].token, "preset-south");
+        assert!(presets[1].name.is_none());
+
+        let PtzResult::Status(status) = parse_ptz_response(
+            PtzResponseKind::Status,
+            b"<Envelope><PTZStatus><Position><PanTilt x=\"0\" y=\"0\"/><Zoom x=\"2.5\"/></Position><MoveStatus><PanTilt>UNKNOWN</PanTilt><Zoom>MOVING</Zoom></MoveStatus></PTZStatus></Envelope>",
+            1_024,
+            8,
+            &ranges,
+            observed_at,
+        )
+        .expect("status with an unknown move state") else {
+            panic!("expected PTZ status");
+        };
+        assert_eq!(status.position.expect("position").zoom, 0.5);
+        assert!(status.moving.is_none());
+        assert_eq!(status.observed_at, observed_at);
+
+        assert!(
+            parse_ptz_response(
+                PtzResponseKind::PresetToken,
+                b"<Envelope><SetPresetResponse/></Envelope>",
+                1_024,
+                8,
+                &ranges,
+                observed_at,
+            )
+            .is_err()
+        );
+        assert!(parse_ptz_response(
+            PtzResponseKind::Status,
+            b"<Envelope><PTZStatus><Position><PanTilt x=\"not-a-number\" y=\"0\"/><Zoom x=\"0\"/></Position></PTZStatus></Envelope>",
+            1_024,
+            8,
+            &ranges,
+            observed_at,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn onvif_response_parsers_select_single_values_and_reject_ambiguous_camera_data() {
+        let profiles = parse_profiles(
+            b"<Envelope><Profiles token=\"main\"><Name>Default</Name><PTZConfigurationToken>ptz-main</PTZConfigurationToken></Profiles><Profiles token=\"aux\"><Name>Auxiliary</Name></Profiles><Profiles/></Envelope>",
+            4_096,
+            8,
+        )
+        .expect("well-formed media profiles");
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(
+            select_profile(&profiles, "Default")
+                .expect("unambiguous display name")
+                .expect("selected profile")
+                .token,
+            "main"
+        );
+        assert!(
+            select_profile(&profiles, "missing")
+                .expect("missing selector is not an error")
+                .is_none()
+        );
+        assert!(
+            select_profile(
+                &[
+                    MediaProfileRecord {
+                        token: "one".to_owned(),
+                        name: Some("same".to_owned()),
+                        ptz_configuration_token: None,
+                    },
+                    MediaProfileRecord {
+                        token: "two".to_owned(),
+                        name: Some("same".to_owned()),
+                        ptz_configuration_token: None,
+                    },
+                ],
+                "same"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_profiles(
+                format!(
+                    "<Envelope><Profiles token=\"{}\"/></Envelope>",
+                    "x".repeat(1_025)
+                )
+                .as_bytes(),
+                4_096,
+                8,
+            )
+            .is_err()
+        );
+
+        let information = parse_device_information(
+            b"<Envelope><Manufacturer>EdgeCommons</Manufacturer><Model>Simulator</Model><FirmwareVersion>1.2.3</FirmwareVersion><SerialNumber>SIM-42</SerialNumber></Envelope>",
+            4_096,
+            8,
+        )
+        .expect("device information response");
+        assert_eq!(information.manufacturer.as_deref(), Some("EdgeCommons"));
+        assert_eq!(information.model.as_deref(), Some("Simulator"));
+        assert_eq!(information.firmware.as_deref(), Some("1.2.3"));
+        assert_eq!(information.serial.as_deref(), Some("SIM-42"));
+
+        assert_eq!(
+            parse_ptz_configuration_token(
+                b"<Envelope><PTZConfiguration token=\"ptz-main\"/></Envelope>",
+                4_096,
+                8,
+            )
+            .expect("single PTZ configuration token"),
+            "ptz-main"
+        );
+        assert!(parse_ptz_configuration_token(
+            b"<Envelope><PTZConfiguration token=\"one\"/><PTZConfiguration token=\"two\"/></Envelope>",
+            4_096,
+            8,
+        )
+        .is_err());
+        assert!(parse_ptz_configuration_token(b"<Envelope/>", 4_096, 8).is_err());
+
+        let features = parse_ptz_node_features(
+            b"<Envelope><PTZNode><HomeSupported>1</HomeSupported><MaximumNumberOfPresets>8</MaximumNumberOfPresets></PTZNode></Envelope>",
+            4_096,
+            8,
+        )
+        .expect("PTZ node features");
+        assert!(features.home);
+        assert!(features.presets);
+        assert!(parse_ptz_node_features(b"<Envelope/>", 4_096, 8).is_err());
+
+        assert_eq!(
+            parse_single_uri(
+                b"<Envelope><Uri>rtsp://camera.test/main</Uri></Envelope>",
+                4_096,
+                8
+            )
+            .expect("single media URI"),
+            "rtsp://camera.test/main"
+        );
+        assert!(parse_single_uri(
+            b"<Envelope><Uri>rtsp://camera.test/one</Uri><Uri>rtsp://camera.test/two</Uri></Envelope>",
+            4_096,
+            8,
+        )
+        .is_err());
+        assert!(parse_single_uri(b"<Envelope/>", 4_096, 8).is_err());
+
+        assert_eq!(
+            SnapshotFallbackReason::for_http_status(404),
+            Some(SnapshotFallbackReason::HttpNotFound)
+        );
+        assert_eq!(
+            SnapshotFallbackReason::for_http_status(405),
+            Some(SnapshotFallbackReason::HttpMethodNotAllowed)
+        );
+        assert_eq!(
+            SnapshotFallbackReason::for_http_status(410),
+            Some(SnapshotFallbackReason::HttpGone)
+        );
+        assert_eq!(
+            SnapshotFallbackReason::for_http_status(501),
+            Some(SnapshotFallbackReason::HttpNotImplemented)
+        );
+        assert_eq!(SnapshotFallbackReason::for_http_status(500), None);
     }
 
     #[test]

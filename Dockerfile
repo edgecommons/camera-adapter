@@ -4,7 +4,7 @@
 #   docker build -f camera-adapter/Dockerfile -t camera-adapter:dev .
 #
 # This file intentionally provides ONVIF and RTSP targets only. GenICam requires a reviewed,
-# architecture-matched Aravis >= 0.8.25 package and is deployed through the native Linux path,
+# architecture-matched Aravis >= 0.8.36 package and is deployed through the native Linux path,
 # not by silently relying on a distribution's older Aravis package.
 #
 # The two base references are reviewed Linux/amd64 digests. Publish a separately reviewed arm64

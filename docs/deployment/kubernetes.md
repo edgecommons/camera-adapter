@@ -71,5 +71,6 @@ The checked-in image does not claim Prometheus support. Add an EdgeCommons Prome
 Service, and ServiceMonitor only as one coordinated, tested packaging change; do not create a
 scrape target for a port the image has not compiled.
 
-Kubernetes/kind, hardware-cluster camera-network, and physical-camera tests remain explicit release
-gates. Record them in the compatibility register rather than treating manifest parsing as evidence.
+Kubernetes/kind and hardware-cluster camera-network tests remain explicit release gates. Physical-camera
+validation is waived for this project because no hardware is available; record the waiver and excluded
+hardware-compatibility claims rather than treating manifest parsing or simulator results as hardware evidence.

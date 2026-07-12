@@ -5696,6 +5696,25 @@ mod tests {
 
     #[test]
     fn storage_low_alarm_is_deduplicated_and_clears_only_after_every_root_recovers() {
+        let healthy = StoragePressureSnapshot {
+            output: RootPressure {
+                root: PathBuf::from("/configured/output"),
+                free_bytes: Some(900),
+                free_percent: Some(90),
+                pressured: false,
+                readable: true,
+            },
+            state: RootPressure {
+                root: PathBuf::from("/configured/state"),
+                free_bytes: Some(900),
+                free_percent: Some(90),
+                pressured: false,
+                readable: true,
+            },
+        };
+        let mut alarms = StorageAlarmState::default();
+        assert!(alarms.transition(&healthy).is_none());
+
         let pressured_output = StoragePressureSnapshot {
             output: RootPressure {
                 root: PathBuf::from("/configured/output"),
@@ -5712,7 +5731,6 @@ mod tests {
                 readable: true,
             },
         };
-        let mut alarms = StorageAlarmState::default();
         let Some(StorageAlarmTransition::Raise(context)) = alarms.transition(&pressured_output)
         else {
             panic!("a configured output floor violation must raise storage-low");
@@ -5722,6 +5740,23 @@ mod tests {
         assert_eq!(context.free_percent, Some(9));
         assert!(alarms.transition(&pressured_output).is_none());
 
+        let pressured_state = StoragePressureSnapshot {
+            output: pressured_output.output.clone(),
+            state: RootPressure {
+                root: PathBuf::from("/configured/state"),
+                free_bytes: Some(50),
+                free_percent: Some(5),
+                pressured: true,
+                readable: true,
+            },
+        };
+        let Some(StorageAlarmTransition::Raise(context)) = alarms.transition(&pressured_state)
+        else {
+            panic!("a new pressured root must replace the active storage-low context");
+        };
+        assert_eq!(context.root, "/configured/state");
+        assert_eq!(context.free_bytes, Some(50));
+
         let recovered = StoragePressureSnapshot {
             output: RootPressure {
                 free_bytes: Some(900),
@@ -5729,13 +5764,58 @@ mod tests {
                 pressured: false,
                 ..pressured_output.output.clone()
             },
-            state: pressured_output.state.clone(),
+            state: RootPressure {
+                free_bytes: Some(900),
+                free_percent: Some(90),
+                pressured: false,
+                ..pressured_state.state
+            },
         };
         let Some(StorageAlarmTransition::Clear(context)) = alarms.transition(&recovered) else {
             panic!("the stateful storage-low condition must clear after both roots recover");
         };
-        assert_eq!(context.root, "/configured/output");
+        assert_eq!(context.root, "/configured/state");
         assert!(alarms.transition(&recovered).is_none());
+    }
+
+    #[test]
+    fn capture_lifecycle_labels_cover_every_supported_trigger_and_mode() {
+        assert_eq!(
+            capture_trigger_type(&crate::messages::CaptureTrigger::Command {
+                request_id: "request".to_string(),
+            }),
+            "command"
+        );
+        assert_eq!(
+            capture_trigger_type(&crate::messages::CaptureTrigger::GroupCommand {
+                request_id: "request".to_string(),
+                capture_group_id: "group".to_string(),
+            }),
+            "group-command"
+        );
+        assert_eq!(
+            capture_trigger_type(&crate::messages::CaptureTrigger::Schedule {
+                schedule_id: "nightly".to_string(),
+                intended_fire_time: chrono::Utc::now(),
+            }),
+            "schedule"
+        );
+        assert_eq!(
+            capture_mode_type(crate::model::CaptureMode::Simulated),
+            "simulated"
+        );
+        assert_eq!(
+            capture_mode_type(crate::model::CaptureMode::SoftwareTrigger),
+            "software-trigger"
+        );
+        assert_eq!(
+            capture_mode_type(crate::model::CaptureMode::SnapshotUri),
+            "snapshot-uri"
+        );
+        assert_eq!(
+            capture_mode_type(crate::model::CaptureMode::RtspFrame),
+            "rtsp-frame"
+        );
     }
 
     #[test]
@@ -5926,6 +6006,30 @@ mod tests {
             result,
             ConfigurationValidationResult::Reject { code, .. } if code == "CAMERA_CONFIG_INVALID"
         ));
+    }
+
+    #[tokio::test]
+    async fn runtime_config_listener_rejects_when_its_runtime_is_gone_before_factory_use() {
+        let listener = RuntimeConfigListener::new(
+            Weak::new(),
+            Arc::new(
+                |_instance, _config| -> edgecommons::Result<Arc<AppFacade>> {
+                    unreachable!("unavailable runtimes must not construct application facades")
+                },
+            ),
+            Arc::new(|_instance, _config| -> edgecommons::Result<EventsFacade> {
+                unreachable!("unavailable runtimes must not construct event facades")
+            }),
+        );
+        let candidate = Arc::new(
+            Config::from_value(COMPONENT_NAME, "gw-01", reload_config("C:/captures-a"))
+                .expect("the core fixture must be structurally valid"),
+        );
+        let error = match listener.prepare_configuration_apply(candidate).await {
+            Ok(_) => panic!("a dropped runtime must veto the candidate before preparation"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "CONFIG_APPLICATION_UNAVAILABLE");
     }
 
     #[cfg(test)]
@@ -8081,6 +8185,90 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn discovery_returns_a_bounded_empty_sim_snapshot_and_replays_retained_pages() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            configuration.global.discovery.enabled = true;
+            let runtime = runtime(configuration, &directory).await;
+            let request = DiscoverRequest {
+                backends: Vec::new(),
+                timeout_ms: 100,
+                limit: 1,
+                cursor: None,
+            };
+
+            let empty = runtime.discover(request.clone()).await.unwrap();
+            assert_eq!(empty["candidates"], json!([]));
+            assert!(empty["nextCursor"].is_null());
+            assert!(empty["completedAt"].is_string());
+
+            let query = json!({ "backends": request.backends });
+            let (_, cursor, completed_at) = runtime
+                .cursors
+                .snapshot_page(
+                    "discover",
+                    &query,
+                    None,
+                    Some(vec![
+                        json!({ "backend": "onvif-rtsp", "selector": { "serial": "one" } }),
+                        json!({ "backend": "onvif-rtsp", "selector": { "serial": "two" } }),
+                    ]),
+                    Some(json!("2026-07-12T00:00:00Z")),
+                    1,
+                )
+                .unwrap();
+            let page = runtime
+                .discover(DiscoverRequest {
+                    cursor: cursor,
+                    ..request
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                page["candidates"],
+                json!([{ "backend": "onvif-rtsp", "selector": { "serial": "two" } }])
+            );
+            assert!(page["nextCursor"].is_null());
+            assert_eq!(page["completedAt"], completed_at.unwrap());
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn reload_supervisor_barrier_cancels_before_timing_out_and_then_allows_retry() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+            let cancellation = CancellationToken::new();
+            let completion = CancellationToken::new();
+            runtime
+                .supervisor_cancellations
+                .write()
+                .unwrap()
+                .insert("camera-a".to_string(), cancellation.clone());
+            runtime
+                .supervisor_finished
+                .write()
+                .unwrap()
+                .insert("camera-a".to_string(), completion.clone());
+
+            let error = runtime
+                .replace_supervisors(&["camera-a".to_string()], Duration::ZERO)
+                .await
+                .expect_err("an unconfirmed supervisor must veto the replacement");
+            assert_eq!(error.code(), crate::ErrorCode::CameraUnavailable);
+            assert!(
+                cancellation.is_cancelled(),
+                "the old generation must be cancelled even when its drain deadline is already elapsed"
+            );
+
+            completion.cancel();
+            runtime
+                .replace_supervisors(&["camera-a".to_string()], Duration::ZERO)
+                .await
+                .expect("a confirmed generation must make the retry safe");
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
         async fn reload_removal_interrupts_queued_work_and_retains_other_camera() {
             let directory = TempDir::new().unwrap();
             let initial = config(directory.path(), &["camera-a", "camera-b"], false);
@@ -8264,6 +8452,64 @@ mod tests {
                 vec!["camera-a".to_string()]
             );
             assert!(runtime.events.read().unwrap().is_empty());
+            runtime.shutdown().await;
+        }
+
+        #[cfg(all(feature = "standalone", feature = "onvif"))]
+        #[tokio::test]
+        async fn runtime_config_listener_does_not_mutate_when_event_facade_preparation_fails() {
+            let directory = TempDir::new().unwrap();
+            let (port, _) = spawn_recording_mqtt_broker().await;
+            let core = facade_core(&directory, port).await;
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+            let app_calls = Arc::new(AtomicUsize::new(0));
+            let event_calls = Arc::new(AtomicUsize::new(0));
+            let listener = RuntimeConfigListener::new(
+                Arc::downgrade(&runtime),
+                {
+                    let core = Arc::clone(&core);
+                    let app_calls = Arc::clone(&app_calls);
+                    Arc::new(move |instance, candidate| {
+                        app_calls.fetch_add(1, Ordering::AcqRel);
+                        Ok(Arc::new(
+                            core.instance_from_config_snapshot(instance, candidate)?
+                                .app(),
+                        ))
+                    })
+                },
+                {
+                    let event_calls = Arc::clone(&event_calls);
+                    Arc::new(move |_instance, _candidate| {
+                        event_calls.fetch_add(1, Ordering::AcqRel);
+                        Err(edgecommons::EdgeCommonsError::Facade(
+                            "controlled event facade preparation failure".to_string(),
+                        ))
+                    })
+                },
+            );
+
+            let error = match listener
+                .prepare_configuration_apply(Arc::new(core_config(
+                    directory.path(),
+                    &["camera-a"],
+                    false,
+                )))
+                .await
+            {
+                Ok(_) => panic!("an event facade failure must veto the candidate"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, "CONFIG_APPLICATION_PREPARE_FAILED");
+            assert_eq!(app_calls.load(Ordering::Acquire), 1);
+            assert_eq!(event_calls.load(Ordering::Acquire), 1);
+            assert_eq!(
+                runtime.registry.ids().unwrap(),
+                vec!["camera-a".to_string()]
+            );
+            assert!(
+                runtime.events.read().unwrap().is_empty(),
+                "preparation failures must not install a partial event facade map"
+            );
             runtime.shutdown().await;
         }
 
@@ -8502,6 +8748,65 @@ mod tests {
             assert_eq!(outbox.len(), 1);
             assert_eq!(outbox[0].message_kind, "terminal");
             assert!(outbox[0].topic.ends_with("/app/image/captured"));
+            runtime.shutdown().await;
+        }
+
+        #[cfg(all(feature = "standalone", feature = "onvif"))]
+        #[tokio::test]
+        async fn saturated_lifecycle_dispatcher_drops_diagnostics_without_blocking_acceptance() {
+            let directory = TempDir::new().unwrap();
+            let (port, publishes) = spawn_recording_mqtt_broker().await;
+            let core = facade_core(&directory, port).await;
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            configuration.global.operator_events.capture_lifecycle = true;
+            let runtime = runtime(configuration, &directory).await;
+            runtime.events.write().unwrap().insert(
+                "camera-a".to_string(),
+                core.instance("camera-a").unwrap().events(),
+            );
+            let permits = Arc::clone(&runtime.waiters.lifecycle_event_slots)
+                .acquire_many_owned(
+                    u32::try_from(MAX_LIFECYCLE_EVENT_PUBLISHES)
+                        .expect("the fixed lifecycle capacity fits Tokio's semaphore API"),
+                )
+                .await
+                .expect("the test holds every detached lifecycle permit");
+
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "saturated-lifecycle-dispatch".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "saturated-lifecycle-dispatch-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .expect("diagnostic saturation must not reject durable capture acceptance");
+            let crate::catalog::AcceptJobOutcome::Inserted(record) = accepted else {
+                panic!("the fixture capture must be newly accepted");
+            };
+            assert_eq!(record.state, crate::model::JobState::Queued);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                publishes.lock().unwrap().iter().all(|(topic, _)| {
+                    !topic.ends_with("/evt/debug/capture-queued")
+                        && !topic.ends_with("/evt/info/capture-started")
+                }),
+                "a saturated bounded dispatcher must drop diagnostics rather than queue task work"
+            );
+
+            drop(permits);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                publishes.lock().unwrap().iter().all(|(topic, _)| {
+                    !topic.ends_with("/evt/debug/capture-queued")
+                        && !topic.ends_with("/evt/info/capture-started")
+                }),
+                "dropped diagnostics must not be replayed after capacity returns"
+            );
             runtime.shutdown().await;
         }
 

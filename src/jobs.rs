@@ -2238,6 +2238,60 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn deadline_helper_preserves_results_and_reports_cancellation_or_timeout() {
+        let (engine, _directory) = engine().await;
+        let cancellation = CancellationToken::new();
+        assert_eq!(
+            engine
+                .await_with_deadline(
+                    now_ms() + 1_000,
+                    &cancellation,
+                    async { Ok::<_, CameraError>("complete") },
+                    "test completion",
+                )
+                .await
+                .unwrap(),
+            "complete"
+        );
+
+        cancellation.cancel();
+        let cancelled = engine
+            .await_with_deadline(
+                now_ms() + 1_000,
+                &cancellation,
+                std::future::pending::<Result<()>>(),
+                "test cancellation",
+            )
+            .await
+            .expect_err("a cancelled runtime must win over an unfinished operation");
+        assert_eq!(cancelled.code(), ErrorCode::CaptureCancelled);
+
+        let timeout_cancellation = CancellationToken::new();
+        let deadline = now_ms() + 100;
+        let task = tokio::spawn({
+            let engine = engine.clone();
+            let timeout_cancellation = timeout_cancellation.clone();
+            async move {
+                engine
+                    .await_with_deadline(
+                        deadline,
+                        &timeout_cancellation,
+                        std::future::pending::<Result<()>>(),
+                        "test timeout",
+                    )
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(101)).await;
+        let timed_out = task
+            .await
+            .expect("deadline helper task must not panic")
+            .expect_err("an unfinished operation must time out at its absolute deadline");
+        assert_eq!(timed_out.code(), ErrorCode::CaptureTimeout);
+    }
+
     #[tokio::test]
     async fn terminal_writes_preserve_profile_trigger_frame_and_failure_contracts() {
         let (engine, _directory) = engine().await;
