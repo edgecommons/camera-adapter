@@ -1744,8 +1744,35 @@ fn remember_terminal_decoder_pts(recently_terminal_pts: &mut VecDeque<u64>, outp
 
 #[cfg(feature = "rtsp")]
 impl Drop for GstreamerDecoder {
+    /// Tears the pipeline down off the reactor.
+    ///
+    /// D3. `set_state(Null)` is a blocking GStreamer call: it joins the decoder's streaming threads
+    /// and waits for the state change to complete, which on a stalled or slow decoder is not
+    /// instantaneous. Every other GStreamer touch in this file is correctly on `spawn_blocking` --
+    /// pipeline creation, every decode, the TLS setup. The teardown was the one that was not, and a
+    /// decoder is dropped on a Tokio worker thread: at the end of a warm session, on every OnDemand
+    /// capture, and on every reconnect. So the one GStreamer call nobody thought about was the one
+    /// that ran on the reactor, and a camera whose pipeline was slow to stop blocked a worker that
+    /// other cameras' futures were waiting on.
+    ///
+    /// The pipeline is moved onto the blocking pool. `Drop` cannot await, so this is deliberately
+    /// fire-and-forget: the handle is dropped, and the pipeline is freed when the blocking task
+    /// finishes.
+    ///
+    /// Outside a Tokio runtime -- a plain test, or teardown after the runtime is gone -- there is no
+    /// blocking pool to move to and no reactor left to protect, so it runs inline.
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            let _ = self.pipeline.set_state(gst::State::Null);
+            return;
+        };
+        // `Pipeline` is a refcounted GObject handle; cloning it is a refcount bump, not a copy of the
+        // pipeline, so the blocking task owns a handle that keeps the pipeline alive until it has
+        // finished stopping it.
+        let pipeline = self.pipeline.clone();
+        handle.spawn_blocking(move || {
+            let _ = pipeline.set_state(gst::State::Null);
+        });
     }
 }
 

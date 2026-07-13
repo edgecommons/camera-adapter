@@ -2057,6 +2057,55 @@ impl CameraRuntime {
             .collect()
     }
 
+    /// Publishes a camera state transition, and says so when it does not take.
+    ///
+    /// D5. `CameraRegistry::update` has two failure channels and every supervisor call site
+    /// discarded both with `let _ =`:
+    ///
+    /// * `Err` is a poisoned registry lock. The component's camera state is now unreadable, every
+    ///   subsequent transition will be lost, and nothing said a word.
+    /// * `Ok(false)` is the generation fence doing its job -- this supervisor has been superseded by
+    ///   a newer generation (or its camera is gone), and its update was deliberately dropped. That is
+    ///   correct, and it is also exactly what an operator staring at a camera stuck in the wrong
+    ///   state needs to be told, because the alternative explanation is a bug.
+    ///
+    /// Neither changes control flow: a superseded supervisor is already on its way out, and a
+    /// poisoned lock is not something a camera actor can do anything about. What changes is that
+    /// both are now visible.
+    fn publish_camera_state(
+        &self,
+        instance: &str,
+        generation: u64,
+        state: CameraConnectionState,
+        capabilities: Option<crate::model::CameraCapabilities>,
+        last_error: Option<CameraStatusError>,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        match self.registry.update(
+            instance,
+            generation,
+            state,
+            capabilities,
+            last_error,
+            observed_at,
+        ) {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                instance,
+                generation,
+                ?state,
+                "camera state update was dropped: a newer generation owns this camera, or it is no longer configured"
+            ),
+            Err(error) => tracing::error!(
+                instance,
+                generation,
+                ?state,
+                error = %error,
+                "camera registry is unavailable; this camera's state can no longer be published"
+            ),
+        }
+    }
+
     /// Answers `sb/queue-status`.
     ///
     /// Read-only and cheap: the admission and dispatcher numbers are atomics, and the durable
@@ -4630,7 +4679,7 @@ impl CameraRuntime {
             {
                 Ok(factory) => factory,
                 Err(error) => {
-                    let _ = self.registry.update(
+                    self.publish_camera_state(
                         &instance,
                         generation,
                         CameraConnectionState::Backoff,
@@ -4642,7 +4691,7 @@ impl CameraRuntime {
                 }
             };
             if cancellation.is_cancelled() {
-                let _ = self.registry.update(
+                self.publish_camera_state(
                     &camera.id,
                     generation,
                     CameraConnectionState::Stopping,
@@ -4653,7 +4702,7 @@ impl CameraRuntime {
                 return;
             }
             generation = generation.saturating_add(1);
-            let _ = self.registry.update(
+            self.publish_camera_state(
                 &camera.id,
                 generation,
                 CameraConnectionState::Connecting,
@@ -4691,7 +4740,7 @@ impl CameraRuntime {
                     ) {
                         Ok(pair) => pair,
                         Err(error) => {
-                            let _ = self.registry.update(
+                            self.publish_camera_state(
                                 &camera.id,
                                 generation,
                                 CameraConnectionState::Backoff,
@@ -4717,7 +4766,7 @@ impl CameraRuntime {
                     if let Ok(mut sessions) = self.session_cancellations.write() {
                         sessions.insert(camera.id.clone(), actor_cancellation.clone());
                     }
-                    let _ = self.registry.update(
+                    self.publish_camera_state(
                         &camera.id,
                         generation,
                         CameraConnectionState::Online,
@@ -4731,7 +4780,7 @@ impl CameraRuntime {
                         Err(error) => {
                             actor_task.abort();
                             let _ = actor_task.await;
-                            let _ = self.registry.update(
+                            self.publish_camera_state(
                                 &camera.id,
                                 generation,
                                 CameraConnectionState::Backoff,
@@ -4809,7 +4858,7 @@ impl CameraRuntime {
                         return;
                     }
                     if let Err(error) = result {
-                        let _ = self.registry.update(
+                        self.publish_camera_state(
                             &camera.id,
                             generation,
                             CameraConnectionState::Backoff,
@@ -4820,7 +4869,7 @@ impl CameraRuntime {
                     }
                 }
                 Err(error) => {
-                    let _ = self.registry.update(
+                    self.publish_camera_state(
                         &camera.id,
                         generation,
                         CameraConnectionState::Backoff,
