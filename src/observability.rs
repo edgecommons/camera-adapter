@@ -239,6 +239,85 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// The fleet's southbound health, one tracker per camera.
+///
+/// `CameraHealthTracker` existed, was tested, and was called by nothing -- the third subsystem in this
+/// codebase found fully built and wired to nothing, after retention and the capture metrics. This is
+/// the thing that calls it.
+#[derive(Debug, Default)]
+pub struct FleetHealth {
+    cameras: std::sync::Mutex<std::collections::BTreeMap<String, CameraHealthTracker>>,
+}
+
+impl FleetHealth {
+    /// Applies an observation to one camera, creating its tracker on first sight.
+    fn observe(&self, instance: &str, observation: impl FnOnce(&mut CameraHealthTracker)) {
+        let mut cameras = self
+            .cameras
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tracker = cameras
+            .entry(instance.to_owned())
+            .or_insert_with(|| CameraHealthTracker::new(Instant::now()));
+        observation(tracker);
+    }
+
+    /// A camera answered: a frame was acquired, and this is how long the round-trip took.
+    pub fn observed_success(&self, instance: &str, poll_latency: Duration) {
+        self.observe(instance, |tracker| {
+            tracker.observe_success(Instant::now(), poll_latency);
+        });
+    }
+
+    /// A camera failed to answer.
+    pub fn observed_read_error(&self, instance: &str) {
+        self.observe(instance, CameraHealthTracker::observe_read_error);
+    }
+
+    /// A camera's session was re-established.
+    pub fn observed_reconnect(&self, instance: &str) {
+        self.observe(instance, CameraHealthTracker::observe_reconnect);
+    }
+
+    /// A terminal message for this camera reached the transport, this long after it was written.
+    pub fn observed_publish(&self, instance: &str, latency: Duration) {
+        self.observe(instance, |tracker| tracker.observe_publish(latency));
+    }
+
+    /// Drains one camera's interval counters into a sample.
+    ///
+    /// `stale_after` is `healthThresholds.staleSignalSecs`, which until now decided nothing at all.
+    pub fn sample(
+        &self,
+        instance: &str,
+        online: bool,
+        stale_after: Duration,
+    ) -> SouthboundHealthSample {
+        let mut cameras = self
+            .cameras
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tracker = cameras
+            .entry(instance.to_owned())
+            .or_insert_with(|| CameraHealthTracker::new(Instant::now()));
+        tracker.take_sample(online, Instant::now(), stale_after)
+    }
+
+    /// Retires a camera a reload removed, so its tracker cannot outlive it.
+    pub fn forget(&self, instance: &str) {
+        self.cameras
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(instance);
+    }
+}
+
+impl crate::outbox::PublishObserver for FleetHealth {
+    fn observed_publish(&self, instance: &str, latency: Duration) {
+        Self::observed_publish(self, instance, latency);
+    }
+}
+
 /// The component's metric surface.
 ///
 /// The camera adapter emitted no metrics at all: there was not one call site for `metrics()`,
@@ -260,12 +339,16 @@ fn duration_millis(duration: Duration) -> u64 {
 /// publishes.
 pub struct CaptureMetrics {
     metrics: Arc<dyn edgecommons::metrics::MetricService>,
+    /// Serializes the define-then-emit pair that `southbound_health` needs. See [`Self::emit_health`].
+    health: tokio::sync::Mutex<()>,
 }
 
 /// Counted as captures move: emitted at the moment, never sampled.
 pub const CAPTURE_METRIC: &str = "camera_captures";
 /// Sampled levels: what the component is holding right now.
 pub const QUEUE_METRIC: &str = "camera_queue";
+/// The standard per-instance southbound metric every adapter in the ecosystem emits.
+pub const HEALTH_METRIC: &str = "southbound_health";
 
 impl CaptureMetrics {
     /// Defines both metrics against the component's metric service.
@@ -295,7 +378,70 @@ impl CaptureMetrics {
                 .add_measure("camerasConfigured", "Count", 60)
                 .build(),
         );
-        Self { metrics }
+        Self {
+            metrics,
+            health: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Emits one camera's standard `southbound_health` sample, dimensioned by `instance`.
+    ///
+    /// This is the metric the whole ecosystem alarms on -- SOUTHBOUND §5 and DESIGN §19.1 -- and the
+    /// adapter emitted nothing at all. `CameraHealthTracker` was written to produce exactly these
+    /// measures and had no callers, so `healthThresholds.staleSignalSecs` decided nothing and no
+    /// camera could report itself stale.
+    ///
+    /// The define-then-emit pair is not an accident, and it is worth explaining. The core metric API
+    /// carries dimensions on the metric DEFINITION and keys definitions by name
+    /// (`HashMap<String, Metric>`), while `emit_metric(name, values)` carries only values -- so one
+    /// name cannot be emitted with different dimension values, which is precisely what "dimensioned
+    /// by instance" requires of a multi-camera adapter. Redefining immediately before emitting is the
+    /// only way to say `instance=cam-03` with today's API, and it is safe only while the pair is
+    /// atomic. Hence the lock, and hence the rule: EVERY `southbound_health` emission goes through
+    /// this method. The real fix belongs in the core library (dimensions at emit time), and until it
+    /// lands this is the honest way to keep the contract.
+    pub async fn emit_health(&self, instance: &str, sample: &SouthboundHealthSample, now: bool) {
+        let metric = edgecommons::metrics::MetricBuilder::create(HEALTH_METRIC)
+            .add_dimension("instance", instance)
+            .add_measure("connectionState", "Count", 1)
+            .add_measure("publishLatencyMs", "Milliseconds", 1)
+            .add_measure("pollLatencyMs", "Milliseconds", 1)
+            .add_measure("readErrors", "Count", 60)
+            .add_measure("staleSignals", "Count", 60)
+            .add_measure("reconnects", "Count", 60)
+            .build();
+
+        let mut values = std::collections::HashMap::with_capacity(6);
+        values.insert(
+            "connectionState".to_owned(),
+            f64::from(sample.connection_state),
+        );
+        values.insert("readErrors".to_owned(), sample.read_errors as f64);
+        values.insert("staleSignals".to_owned(), f64::from(sample.stale_signals));
+        values.insert("reconnects".to_owned(), sample.reconnects as f64);
+        // A latency that has never been observed is absent, not zero: zero is a real measurement and
+        // would read as a camera answering instantly.
+        if let Some(latency) = sample.publish_latency_ms {
+            values.insert("publishLatencyMs".to_owned(), latency as f64);
+        }
+        if let Some(latency) = sample.poll_latency_ms {
+            values.insert("pollLatencyMs".to_owned(), latency as f64);
+        }
+
+        let _serialized = self.health.lock().await;
+        self.metrics.define_metric(metric);
+        let emitted = if now {
+            self.metrics.emit_metric_now(HEALTH_METRIC, values).await
+        } else {
+            self.metrics.emit_metric(HEALTH_METRIC, values).await
+        };
+        if let Err(error) = emitted {
+            tracing::warn!(
+                instance,
+                error = %error,
+                "southbound health metric could not be emitted"
+            );
+        }
     }
 
     /// Counts one capture event. Best effort: a metric target that is unhappy must never be able to
@@ -330,6 +476,58 @@ pub const fn terminal_measure(state: crate::model::JobState) -> Option<&'static 
 
 #[cfg(test)]
 mod tests {
+
+    /// Interval counters drain on emission; last-seen values do not.
+    ///
+    /// The distinction is the whole reason `CameraHealthTracker` exists rather than a bag of numbers:
+    /// `readErrors` and `reconnects` answer "what happened since you last asked", so reporting them
+    /// twice would double-count an outage. `pollLatencyMs` answers "how is it now", so a camera that
+    /// has gone quiet must keep reporting the last round-trip it managed, not silently forget it.
+    #[test]
+    fn a_health_sample_drains_the_counters_and_keeps_the_gauges() {
+        let health = FleetHealth::default();
+        health.observed_success("camera-a", Duration::from_millis(42));
+        health.observed_read_error("camera-a");
+        health.observed_read_error("camera-a");
+        health.observed_reconnect("camera-a");
+        health.observed_publish("camera-a", Duration::from_millis(7));
+
+        let first = health.sample("camera-a", true, Duration::from_secs(300));
+        assert_eq!(first.connection_state, 1);
+        assert_eq!(first.read_errors, 2);
+        assert_eq!(first.reconnects, 1);
+        assert_eq!(first.poll_latency_ms, Some(42));
+        assert_eq!(first.publish_latency_ms, Some(7));
+        assert_eq!(first.stale_signals, 0, "the camera answered just now");
+
+        let second = health.sample("camera-a", true, Duration::from_secs(300));
+        assert_eq!(second.read_errors, 0, "an interval counter reports once");
+        assert_eq!(second.reconnects, 0, "an interval counter reports once");
+        assert_eq!(
+            second.poll_latency_ms,
+            Some(42),
+            "the last round-trip is a gauge, and a camera that has gone quiet still has one"
+        );
+    }
+
+    /// A camera nobody has ever heard from is stale, not healthy.
+    ///
+    /// The tracker starts with no successful observation at all, and the temptation is to treat that
+    /// as "fine so far". A camera that has never produced a frame is the one an operator most wants
+    /// to hear about.
+    #[test]
+    fn a_camera_that_has_never_answered_is_stale_from_the_start() {
+        let health = FleetHealth::default();
+        let sample = health.sample("camera-a", true, Duration::ZERO);
+        assert_eq!(sample.connection_state, 1);
+        assert_eq!(
+            sample.stale_signals, 1,
+            "silence since startup is silence, whatever the session says"
+        );
+        assert_eq!(sample.poll_latency_ms, None);
+
+        health.forget("camera-a");
+    }
     /// Every terminal state a capture can reach must be counted, and nothing else may be.
     ///
     /// The counters are what an operator watches, so a terminal that maps to no measure is a capture

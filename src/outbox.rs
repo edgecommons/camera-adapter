@@ -62,6 +62,16 @@ impl OutboxStore for Catalog {
     }
 }
 
+/// Told how long a camera's terminal message took to reach the transport.
+///
+/// `publishLatencyMs` is one of the contract measures of `southbound_health` (SOUTHBOUND §5), and it
+/// is the one measure only the outbox can source: it is not known until the message is confirmed,
+/// long after the capture that produced it is done.
+pub trait PublishObserver: Send + Sync {
+    /// One confirmed publication, and the camera it belongs to.
+    fn observed_publish(&self, instance: &str, latency: Duration);
+}
+
 /// A strict publisher that returns success only after the transport acknowledges exact bytes.
 #[async_trait]
 pub trait ConfirmedPublisher: Send + Sync {
@@ -153,6 +163,7 @@ pub struct OutboxPass {
 pub struct OutboxPublisher<S, P> {
     store: Arc<S>,
     publisher: Arc<P>,
+    observer: Option<Arc<dyn PublishObserver>>,
     confirmation_timeout: Duration,
     poll_interval: Duration,
     max_result_records: u64,
@@ -166,6 +177,13 @@ where
     S: OutboxStore + 'static,
     P: ConfirmedPublisher + 'static,
 {
+    /// Reports confirmed publications to a southbound-health observer.
+    #[must_use]
+    pub fn with_publish_observer(mut self, observer: Arc<dyn PublishObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
     /// Creates a publisher with bounded transport and polling deadlines.
     pub fn new(
         store: Arc<S>,
@@ -183,6 +201,7 @@ where
         let (pressure_tx, _) = watch::channel(OutboxPressure::default());
         let (durability_tx, _) = watch::channel(OutboxDurability::default());
         Ok(Self {
+            observer: None,
             store,
             publisher,
             confirmation_timeout,
@@ -252,8 +271,18 @@ where
                 Ok(()) => {
                     // A failed SQLite commit after PUBACK intentionally leaves the row pending;
                     // the next attempt reuses identical bytes and yields at-least-once delivery.
-                    if self.store.delivered(record.id, (self.clock)()).await? {
+                    let delivered_at_ms = (self.clock)();
+                    if self.store.delivered(record.id, delivered_at_ms).await? {
                         pass.delivered += 1;
+                        if let (Some(observer), Some(instance)) =
+                            (self.observer.as_ref(), record.instance.as_deref())
+                        {
+                            let latency = delivered_at_ms.saturating_sub(record.created_at_ms);
+                            observer.observed_publish(
+                                instance,
+                                Duration::from_millis(u64::try_from(latency).unwrap_or(0)),
+                            );
+                        }
                     }
                 }
                 Err(_) => {
@@ -477,8 +506,66 @@ mod tests {
         }
     }
 
+    /// A confirmed publication tells the camera's health how long it took.
+    ///
+    /// `publishLatencyMs` is a contract measure of `southbound_health` (SOUTHBOUND §5) and it is the
+    /// one measure only the outbox can source: it is not known until the transport confirms, long
+    /// after the capture that produced the message is done. Which makes it exactly the kind of thing
+    /// that gets wired and never called.
+    #[tokio::test]
+    async fn a_confirmed_publication_reports_its_latency_to_the_camera_that_earned_it() {
+        #[derive(Default)]
+        struct RecordingObserver {
+            seen: Mutex<Vec<(String, Duration)>>,
+        }
+
+        impl PublishObserver for RecordingObserver {
+            fn observed_publish(&self, instance: &str, latency: Duration) {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((instance.to_owned(), latency));
+            }
+        }
+
+        let observer = Arc::new(RecordingObserver::default());
+        let store = Arc::new(FakeStore::default());
+        // The message was written at 1_000 and is confirmed at 1_250.
+        let mut pending = record();
+        pending.created_at_ms = 1_000;
+        store.records.lock().unwrap().push(pending);
+        let publisher = Arc::new(FakePublisher::default());
+        *publisher.outcomes.lock().unwrap() = VecDeque::from([true]);
+        let worker = OutboxPublisher::new(
+            store.clone(),
+            publisher.clone(),
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+            1_000,
+        )
+        .unwrap()
+        .with_clock(Arc::new(|| 1_250))
+        .with_publish_observer(Arc::clone(&observer) as Arc<dyn PublishObserver>);
+
+        let pass = worker.run_once().await.unwrap();
+        assert_eq!(pass.delivered, 1);
+
+        let seen = observer.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "one confirmed message, one observation");
+        assert_eq!(
+            seen[0].0, "camera-a",
+            "the latency belongs to the camera whose capture produced the message"
+        );
+        assert_eq!(
+            seen[0].1,
+            Duration::from_millis(250),
+            "the latency is from the moment the message was written to the moment it was confirmed"
+        );
+    }
+
     fn record() -> OutboxRecord {
         OutboxRecord {
+            instance: Some("camera-a".to_string()),
             id: 7,
             event_key: "evt_7".to_string(),
             capture_id: Some("cap_7".to_string()),

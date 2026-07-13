@@ -480,6 +480,8 @@ pub struct WaiterRecord {
 /// Exact stored outbox record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxRecord {
+    /// The camera whose capture produced this message, when it had one.
+    pub instance: Option<String>,
     /// SQLite row identifier.
     pub id: i64,
     /// Stable semantic event key.
@@ -1577,11 +1579,19 @@ impl Catalog {
         }
         self.execute(move |connection| {
             let mut statement = connection.prepare(
-                "SELECT id,event_key,capture_id,group_id,message_kind,topic,envelope_uuid,encoded_envelope,\
-                 created_at_ms,available_at_ms,attempts,last_attempt_at_ms,delivered_at_ms,last_error \
-                 FROM outbox WHERE delivered_at_ms IS NULL AND available_at_ms<=?1 ORDER BY id LIMIT ?2",
+                // The camera is joined through rather than stored again: a terminal job is retained
+                // until its own messages are gone, so the row is always there while the message is
+                // pending. The alternative -- a column and a migration -- stores what the catalog
+                // already knows, and reading it per delivery would add work to the outbox, which is
+                // a single serial worker with no headroom to give.
+                "SELECT o.id,o.event_key,o.capture_id,o.group_id,o.message_kind,o.topic,\
+                 o.envelope_uuid,o.encoded_envelope,o.created_at_ms,o.available_at_ms,o.attempts,\
+                 o.last_attempt_at_ms,o.delivered_at_ms,o.last_error,j.instance \
+                 FROM outbox o LEFT JOIN jobs j ON j.capture_id=o.capture_id \
+                 WHERE o.delivered_at_ms IS NULL AND o.available_at_ms<=?1 ORDER BY o.id LIMIT ?2",
             )?;
-            let records = statement.query_map(params![now_ms, limit as i64], outbox_from_row)?
+            let records = statement
+                .query_map(params![now_ms, limit as i64], outbox_from_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(records)
         })
@@ -3710,6 +3720,7 @@ fn outbox_from_row(row: &Row<'_>) -> rusqlite::Result<OutboxRecord> {
         last_attempt_at_ms: row.get(11)?,
         delivered_at_ms: row.get(12)?,
         last_error: row.get(13)?,
+        instance: row.get(14)?,
     })
 }
 

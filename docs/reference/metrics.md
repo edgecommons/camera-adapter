@@ -1,7 +1,20 @@
 # Metrics and alarms reference
 
-The adapter emits two metrics through the EdgeCommons metric subsystem, which routes them to the target
+The adapter emits three metrics through the EdgeCommons metric subsystem, which routes them to the target
 selected by the component's `metricEmission` configuration.
+
+`southbound_health` is the standard metric every adapter in the ecosystem emits, dimensioned by
+`instance` so each camera reports its own. It is sampled every 30 seconds, and emitted immediately when
+a camera connects or disconnects.
+
+| Measure | Unit | Meaning |
+|---|---|---|
+| `connectionState` | Count | 1 while the camera's session is live, 0 otherwise. |
+| `pollLatencyMs` | Milliseconds | The last acquisition round-trip. Absent until the camera has produced a frame. |
+| `publishLatencyMs` | Milliseconds | How long the camera's last terminal message took to reach the transport. Absent until one has. |
+| `readErrors` | Count | Acquisition failures in the interval. A failure to encode or to write to disk is not counted: it is not the camera's fault. |
+| `staleSignals` | Count | 1 when the camera has produced nothing within `healthThresholds.staleSignalSecs`, 0 otherwise. A camera can be connected and stale. |
+| `reconnects` | Count | Sessions re-established in the interval. A camera's first connection is not a reconnect. |
 
 `camera_captures` counts captures as they happen. It is emitted at the moment of each event, never sampled,
 so a capture that starts and finishes between two collection intervals is still counted.

@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
@@ -670,6 +670,8 @@ pub struct CameraRuntime {
     readiness: RuntimeReadiness,
     /// Capture counters and sampled queue levels. See `observability::CaptureMetrics`.
     metrics: Arc<crate::observability::CaptureMetrics>,
+    /// Per-camera southbound health, the standard metric every adapter in the ecosystem emits.
+    health: Arc<crate::observability::FleetHealth>,
     actors: Arc<RwLock<HashMap<String, CameraActorHandle>>>,
     /// Per-supervisor shutdown tokens.  A child token also observes process shutdown, while a
     /// reload can retire one connecting/backing-off supervisor without stopping the whole runtime.
@@ -725,20 +727,49 @@ struct RuntimeReloadCheckpoint {
 /// Process-local core deferred tokens paired with durable waiter records. The durable row makes
 /// acceptance auditable; only the opaque token stays in memory, because routing remains owned by
 /// the EdgeCommons command inbox.
+/// Something waiting to be told how a capture or a group ended.
+///
+/// The registry held `DeferredReplyToken` directly. That type is minted only by the core library, has
+/// private fields and no constructor an adapter can reach -- so the waiter bound below could not be
+/// tested at all without putting a `#[cfg(test)]` fake inside a production type, which is precisely
+/// the shape (T2) this codebase has already been bitten by. A one-method seam costs nothing, changes
+/// no behaviour, and makes the bound provable.
+#[async_trait::async_trait]
+trait CaptureWaiter: Send + Sync {
+    /// Delivers the terminal result. `true` when the caller was actually reached.
+    async fn settle(&self, result: serde_json::Value) -> bool;
+}
+
+#[async_trait::async_trait]
+impl CaptureWaiter for DeferredReplyToken {
+    async fn settle(&self, result: serde_json::Value) -> bool {
+        self.settle_success(Some(result)).await.is_ok()
+    }
+}
+
 struct RuntimeJobHooks {
     catalog: Catalog,
     runtime: Mutex<Weak<CameraRuntime>>,
     lifecycle_event_slots: Arc<Semaphore>,
-    tokens: Mutex<HashMap<String, Vec<(String, DeferredReplyToken)>>>,
-    group_tokens: Mutex<HashMap<String, Vec<DeferredReplyToken>>>,
+    /// `limits.maxDeferredWaitersPerCapture`, which until now bounded nothing.
+    ///
+    /// Held here rather than read from the configuration on every attach: this is on the acceptance
+    /// path, and the configuration is a deep clone.
+    waiter_limit: AtomicUsize,
+    tokens: Mutex<HashMap<String, AttachedWaiters>>,
+    group_tokens: Mutex<HashMap<String, Vec<Arc<dyn CaptureWaiter>>>>,
     pending: Mutex<HashMap<(String, String), PendingDeferredWaiter>>,
 }
 
-type PendingDeferredWaiter = (String, DeferredReplyToken, String, String);
+type PendingDeferredWaiter = (String, Arc<dyn CaptureWaiter>, String, String);
+/// The callers attached to one capture, each with the waiter id its durable row is keyed by.
+type AttachedWaiters = Vec<(String, Arc<dyn CaptureWaiter>)>;
 
 impl RuntimeJobHooks {
     fn new(catalog: Catalog) -> Self {
         Self {
+            // Replaced from configuration the moment the runtime exists; this is only the floor.
+            waiter_limit: AtomicUsize::new(8),
             catalog,
             runtime: Mutex::new(Weak::new()),
             lifecycle_event_slots: Arc::new(Semaphore::new(MAX_LIFECYCLE_EVENT_PUBLISHES)),
@@ -759,24 +790,39 @@ impl RuntimeJobHooks {
         self.runtime.lock().ok()?.upgrade()
     }
 
+    /// Applies `limits.maxDeferredWaitersPerCapture` to the hooks.
+    fn set_waiter_limit(&self, limit: usize) {
+        self.waiter_limit.store(limit.max(1), Ordering::Release);
+    }
+
+    /// Attaches one more caller to an in-flight capture, up to the configured bound.
+    ///
+    /// A retried direct capture attaches ANOTHER waiter to the same job (DESIGN §356), and the number
+    /// of them is what `limits.maxDeferredWaitersPerCapture` exists to bound. It bounded nothing: the
+    /// list was pushed to unconditionally, so a client that kept retrying grew it without limit, and
+    /// every one of those tokens is held until the capture is terminal and then fanned out to.
     fn register(
         &self,
         capture_id: String,
         waiter_id: String,
-        token: DeferredReplyToken,
+        token: Arc<dyn CaptureWaiter>,
     ) -> Result<()> {
-        self.tokens
-            .lock()
-            .map_err(|_| {
-                crate::CameraError::Catalog("deferred waiter registry is unavailable".to_string())
-            })?
-            .entry(capture_id)
-            .or_default()
-            .push((waiter_id, token));
+        let limit = self.waiter_limit.load(Ordering::Acquire);
+        let mut tokens = self.tokens.lock().map_err(|_| {
+            crate::CameraError::Catalog("deferred waiter registry is unavailable".to_string())
+        })?;
+        let waiters = tokens.entry(capture_id).or_default();
+        if waiters.len() >= limit {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::ResourceLimit,
+                "this capture already has the maximum number of callers waiting on it",
+            ));
+        }
+        waiters.push((waiter_id, token));
         Ok(())
     }
 
-    fn register_group(&self, group_id: String, token: DeferredReplyToken) -> Result<()> {
+    fn register_group(&self, group_id: String, token: Arc<dyn CaptureWaiter>) -> Result<()> {
         self.group_tokens
             .lock()
             .map_err(|_| {
@@ -797,7 +843,7 @@ impl RuntimeJobHooks {
         };
         let body = group_terminal_json(group);
         for token in tokens {
-            let _ = token.settle_success(Some(body.clone())).await;
+            let _ = token.settle(body.clone()).await;
         }
     }
 
@@ -806,7 +852,7 @@ impl RuntimeJobHooks {
         instance: String,
         request_id: String,
         waiter_id: String,
-        token: DeferredReplyToken,
+        token: Arc<dyn CaptureWaiter>,
         correlation_id: String,
         request_uuid: String,
     ) -> Result<()> {
@@ -828,11 +874,7 @@ impl RuntimeJobHooks {
         Ok(())
     }
 
-    fn take_pending(
-        &self,
-        instance: &str,
-        request_id: &str,
-    ) -> Option<(String, DeferredReplyToken, String, String)> {
+    fn take_pending(&self, instance: &str, request_id: &str) -> Option<PendingDeferredWaiter> {
         self.pending
             .lock()
             .ok()?
@@ -949,6 +991,35 @@ impl JobHooks for RuntimeJobHooks {
         ) {
             runtime.metrics.count(measure).await;
         }
+        // The camera answered, or it did not. `pollLatencyMs` is the acquisition round-trip, which is
+        // exactly what SOUTHBOUND §5 means by a read/poll latency, and a failure IN acquisition is a
+        // read error -- an encode or a disk failure is not the camera's fault and must not be counted
+        // against it, or a healthy camera behind a full disk reads as a broken one.
+        if let Some(runtime) = self.runtime() {
+            match record.state {
+                crate::model::JobState::Succeeded => {
+                    if let Some(acquisition) = terminal_body
+                        .get("durationsMs")
+                        .and_then(|durations| durations.get("acquisition"))
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        runtime
+                            .health
+                            .observed_success(&record.instance, Duration::from_millis(acquisition));
+                    }
+                }
+                crate::model::JobState::Failed => {
+                    let stage = terminal_body
+                        .get("failure")
+                        .and_then(|failure| failure.get("stage"))
+                        .and_then(serde_json::Value::as_str);
+                    if stage.is_some_and(|stage| stage.eq_ignore_ascii_case("acquiring")) {
+                        runtime.health.observed_read_error(&record.instance);
+                    }
+                }
+                _ => {}
+            }
+        }
         // The execution slot the scheduler was holding on this capture's behalf, released on the one
         // path every capture takes exactly once. Releasing it only on success would be a component
         // that stops scheduling after its first failure.
@@ -960,11 +1031,7 @@ impl JobHooks for RuntimeJobHooks {
             Err(_) => return,
         };
         for (waiter_id, token) in tokens {
-            if token
-                .settle_success(Some(terminal_body.clone()))
-                .await
-                .is_ok()
-            {
+            if token.settle(terminal_body.clone()).await {
                 let _ = self.catalog.remove_waiter(waiter_id).await;
             }
         }
@@ -996,10 +1063,13 @@ impl AcceptanceHook for RuntimeJobHooks {
         else {
             return Ok(());
         };
+        // Attached before the durable row is written: a caller the bound turns away must not leave a
+        // waiter row behind for a reply that will never be routed to it.
+        self.register(record.capture_id.clone(), waiter_id.clone(), token)?;
         let now = chrono::Utc::now().timestamp_millis();
         self.catalog
             .add_waiter(crate::catalog::WaiterRecord {
-                waiter_id: waiter_id.clone(),
+                waiter_id,
                 capture_id: record.capture_id.clone(),
                 correlation_id,
                 request_uuid: Some(request_uuid),
@@ -1007,7 +1077,6 @@ impl AcceptanceHook for RuntimeJobHooks {
                 created_at_ms: now,
             })
             .await?;
-        self.register(record.capture_id.clone(), waiter_id, token)?;
         Ok(())
     }
 }
@@ -1238,6 +1307,7 @@ impl CameraRuntime {
             metrics,
         } = services;
         let metrics = Arc::new(crate::observability::CaptureMetrics::new(metrics));
+        let health = Arc::new(crate::observability::FleetHealth::default());
         backend_context.validate_config(&config)?;
         let max_connection_attempts = config.global.limits.max_concurrent_connects;
         let storage_pressure = StoragePressureMonitor::new(
@@ -1247,6 +1317,7 @@ impl CameraRuntime {
             Arc::new(FilesystemSpaceProbe::default()),
         );
         let waiters = Arc::new(RuntimeJobHooks::new(resources.catalog.clone()));
+        waiters.set_waiter_limit(config.global.limits.max_deferred_waiters_per_capture);
         let mut engines = BTreeMap::new();
         // One queue for the whole fleet. There is no longer a dispatch cache per camera, so a camera
         // that is added by a reload needs nothing built for it: it simply becomes a camera the
@@ -1281,6 +1352,7 @@ impl CameraRuntime {
         let runtime = Arc::new(Self {
             config: RwLock::new(config),
             backend_context,
+            health,
             catalog: resources.catalog,
             admission: resources.admission,
             storage: resources.storage,
@@ -1792,7 +1864,10 @@ impl CameraRuntime {
                             )
                         })?;
                 } else {
-                    self.waiters.register_group(group.group_id.clone(), token)?;
+                    self.waiters.register_group(
+                        group.group_id.clone(),
+                        Arc::new(token) as Arc<dyn CaptureWaiter>,
+                    )?;
                 }
             }
             return Ok(group);
@@ -1864,7 +1939,10 @@ impl CameraRuntime {
                                     )
                                 })?;
                         } else {
-                            self.waiters.register_group(group.group_id.clone(), token)?;
+                            self.waiters.register_group(
+                                group.group_id.clone(),
+                                Arc::new(token) as Arc<dyn CaptureWaiter>,
+                            )?;
                         }
                     }
                     return Ok(group);
@@ -1888,7 +1966,10 @@ impl CameraRuntime {
                                 )
                             })?;
                     } else {
-                        self.waiters.register_group(group.group_id.clone(), token)?;
+                        self.waiters.register_group(
+                            group.group_id.clone(),
+                            Arc::new(token) as Arc<dyn CaptureWaiter>,
+                        )?;
                     }
                 }
                 return Ok(group);
@@ -1901,7 +1982,10 @@ impl CameraRuntime {
             }
         };
         if let Some(token) = deferred_token {
-            self.waiters.register_group(group.group_id.clone(), token)?;
+            self.waiters.register_group(
+                group.group_id.clone(),
+                Arc::new(token) as Arc<dyn CaptureWaiter>,
+            )?;
         }
         // Group ACCEPTED and QUEUED are separate durable commits. Queue every member in one
         // catalog transaction before exposing any descriptor, then hand those already-queued
@@ -2149,6 +2233,13 @@ impl CameraRuntime {
         last_error: Option<CameraStatusError>,
         observed_at: chrono::DateTime<chrono::Utc>,
     ) {
+        // Read before the write: the transition is what the health metric reports on, and after the
+        // update there is nothing left to compare against.
+        let previous = self
+            .registry
+            .snapshot(instance)
+            .ok()
+            .map(|snapshot| snapshot.state);
         match self.registry.update(
             instance,
             generation,
@@ -2157,7 +2248,7 @@ impl CameraRuntime {
             last_error,
             observed_at,
         ) {
-            Ok(true) => {}
+            Ok(true) => self.observe_connectivity(instance, previous, state),
             Ok(false) => tracing::debug!(
                 instance,
                 generation,
@@ -3675,6 +3766,8 @@ impl CameraRuntime {
         // after this point. All remaining fallible preparation has completed, so the registry and
         // runtime configuration can now advance as one candidate generation.
         let diff = self.registry.apply_validated_config(&replacement)?;
+        self.waiters
+            .set_waiter_limit(replacement.global.limits.max_deferred_waiters_per_capture);
         {
             match self.engines.write() {
                 Ok(mut engines) => {
@@ -3987,8 +4080,85 @@ impl CameraRuntime {
                     }
                 };
                 runtime.metrics.sample_queue(values).await;
+                runtime.sample_southbound_health(false).await;
             }
         })
+    }
+
+    /// Records a camera's connect/disconnect transition and reports it at once.
+    ///
+    /// SOUTHBOUND §5: transitions are emitted immediately rather than waiting out a sampling
+    /// interval, because a camera that just went down is exactly what an operator does not want to
+    /// hear about thirty seconds late.
+    ///
+    /// A `reconnect` is counted only for a camera that HAD a session and lost it. The first connect of
+    /// a camera's life is not a reconnect, and counting it as one would put a reconnect against every
+    /// camera in the fleet every time the component starts -- the shape of a fleet-wide outage.
+    fn observe_connectivity(
+        &self,
+        instance: &str,
+        previous: Option<CameraConnectionState>,
+        state: CameraConnectionState,
+    ) {
+        let was_online = previous == Some(CameraConnectionState::Online);
+        let is_online = state == CameraConnectionState::Online;
+        if was_online == is_online {
+            return;
+        }
+        if is_online
+            && matches!(
+                previous,
+                Some(CameraConnectionState::Offline | CameraConnectionState::Backoff)
+            )
+        {
+            self.health.observed_reconnect(instance);
+        }
+
+        let Ok(config) = self.config_snapshot() else {
+            return;
+        };
+        let stale_after =
+            Duration::from_secs(config.global.health_thresholds.stale_signal_secs.max(1));
+        let health = Arc::clone(&self.health);
+        let metrics = Arc::clone(&self.metrics);
+        let instance = instance.to_owned();
+        // Detached on purpose. `spawn_task` retains every handle it is given, and a fleet that
+        // reconnects is a fleet that produces these constantly; the emission is best-effort and
+        // outliving it by a few milliseconds at shutdown costs nothing.
+        tokio::spawn(async move {
+            let sample = health.sample(&instance, is_online, stale_after);
+            metrics.emit_health(&instance, &sample, true).await;
+        });
+    }
+
+    /// Emits one `southbound_health` sample per configured camera.
+    ///
+    /// SOUTHBOUND §5 and DESIGN §19.1: this is the metric an operator alarms a fleet on, and the
+    /// adapter emitted none of it. `connectionState` is the camera's live session; `staleSignals` is
+    /// the one that gives `healthThresholds.staleSignalSecs` a job at last -- a camera that has not
+    /// answered inside the threshold says so, whether or not anything has failed.
+    ///
+    /// `immediate` bypasses batching, for the connect and disconnect transitions an operator must not
+    /// have to wait a sampling interval to see.
+    async fn sample_southbound_health(&self, immediate: bool) {
+        let Ok(config) = self.config_snapshot() else {
+            return;
+        };
+        let stale_after =
+            Duration::from_secs(config.global.health_thresholds.stale_signal_secs.max(1));
+        for camera in &config.instances {
+            if !camera.enabled {
+                continue;
+            }
+            let online = self
+                .registry
+                .snapshot(&camera.id)
+                .is_ok_and(|snapshot| snapshot.state == CameraConnectionState::Online);
+            let sample = self.health.sample(&camera.id, online, stale_after);
+            self.metrics
+                .emit_health(&camera.id, &sample, immediate)
+                .await;
+        }
     }
 
     /// Runs the fleet capture queue: pull the best admissible capture, and give it to its camera.
@@ -4237,7 +4407,8 @@ impl CameraRuntime {
             Duration::from_secs(10),
             Duration::from_millis(250),
             config.global.state.max_result_records,
-        )?;
+        )?
+        .with_publish_observer(Arc::clone(&self.health) as Arc<dyn crate::outbox::PublishObserver>);
         let events = self.outbox_events.clone().ok_or_else(|| {
             crate::CameraError::Catalog(
                 "missing component events facade for outbox health".to_string(),
@@ -5720,7 +5891,7 @@ impl CameraRuntime {
             instance.clone(),
             request_id.clone(),
             waiter_id.clone(),
-            token.clone(),
+            Arc::new(token.clone()) as Arc<dyn CaptureWaiter>,
             correlation_id.clone(),
             request_uuid.clone(),
         )?;
@@ -5774,8 +5945,11 @@ impl CameraRuntime {
                 created_at_ms: now,
             })
             .await?;
-        self.waiters
-            .register(record.capture_id.clone(), waiter_id, token.clone())?;
+        self.waiters.register(
+            record.capture_id.clone(),
+            waiter_id,
+            Arc::new(token.clone()) as Arc<dyn CaptureWaiter>,
+        )?;
         if let Some(terminal) = self
             .catalog
             .job(record.capture_id)
@@ -7413,9 +7587,19 @@ mod tests {
         /// assertion is not "the numbers are right" but "the wiring exists" -- a metric nobody emits
         /// is indistinguishable from a metric that does not exist.
         #[derive(Default)]
+        /// An emission as a metric TARGET sees it: the values, and the dimensions the definition
+        /// carried at the moment it was emitted.
+        #[derive(Debug, Clone)]
+        struct RecordedEmission {
+            metric: String,
+            values: std::collections::HashMap<String, f64>,
+            dimensions: std::collections::BTreeMap<String, String>,
+        }
+
+        #[derive(Default)]
         struct RecordingMetrics {
-            defined: Mutex<Vec<String>>,
-            emitted: Mutex<Vec<(String, std::collections::HashMap<String, f64>)>>,
+            defined: Mutex<std::collections::HashMap<String, edgecommons::metrics::Metric>>,
+            emitted: Mutex<Vec<RecordedEmission>>,
         }
 
         impl RecordingMetrics {
@@ -7424,9 +7608,24 @@ mod tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .filter(|(name, _)| name == metric)
-                    .filter_map(|(_, values)| values.get(measure))
+                    .filter(|emission| emission.metric == metric)
+                    .filter_map(|emission| emission.values.get(measure))
                     .sum()
+            }
+
+            /// Every `southbound_health` emission that carried this camera's `instance` dimension.
+            fn health_for(&self, instance: &str) -> Vec<RecordedEmission> {
+                self.emitted
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|emission| {
+                        emission.metric == crate::observability::HEALTH_METRIC
+                            && emission.dimensions.get("instance").map(String::as_str)
+                                == Some(instance)
+                    })
+                    .cloned()
+                    .collect()
             }
         }
 
@@ -7436,11 +7635,11 @@ mod tests {
                 self.defined
                     .lock()
                     .unwrap()
-                    .push(metric.get_name().to_owned());
+                    .insert(metric.get_name().to_owned(), metric);
             }
 
             fn is_metric_defined(&self, name: &str) -> bool {
-                self.defined.lock().unwrap().iter().any(|held| held == name)
+                self.defined.lock().unwrap().contains_key(name)
             }
 
             async fn emit_metric(
@@ -7448,7 +7647,21 @@ mod tests {
                 name: &str,
                 values: std::collections::HashMap<String, f64>,
             ) -> edgecommons::Result<()> {
-                self.emitted.lock().unwrap().push((name.to_owned(), values));
+                // A real target is handed the definition and the values together, so the dimensions
+                // are whatever the definition carries at THIS instant. Recording them any other way
+                // would hide exactly the mistake worth catching.
+                let dimensions = self
+                    .defined
+                    .lock()
+                    .unwrap()
+                    .get(name)
+                    .map(|metric| metric.get_dimensions().clone())
+                    .unwrap_or_default();
+                self.emitted.lock().unwrap().push(RecordedEmission {
+                    metric: name.to_owned(),
+                    values,
+                    dimensions,
+                });
                 Ok(())
             }
 
@@ -7465,6 +7678,21 @@ mod tests {
             }
 
             async fn shutdown(&self) {}
+        }
+
+        /// A caller waiting on a capture. It exists because `DeferredReplyToken` cannot be built
+        /// outside the core library -- which is exactly why the waiter bound had never been tested.
+        #[derive(Default)]
+        struct CountingWaiter {
+            settled: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl CaptureWaiter for CountingWaiter {
+            async fn settle(&self, _result: serde_json::Value) -> bool {
+                self.settled.fetch_add(1, Ordering::AcqRel);
+                true
+            }
         }
 
         struct TestTerminalEncoder;
@@ -7619,6 +7847,7 @@ mod tests {
                 storage_alarm: Arc::new(Mutex::new(StorageAlarmState::default())),
                 readiness: RuntimeReadiness::noop(),
                 metrics: Arc::new(crate::observability::CaptureMetrics::new(metrics)),
+                health: Arc::new(crate::observability::FleetHealth::default()),
                 actors: Arc::new(RwLock::new(HashMap::new())),
                 supervisor_cancellations: Arc::new(RwLock::new(HashMap::new())),
                 motion_stops: Arc::new(RwLock::new(HashMap::new())),
@@ -14826,6 +15055,251 @@ mod tests {
                 !camera_is_moving(&runtime).await,
                 "a rejected move must not have moved the camera"
             );
+            runtime.shutdown().await;
+        }
+
+        /// N9: the adapter emits `southbound_health`, per camera, and it says something true.
+        ///
+        /// SOUTHBOUND §5 and DESIGN §19.1 both state that every adapter emits this metric dimensioned
+        /// by `instance`; DESIGN.md:854 even marks `healthThresholds.staleSignalSecs` as "live; drives
+        /// `southbound_health.staleSignals`". None of it existed. `CameraHealthTracker` was written to
+        /// produce exactly these measures and had no callers at all, so no camera could report itself
+        /// stale and no operator could alarm on one.
+        ///
+        /// The dimension is the part that is easy to get wrong and easy to not notice: the core metric
+        /// API carries dimensions on the DEFINITION and keys definitions by name, so it takes real care
+        /// to say `instance=camera-b` rather than emit every camera's health into one nameless stream.
+        /// The canonical Java protocol-adapter template does not manage it -- its `emitHealth` takes an
+        /// instance id and never uses it.
+        #[tokio::test]
+        async fn southbound_health_is_emitted_per_camera_and_reports_the_capture_it_saw() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+            let (runtime, metrics) = runtime_with_metrics(configuration, &directory).await;
+            for camera in ["camera-a", "camera-b"] {
+                runtime
+                    .start_supervisor(camera.to_string(), runtime.engine(camera).unwrap())
+                    .unwrap();
+                wait_for_online(&runtime, camera).await;
+            }
+
+            // One camera does some work; the other does none.
+            let accepted = runtime
+                .submit_capture(
+                    "camera-b".to_string(),
+                    "health-capture".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "health-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let capture = match accepted {
+                crate::catalog::AcceptJobOutcome::Inserted(record)
+                | crate::catalog::AcceptJobOutcome::Existing(record) => record.capture_id,
+                crate::catalog::AcceptJobOutcome::Conflict => panic!("unexpected ledger conflict"),
+            };
+            let record =
+                wait_for_terminal_within(&runtime, &capture, Duration::from_secs(20)).await;
+            assert_eq!(record.state, crate::model::JobState::Succeeded);
+
+            runtime.sample_southbound_health(false).await;
+
+            for camera in ["camera-a", "camera-b"] {
+                let samples = metrics.health_for(camera);
+                assert!(
+                    !samples.is_empty(),
+                    "every configured camera must report its own southbound health: {camera}"
+                );
+                let latest = samples.last().unwrap();
+                assert_eq!(
+                    latest.values.get("connectionState"),
+                    Some(&1.0),
+                    "{camera} is online and must say so"
+                );
+                assert_eq!(
+                    latest.values.get("staleSignals"),
+                    Some(&0.0),
+                    "{camera} has answered inside the stale threshold"
+                );
+            }
+
+            // The camera that captured reports the round-trip it measured; the idle one has no
+            // latency to report and must not invent a zero.
+            let busy = metrics.health_for("camera-b");
+            assert!(
+                busy.iter()
+                    .any(|emission| emission.values.contains_key("pollLatencyMs")),
+                "the camera that answered must report the round-trip it took"
+            );
+            let idle = metrics.health_for("camera-a");
+            assert!(
+                idle.iter()
+                    .all(|emission| !emission.values.contains_key("pollLatencyMs")),
+                "a camera that has never been polled must not report a latency of zero"
+            );
+            runtime.shutdown().await;
+        }
+
+        /// N9: a camera that drops and comes back counts a reconnect, and reports it at once.
+        ///
+        /// The first connection of a camera's life is NOT a reconnect. Counting it as one would put a
+        /// reconnect against every camera in the fleet every time the component starts -- which is the
+        /// shape of a fleet-wide outage, and would train an operator to ignore the measure.
+        ///
+        /// The transition is emitted immediately rather than at the next sample: a camera that just
+        /// went down is not something to hear about thirty seconds late.
+        #[tokio::test]
+        async fn a_camera_that_drops_and_returns_counts_a_reconnect_but_its_first_connect_does_not()
+        {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-a"], false);
+            let (runtime, metrics) = runtime_with_metrics(configuration, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            // The supervisor's own first connect brought it ONLINE. That is not a reconnect.
+            runtime.sample_southbound_health(false).await;
+            let first = metrics
+                .health_for("camera-a")
+                .last()
+                .cloned()
+                .expect("the camera reports its health");
+            assert_eq!(
+                first.values.get("reconnects"),
+                Some(&0.0),
+                "a camera's first connection is not a reconnect"
+            );
+
+            let generation = runtime.registry.snapshot("camera-a").unwrap().generation;
+            runtime.publish_camera_state(
+                "camera-a",
+                generation,
+                CameraConnectionState::Backoff,
+                None,
+                None,
+                chrono::Utc::now(),
+            );
+            runtime.publish_camera_state(
+                "camera-a",
+                generation,
+                CameraConnectionState::Online,
+                None,
+                None,
+                chrono::Utc::now(),
+            );
+
+            // The transition is emitted immediately; give the detached emission a moment to land.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let down = metrics
+                .health_for("camera-a")
+                .iter()
+                .any(|emission| emission.values.get("connectionState") == Some(&0.0));
+            assert!(
+                down,
+                "the camera going down must be reported at once, not at the next sample"
+            );
+
+            runtime.sample_southbound_health(false).await;
+            let latest = metrics.health_for("camera-a").last().cloned().unwrap();
+            assert_eq!(
+                latest.values.get("connectionState"),
+                Some(&1.0),
+                "it came back"
+            );
+            let reconnects: f64 = metrics
+                .health_for("camera-a")
+                .iter()
+                .filter_map(|emission| emission.values.get("reconnects"))
+                .sum();
+            assert!(
+                reconnects >= 1.0,
+                "a camera that dropped and returned reconnected, and must say so: {reconnects}"
+            );
+            runtime.shutdown().await;
+        }
+
+        /// N9: a camera that has not answered inside the threshold says so.
+        ///
+        /// This is the whole job of `healthThresholds.staleSignalSecs`, which decided nothing at all:
+        /// it was parsed, range-validated, and read by no code. A camera can be ONLINE and useless --
+        /// the session is up and nothing has come back from it -- and `staleSignals` is the only
+        /// measure that distinguishes that from a healthy one.
+        #[tokio::test]
+        async fn a_camera_that_has_not_answered_reports_itself_stale() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            // Nothing this camera has ever done is inside a zero-length threshold.
+            configuration.global.health_thresholds.stale_signal_secs = 1;
+            let (runtime, metrics) = runtime_with_metrics(configuration, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            // The camera has never produced a frame, and the threshold is one second.
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            runtime.sample_southbound_health(false).await;
+
+            let latest = metrics
+                .health_for("camera-a")
+                .last()
+                .cloned()
+                .expect("the camera reports its health");
+            assert_eq!(
+                latest.values.get("connectionState"),
+                Some(&1.0),
+                "the session is up"
+            );
+            assert_eq!(
+                latest.values.get("staleSignals"),
+                Some(&1.0),
+                "a connected camera that has told us nothing is stale, and must say so"
+            );
+            runtime.shutdown().await;
+        }
+
+        /// N10: `maxDeferredWaitersPerCapture` bounds what it says it bounds.
+        ///
+        /// A retried direct capture attaches ANOTHER caller to the same in-flight job (DESIGN §356),
+        /// and this limit exists to say how many. It bounded nothing: the list was pushed to
+        /// unconditionally, so a client that kept retrying grew it without limit -- and every one of
+        /// those tokens is held until the capture is terminal and then fanned out to.
+        #[tokio::test]
+        async fn a_capture_stops_accepting_callers_at_its_configured_bound() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-a"], false);
+            let runtime = runtime(configuration, &directory).await;
+            runtime.waiters.set_waiter_limit(2);
+
+            let capture = "cap-waiters";
+            let attach = |waiter: &str| {
+                runtime.waiters.register(
+                    capture.to_string(),
+                    waiter.to_string(),
+                    Arc::new(CountingWaiter::default()) as Arc<dyn CaptureWaiter>,
+                )
+            };
+
+            attach("waiter-1").expect("the first caller attaches");
+            attach("waiter-2").expect("the second caller fills the bound");
+            let error = attach("waiter-3").expect_err("the third must be turned away");
+            assert_eq!(error.code(), crate::ErrorCode::ResourceLimit);
+
+            // And the bound is per capture, not global: a different capture still has room.
+            runtime
+                .waiters
+                .register(
+                    "cap-other".to_string(),
+                    "waiter-4".to_string(),
+                    Arc::new(CountingWaiter::default()) as Arc<dyn CaptureWaiter>,
+                )
+                .expect("a different capture has its own bound");
             runtime.shutdown().await;
         }
 

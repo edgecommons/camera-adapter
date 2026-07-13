@@ -33,7 +33,7 @@ configuration, messaging, credentials, and platform fields follow the core schem
 | `limits.maxPendingCaptures` | 256 | Captures the fleet queue holds in total. Must be at least `maxQueuedCapturesPerCamera`. Submitting past it is rejected with `QUEUE_FULL`. |
 | `limits.maxQueueWaitMs` | 300000 | How long a capture may wait for a camera when its profile sets no `queueExpiryMs`. A capture that waits longer expires without running. |
 | `limits.maxQueuedControlsPerCamera` | 32 | Ordinary control queue cap per camera. |
-| `limits.maxDeferredWaitersPerCapture` | 8 | Deferred direct-waiter cap. |
+| `limits.maxDeferredWaitersPerCapture` | 8 | How many callers may wait on one in-flight capture. A retried deferred capture attaches another caller to the same job; past this bound the retry is rejected with `RESOURCE_LIMIT`. |
 | `limits.maxCamerasPerGroup` | 32 | Group capture fan-out cap. |
 | `limits.resourceGroups.{name}.maxConcurrentCaptures` | required when named | Shared NIC/USB acquisition cap for cameras selecting that resource group. |
 | `timeouts.captureMs` | 30000 | Acquisition-stage cap. |
@@ -51,7 +51,7 @@ configuration, messaging, credentials, and platform fields follow the core schem
 | `discovery.intervalSeconds` / `maxResults` | 60 / 1000 | Periodic discovery cadence and retained-result cap. |
 | `discovery.eligibleInterfaces` | `[]` | Exact OS interfaces permitted for WS-Discovery; no wildcard fallback. |
 | `operatorEvents.captureLifecycle` | `false` | Emit capture queued/started operator diagnostics. |
-| `healthThresholds.staleSignalSecs` | 300 | Mark a camera stale after this interval without observation. |
+| `healthThresholds.staleSignalSecs` | 300 | How long a camera may produce nothing before `southbound_health.staleSignals` reports it stale. A camera can be connected and stale. |
 | `security.maxHeaderBytes` | 65536 | ONVIF HTTP header/status limit. |
 | `security.maxDecompressionRatio` | 100 | Decoded/compressed response ratio limit. |
 | `security.allowBasicOverPlaintext` | `false` | Development-only exception for Basic auth over HTTP. |
