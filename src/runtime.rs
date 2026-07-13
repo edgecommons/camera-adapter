@@ -25,7 +25,7 @@ use edgecommons::config::{
 use edgecommons::facades::{AppFacade, EventsFacade, Severity};
 use edgecommons::messaging::Message;
 use edgecommons::platform::Platform;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -4459,7 +4459,29 @@ impl CameraRuntime {
                         }
                     };
                     let result = loop {
-                        let _ = dispatcher.drain_into(&handle);
+                        // D1: this loop used to run `drain_into` and then sleep 10 ms, forever, for
+                        // every camera -- 25,600 timer wakeups and as many mutex acquisitions per
+                        // second across a 256-camera fleet, on hardware that was otherwise idle,
+                        // because committing a descriptor never told anyone about it.
+                        //
+                        // A commit now raises `arrived`, so an idle camera waits on a notification
+                        // and burns nothing at all -- and a newly queued capture is dispatched at
+                        // once instead of waiting out a tick. The timer survives for exactly one
+                        // case: descriptors still held because the ACTOR's queue is full. That is
+                        // real backpressure, the actor gives no signal when it frees a slot, and it
+                        // only happens under load -- so the retry keeps its original 10 ms cadence
+                        // and pays for itself.
+                        let pending = match dispatcher.drain_into(&handle) {
+                            Ok(summary) => summary.pending,
+                            Err(error) => {
+                                tracing::warn!(
+                                    instance = %camera.id,
+                                    error = %error,
+                                    "supervisor could not hand queued captures to the camera actor"
+                                );
+                                0
+                            }
+                        };
                         tokio::select! {
                             joined = &mut actor_task => break joined.map_err(|error| crate::CameraError::Backend { backend: "actor", message: format!("actor task failed: {error}") }).and_then(|result| result),
                             _ = cancellation.cancelled() => {
@@ -4484,7 +4506,13 @@ impl CameraRuntime {
                                 }
                                 break Ok(());
                             }
-                            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                            () = async {
+                                if pending > 0 {
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                } else {
+                                    dispatcher.arrival().await;
+                                }
+                            } => {}
                         }
                     };
                     if let Ok(mut actors) = self.actors.write() {
@@ -4967,6 +4995,26 @@ struct SupervisorDispatcherInner {
     maximum: usize,
     used: AtomicUsize,
     queue: Mutex<VecDeque<CaptureDescriptor>>,
+    /// Raised whenever a descriptor is committed, so the supervisor can dispatch it immediately
+    /// instead of discovering it on the next tick of a timer.
+    arrived: Notify,
+}
+
+/// What one [`SupervisorDispatcher::drain_into`] pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DrainSummary {
+    /// Descriptors handed to the actor.
+    forwarded: usize,
+    /// Descriptors the actor refused because they were already dead (expired or cancelled). They
+    /// are retired durably by their own terminal-deadline task; the supervisor's job is only to
+    /// stop holding them -- and to release the queue slot they occupied.
+    retired: usize,
+    /// Descriptors still held because the actor's own queue is full.
+    ///
+    /// This is the only reason the supervisor ever needs a timer: it must retry when the actor
+    /// frees a slot, and the actor does not signal that. With nothing pending there is nothing to
+    /// retry, so the loop can simply wait to be told that work arrived.
+    pending: usize,
 }
 
 impl SupervisorDispatcher {
@@ -4983,14 +5031,23 @@ impl SupervisorDispatcher {
                 maximum,
                 used: AtomicUsize::new(0),
                 queue: Mutex::new(VecDeque::new()),
+                arrived: Notify::new(),
             }),
         })
+    }
+
+    /// Waits until a descriptor is committed to this dispatcher.
+    ///
+    /// `Notify` holds a permit when nobody is waiting, so a descriptor committed between a drain and
+    /// this call wakes it immediately rather than being missed.
+    async fn arrival(&self) {
+        self.inner.arrived.notified().await;
     }
 
     /// Forwards as many durable descriptors as the connected actor can reserve right now.
     /// A full actor is normal; the descriptor remains owned by the supervisor and is retried
     /// without ever re-running catalog acceptance.
-    fn drain_into(&self, actor: &CameraActorHandle) -> Result<()> {
+    fn drain_into(&self, actor: &CameraActorHandle) -> Result<DrainSummary> {
         let mut queue = self.inner.queue.lock().map_err(|_| {
             crate::CameraError::Catalog("supervisor capture queue is unavailable".to_string())
         })?;
@@ -5001,23 +5058,57 @@ impl SupervisorDispatcher {
             }
             keep
         });
+        let mut summary = DrainSummary::default();
         loop {
             let Some(descriptor) = queue.pop_front() else {
-                return Ok(());
+                return Ok(summary);
             };
             let reservation = match actor.reserve() {
                 Ok(reservation) => reservation,
                 Err(error) if error.code() == crate::ErrorCode::QueueFull => {
                     queue.push_front(descriptor);
-                    return Ok(());
+                    summary.pending = queue.len();
+                    return Ok(summary);
                 }
                 Err(error) => {
                     queue.push_front(descriptor);
                     return Err(error);
                 }
             };
-            reservation.commit(descriptor)?;
+            // The descriptor is leaving this queue for good now, whichever way the commit goes:
+            // the actor either takes it, or refuses it as already dead. So release the slot HERE,
+            // before a fallible call, not after one.
+            //
+            // This is B5. The old code moved the descriptor into `commit(descriptor)?` and
+            // decremented `used` on the line AFTER it -- a line the `?` skips. `try_enqueue` returns
+            // Err the moment the capture's deadline has passed, which is precisely what happens to
+            // work that was queued while its camera was offline and is drained after a reconnect
+            // that outlasted the deadline. The descriptor was destroyed and its slot was never
+            // given back. After `maxQueuedCapturesPerCamera` such losses -- four, by default -- that
+            // camera answered QUEUE_FULL to every capture for the rest of the process's life. A
+            // flaky camera bricked its own queue, silently, because the caller wrote
+            // `let _ = dispatcher.drain_into(&handle)`.
+            //
+            // The tell that it was an oversight rather than a decision: both `reserve()` failure
+            // paths above carefully push the descriptor back. Only the commit path forgot.
+            let capture_id = descriptor.capture_id().to_string();
+            let committed = reservation.commit(descriptor);
             self.inner.used.fetch_sub(1, Ordering::AcqRel);
+            match committed {
+                Ok(_) => summary.forwarded += 1,
+                Err(error) => {
+                    // Dead on arrival: expired or cancelled. Its durable row is retired by its own
+                    // terminal-deadline task, so there is nothing to do here but let it go -- and
+                    // keep draining. One dead capture must not hold up the live ones behind it.
+                    tracing::debug!(
+                        instance = %self.inner.instance,
+                        capture = %capture_id,
+                        error = %error,
+                        "supervisor discarded a capture the camera actor would not accept"
+                    );
+                    summary.retired += 1;
+                }
+            }
         }
     }
 
@@ -5076,6 +5167,8 @@ impl DispatchReservation for SupervisorReservation {
         queue.push_back(descriptor);
         let queue_position = queue.len();
         self.committed = true;
+        drop(queue);
+        self.dispatcher.arrived.notify_one();
         Ok(queue_position)
     }
 }
@@ -11935,6 +12028,114 @@ mod tests {
                 1,
                 "the protocol session must be closed instead of leaked server-side"
             );
+        }
+
+        /// B5: any failed commit used to destroy the descriptor AND keep its queue slot, forever.
+        ///
+        /// `drain_into` moved the descriptor into `commit(descriptor)?` and decremented the slot
+        /// counter on the line AFTER it -- a line the `?` skips. So a commit that failed lost the
+        /// descriptor and never gave the slot back. After `maxQueuedCapturesPerCamera` such losses
+        /// (four, by default) the camera answered QUEUE_FULL to every capture for the rest of the
+        /// process's life, and nobody saw it, because the caller wrote
+        /// `let _ = dispatcher.drain_into(&handle)`. The tell that it was an oversight: both
+        /// `reserve()` failure paths carefully push the descriptor back. Only the commit path forgot.
+        ///
+        /// IN PRODUCTION the commit fails because the capture EXPIRED: work queued while a camera is
+        /// offline waits in the supervisor's dispatcher, and `try_enqueue` refuses anything already
+        /// past its deadline. That path is not what this test drives, because it is a race, and it is
+        /// worth being precise about why. When the terminal-deadline task fires it writes the
+        /// terminal row and only then cancels the runtime -- and a cancelled descriptor is reaped by
+        /// the `retain` above, which returns the slot correctly. The leak lives in the window between
+        /// the deadline passing and that write completing, and in the case where the write FAILS
+        /// outright and the cancellation therefore never happens. Both widen exactly when the catalog
+        /// is contended -- which is B6. The two defects compound.
+        ///
+        /// So the invariant is pinned where it can be pinned deterministically, with no fault
+        /// injection in production code: a descriptor that leaves this queue returns its slot, no
+        /// matter why the actor refused it. Dispatching camera-a's work at camera-b's actor is
+        /// refused for a different reason and travels the identical line.
+        #[tokio::test]
+        async fn a_refused_capture_gives_its_queue_slot_back_instead_of_bricking_the_camera() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+            configuration.global.limits.max_queued_captures_per_camera = 1;
+            let runtime = runtime(configuration, &directory).await;
+
+            // No supervisor is running, so this descriptor simply waits in camera-a's dispatcher --
+            // exactly as it would for a camera that is offline.
+            runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "will-be-refused".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "refusal-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .expect("the first capture must be accepted");
+
+            let session = TeardownSession {
+                capabilities: crate::model::CameraCapabilities {
+                    capture_modes: vec![crate::model::CaptureMode::Simulated],
+                    pixel_formats: vec![crate::model::PixelFormat::Rgb8],
+                    software_trigger: false,
+                    snapshot_uri: false,
+                    rtsp: false,
+                    ptz: false,
+                    ptz_status: false,
+                    presets: false,
+                    preset_mutation: false,
+                    vendor: None,
+                    model: None,
+                    firmware: None,
+                    serial: None,
+                    warnings: Vec::new(),
+                },
+                stops: Arc::new(Mutex::new(Vec::new())),
+                closes: Arc::new(AtomicUsize::new(0)),
+            };
+            let (_actor, wrong_actor) = CameraActor::new(
+                "camera-b",
+                Box::new(session),
+                runtime.engine("camera-b").unwrap(),
+                2,
+                2,
+            )
+            .unwrap();
+
+            let summary = runtime
+                .dispatcher("camera-a")
+                .unwrap()
+                .drain_into(&wrong_actor)
+                .expect("a refused descriptor is not a dispatcher failure");
+
+            assert_eq!(
+                summary,
+                DrainSummary {
+                    forwarded: 0,
+                    retired: 1,
+                    pending: 0,
+                },
+                "the actor must refuse the descriptor, and the supervisor must stop holding it"
+            );
+
+            // The bug, stated as a test: the camera must still accept work.
+            runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "after-the-refusal".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "recovery-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .expect("a refused capture must not consume its camera's queue slot forever");
         }
 
         // The grace is an upper bound, not a new way to hang: a backend that will not finish its
