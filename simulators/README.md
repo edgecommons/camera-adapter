@@ -152,6 +152,21 @@ evidence.
 
 ### Native RTSP decoder validation
 
+**Prerequisite: a local `edgecommons` source override.** `Cargo.toml` depends on `edgecommons` by
+pinned git rev so that CI, which clones this repository on its own, can resolve it. That repository is
+private, and the validation container has no credentials, so the container resolves the dependency
+only through the gitignored `camera-adapter/.cargo/config.toml`:
+
+```toml
+[patch."https://github.com/edgecommons/edgecommons.git"]
+edgecommons = { path = "../core/libs/rust" }
+```
+
+The path must be **relative**. The runner mounts the whole workspace and builds from
+`/edgecommons/camera-adapter`, so an absolute Windows path resolves on the host and nowhere else;
+`../core/libs/rust` is correct in both places. This assumes the usual layout, with the `core`
+checkout beside `camera-adapter`.
+
 The Rust decoder is validated from a pinned Linux image, on the Compose network,
 so `onvif-sim` and `mediamtx` retain their service names and no host-network
 shortcut weakens the URI-pinning test. The reproducible coverage runner starts

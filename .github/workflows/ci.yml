@@ -93,3 +93,62 @@ jobs:
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           pip install diff-cover
           diff-cover target/cobertura.xml --compare-branch=origin/main --fail-under=95
+
+  rtsp-backend:
+    # The `rtsp` (GStreamer) backend was compiled by NOTHING. The jobs above build default features
+    # only (standalone + onvif), and the backend cannot build on the Windows dev box for want of
+    # pkg-config and GStreamer. So the entire RTSP capture path -- the decoder, the access-unit
+    # assembler, the session worker -- was never compiled, never linted and never tested by any
+    # automated gate in this repo or on any machine a developer routinely runs.
+    #
+    # That is how the RTSP decode stage came to be bounded by a hardcoded four-permit process-global
+    # semaphore while the component advertised 32 concurrent captures: nothing ever looked at it.
+    #
+    # No camera is needed here. The live-fixture tests are #[ignore]d and run against MediaMTX in
+    # simulators/run-rtsp-native-coverage.ps1; this job compiles the code, lints it, and runs the unit
+    # tests, which is precisely the coverage that was missing.
+    #
+    # `genicam` is still ungated. It needs native Aravis >= 0.8.36 (native/aravis-scoped/build.rs
+    # enforces this for interface-scoped discovery) and the distributions ship 0.8.26 (Debian
+    # bookworm) / 0.8.31 (Ubuntu 24.04), so gating it means building Aravis from source in CI. That
+    # is a separate piece of work, and pretending otherwise by dropping the feature from the command
+    # line would leave a green check over an uncompiled backend -- exactly the failure above.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GStreamer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: Authenticate to the private edgecommons git dependency
+        env:
+          EDGECOMMONS_READ_TOKEN: ${{ secrets.EDGECOMMONS_READ_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons.git".insteadOf \
+            "https://github.com/edgecommons/edgecommons.git"
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons".insteadOf \
+            "https://github.com/edgecommons/edgecommons"
+
+      - name: Clippy (rtsp backend)
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: |
+          cargo clippy --locked --all-targets \
+            --no-default-features --features standalone,onvif,rtsp -- -D warnings
+
+      - name: Test (rtsp backend)
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: |
+          cargo test --locked --lib \
+            --no-default-features --features standalone,onvif,rtsp

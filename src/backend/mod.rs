@@ -9,12 +9,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use edgecommons::credentials::CredentialService;
 
-use crate::config::{AdapterConfig, BackendConfig, CaptureProfile, GlobalConfig};
+use crate::config::{AdapterConfig, BackendConfig, CaptureProfile, GlobalConfig, LimitsConfig};
 use crate::error::Result;
 use crate::model::{
     BackendKind, CameraCapabilities, CaptureFrame, PtzRequest, PtzResult, PtzStatus,
@@ -184,6 +185,13 @@ pub trait CameraSession: Send + 'static {
 #[derive(Clone)]
 pub struct BackendRuntimeContext {
     credential_service: Option<Arc<dyn CredentialService>>,
+    /// Component-wide RTSP decode-stage bound.
+    ///
+    /// It lives here because this context is the only backend-facing object with a process
+    /// lifetime: factories are rebuilt per camera and per reconnect, so a semaphore owned by a
+    /// factory would bound one camera against itself and nothing else.
+    #[cfg_attr(not(feature = "rtsp"), allow(dead_code))]
+    decode_gate: Arc<Semaphore>,
 }
 
 impl BackendRuntimeContext {
@@ -191,9 +199,19 @@ impl BackendRuntimeContext {
     ///
     /// `None` is valid only while no ONVIF camera configuration refers to a secret.  Such a
     /// reference is rejected by [`Self::validate_config`] before the runtime accepts work.
+    ///
+    /// `limits` sizes the shared RTSP decode gate. The decode stage is part of acquisition, which
+    /// the design bounds with `maxConcurrentCaptures`; sizing the gate from anything else would
+    /// silently cap the component below the concurrency it advertises.
     #[must_use]
-    pub fn new(credential_service: Option<Arc<dyn CredentialService>>) -> Self {
-        Self { credential_service }
+    pub fn new(
+        credential_service: Option<Arc<dyn CredentialService>>,
+        limits: &LimitsConfig,
+    ) -> Self {
+        Self {
+            credential_service,
+            decode_gate: Arc::new(Semaphore::new(limits.max_concurrent_captures)),
+        }
     }
 
     /// Validates that every configured ONVIF secret reference has a real EdgeCommons service.
@@ -271,6 +289,7 @@ impl BackendRuntimeContext {
                 clock: Arc::new(onvif::SystemOnvifClock),
                 nonce_source: Arc::new(onvif::SystemNonceSource),
                 security: global.security.clone(),
+                decode_gate: Arc::clone(&self.decode_gate),
             },
         ))
     }
@@ -337,6 +356,46 @@ mod tests {
 
     fn config(value: serde_json::Value) -> BackendConfig {
         serde_json::from_value(value).unwrap()
+    }
+
+    /// The RTSP decode stage must be exactly as wide as the concurrency the component advertises.
+    ///
+    /// It used to be a process-global `Semaphore::new(4)` in `backend::rtsp`, four permits for the
+    /// whole component no matter how it was configured. Every decoder creation and every access-unit
+    /// decode takes one, so a fleet configured for 32 concurrent captures ran its RTSP decode four
+    /// wide and the rest of the captures sat in admission until their deadline expired. Nothing
+    /// pointed at the real cause: the config said 32, and the component reported CAPTURE_TIMEOUT.
+    #[test]
+    fn decode_gate_is_as_wide_as_the_configured_capture_concurrency() {
+        let limits = LimitsConfig {
+            max_concurrent_captures: 7,
+            ..LimitsConfig::default()
+        };
+
+        let context = BackendRuntimeContext::new(None, &limits);
+
+        assert_eq!(
+            context.decode_gate.available_permits(),
+            7,
+            "the decode gate must take its width from limits.maxConcurrentCaptures"
+        );
+    }
+
+    /// One gate for the whole component, not one per camera.
+    ///
+    /// A factory is built per camera and rebuilt on every reconnect, so a semaphore owned by a
+    /// factory would only ever bound a camera against itself -- which is no bound at all. The
+    /// context is cloned to reach those factories, so the clone must carry the same semaphore.
+    #[test]
+    fn cloning_the_context_shares_one_decode_gate() {
+        let context = BackendRuntimeContext::new(None, &LimitsConfig::default());
+
+        let clone = context.clone();
+
+        assert!(
+            Arc::ptr_eq(&context.decode_gate, &clone.decode_gate),
+            "every camera must contend for the same decode gate"
+        );
     }
 
     #[cfg(feature = "onvif")]
@@ -420,7 +479,7 @@ mod tests {
     #[test]
     fn runtime_context_validates_credential_free_configs_and_delegates_simulator_factory() {
         let adapter = adapter_config(serde_json::json!({"type": "sim"}));
-        let context = BackendRuntimeContext::new(None);
+        let context = BackendRuntimeContext::new(None, &LimitsConfig::default());
         context
             .validate_config(&adapter)
             .expect("credential-free simulator configuration needs no secret provider");
@@ -441,7 +500,7 @@ mod tests {
             "deviceServiceUrl": "https://camera.test/onvif/device_service",
             "mediaProfile": "main"
         }));
-        let error = match BackendRuntimeContext::new(None)
+        let error = match BackendRuntimeContext::new(None, &LimitsConfig::default())
             .factory_for(&adapter.instances[0].backend, &adapter.global)
         {
             Err(error) => error,
@@ -454,7 +513,7 @@ mod tests {
     #[cfg(feature = "onvif")]
     #[test]
     fn runtime_context_binds_selector_discovery_to_configured_interfaces() {
-        let context = BackendRuntimeContext::new(None);
+        let context = BackendRuntimeContext::new(None, &LimitsConfig::default());
         let global = global(
             &["camera-net-a", "camera-net-b"],
             crate::config::SecurityConfig::default(),
@@ -490,7 +549,7 @@ mod tests {
         assert_eq!(static_error.code(), crate::ErrorCode::InvalidRequest);
 
         assert_eq!(
-            BackendRuntimeContext::new(None)
+            BackendRuntimeContext::new(None, &LimitsConfig::default())
                 .factory_for(&adapter.instances[0].backend, &adapter.global)
                 .expect("runtime context supplies ONVIF policy/services")
                 .kind(),
@@ -502,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_context_resolves_onvif_secret_references_through_edgecommons() {
         let (_directory, service) = credential_service();
-        let context = BackendRuntimeContext::new(Some(service));
+        let context = BackendRuntimeContext::new(Some(service), &LimitsConfig::default());
         let factory = context
             .onvif_factory(&global(&[], crate::config::SecurityConfig::default()))
             .expect("ONVIF factory with credential service");
@@ -526,7 +585,7 @@ mod tests {
             max_decompression_ratio: 37,
             allow_basic_over_plaintext: true,
         };
-        let factory = BackendRuntimeContext::new(None)
+        let factory = BackendRuntimeContext::new(None, &LimitsConfig::default())
             .onvif_factory(&global(&[], security.clone()))
             .expect("ONVIF factory");
         let applied = factory.security_policy_for_test();
@@ -567,7 +626,7 @@ mod tests {
         )
         .expect("core configuration");
         let adapter = AdapterConfig::from_core_reload(&core).expect("valid adapter configuration");
-        let error = BackendRuntimeContext::new(None)
+        let error = BackendRuntimeContext::new(None, &LimitsConfig::default())
             .validate_config(&adapter)
             .expect_err("secret-bearing ONVIF configuration requires the core credentials service");
 

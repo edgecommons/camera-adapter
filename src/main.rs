@@ -68,7 +68,8 @@ async fn main() -> anyhow::Result<()> {
     );
     let credential_service = gg.credentials();
     credential_service_available.store(credential_service.is_some(), Ordering::Release);
-    let backend_context = BackendRuntimeContext::new(credential_service);
+    let backend_context =
+        BackendRuntimeContext::new(credential_service, &loaded.config.global.limits);
     backend_context.validate_config(&loaded.config)?;
 
     // State/catalog/output startup gates run before any camera connection. The complete runtime
