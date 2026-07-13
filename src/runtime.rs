@@ -879,6 +879,18 @@ impl JobHooks for RuntimeJobHooks {
         spec: &CaptureJobSpec,
         queue_position: usize,
     ) {
+        // Counted HERE, and awaited, rather than inside the spawned publish below.
+        //
+        // The publish is deliberately best-effort: it takes a permit from a bounded pool of
+        // lifecycle-event slots and gives up if none is free, because a slow event consumer must
+        // never be able to stall a capture. That bound is right for EVENTS. It is catastrophic for a
+        // COUNTER: a metric that silently stops counting exactly when the component is busiest is
+        // worse than no metric, and it would have under-reported precisely the overload an operator
+        // was looking at. It also made the count race the capture's own terminal state -- CI caught
+        // that, on the same commit that passed on another runner.
+        if let Some(runtime) = self.runtime() {
+            runtime.metrics.count("queued").await;
+        }
         let Ok(permit) = Arc::clone(&self.lifecycle_event_slots).try_acquire_owned() else {
             return;
         };
@@ -896,6 +908,10 @@ impl JobHooks for RuntimeJobHooks {
     }
 
     async fn capture_started(&self, spec: &CaptureJobSpec) {
+        // Counted before the best-effort publish gate, for the reasons in `capture_queued`.
+        if let Some(runtime) = self.runtime() {
+            runtime.metrics.count("started").await;
+        }
         let Ok(permit) = Arc::clone(&self.lifecycle_event_slots).try_acquire_owned() else {
             return;
         };
@@ -1081,7 +1097,6 @@ impl CameraRuntime {
         spec: CaptureJobSpec,
         queue_position: usize,
     ) {
-        self.metrics.count("queued").await;
         let Some(events) = self.lifecycle_events(&spec.instance) else {
             return;
         };
@@ -1118,10 +1133,6 @@ impl CameraRuntime {
     }
 
     async fn emit_capture_started(&self, spec: CaptureJobSpec) {
-        // Counted before the early return below: whether a camera has an event facade installed says
-        // nothing about whether it is doing work, and a metric that quietly stops counting is worse
-        // than no metric.
-        self.metrics.count("started").await;
         let Some(events) = self.lifecycle_events(&spec.instance) else {
             return;
         };
@@ -12818,6 +12829,71 @@ mod tests {
                 None,
                 chrono::Utc::now(),
             );
+        }
+
+        /// A capture must be counted even when the component is too busy to publish its events.
+        ///
+        /// The lifecycle-event publish is best-effort by design: it takes a permit from a bounded
+        /// pool and gives up if none is free, so that a slow event consumer can never stall a
+        /// capture. That bound is right for EVENTS and catastrophic for a COUNTER. The counters
+        /// originally rode inside that publish, which meant they were dropped exactly when the
+        /// component was busiest -- under-reporting precisely the overload an operator would be
+        /// staring at -- and raced the capture's own terminal state, which is what CI caught: the
+        /// same commit passed on one runner and failed on another.
+        #[tokio::test]
+        async fn captures_are_counted_even_when_every_event_slot_is_taken() {
+            let directory = TempDir::new().unwrap();
+            let (runtime, metrics) =
+                runtime_with_metrics(config(directory.path(), &["camera-a"], false), &directory)
+                    .await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            // Starve the publish path completely: not one lifecycle event can be emitted.
+            let _permits = Arc::clone(&runtime.waiters.lifecycle_event_slots)
+                .acquire_many_owned(
+                    u32::try_from(MAX_LIFECYCLE_EVENT_PUBLISHES)
+                        .expect("the fixed lifecycle capacity fits Tokio's semaphore API"),
+                )
+                .await
+                .expect("the test holds every detached lifecycle permit");
+
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "counted-under-starvation".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "starvation-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let capture_id = match accepted {
+                crate::catalog::AcceptJobOutcome::Inserted(record) => record.capture_id,
+                other => panic!("expected a newly accepted capture, got {other:?}"),
+            };
+            let terminal = wait_for_terminal(&runtime, &capture_id).await;
+            assert_eq!(terminal.state, crate::model::JobState::Succeeded);
+
+            let counted = crate::observability::CAPTURE_METRIC;
+            assert_eq!(
+                metrics.counts(counted, "queued"),
+                1.0,
+                "the capture happened; a saturated EVENT pipe must not stop it being COUNTED"
+            );
+            assert_eq!(metrics.counts(counted, "started"), 1.0);
+            assert_eq!(
+                metrics.counts(counted, "succeeded"),
+                1.0,
+                "and its outcome is the number an operator watches -- it must survive the overload                  that makes them look"
+            );
+
+            runtime.shutdown().await;
         }
 
         /// Q5: camera presence is pushed, not just polled.
