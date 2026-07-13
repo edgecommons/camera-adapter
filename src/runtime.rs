@@ -8362,6 +8362,28 @@ mod tests {
             }
         }
 
+        /// Waits for the fleet queue to let go of descriptors whose captures have ended.
+        ///
+        /// A cancelled or expired descriptor is removed by the watcher task `try_enqueue` spawns for
+        /// it -- deliberately, so that work is released even when no consumer is polling the queue and
+        /// its camera is offline. That removal is therefore ASYNCHRONOUS, and asserting on the queue
+        /// the instant a cancel returns is a race with a task that has not been scheduled yet. It is a
+        /// race the assertion usually wins on a fast machine and lost, once, on a two-core CI runner.
+        async fn wait_for_queue_depth(runtime: &CameraRuntime, expected: usize) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let pending = runtime.scheduler.pending();
+                if pending == expected {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the queue still holds {pending} descriptors; expected {expected}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
         async fn wait_for_online(runtime: &CameraRuntime, instance: &str) {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
             loop {
@@ -14399,13 +14421,18 @@ mod tests {
                 drained.durable_backlog, 0,
                 "the durable backlog is gone, not just forgotten"
             );
+            // The descriptors go too, but not synchronously: each one is removed by the watcher task
+            // its enqueue spawned, which is what releases work whose camera is offline and whose queue
+            // nobody is polling. Demanding it of the very next line is a race with a task that has not
+            // run yet -- and that race is what failed once on CI and never here.
+            wait_for_queue_depth(&runtime, 0).await;
             assert_eq!(
-                drained.dispatch_queued, 0,
+                runtime.queue_status(None).await.unwrap().dispatch_queued,
+                0,
                 "and the descriptors must not still be occupying the camera's queue slots"
             );
         }
 
-        /// The drain reaches durable work regardless of whether an unknown camera is named.
         /// Rebasing a deadline must not disarm it: a capture that runs out of time still fails.
         ///
         /// The terminal-deadline task re-reads its deadline instead of firing on the one it was
@@ -14810,6 +14837,7 @@ mod tests {
             );
         }
 
+        /// The drain reaches durable work regardless of whether an unknown camera is named.
         #[tokio::test]
         async fn queue_status_and_clear_reject_an_unknown_camera() {
             let directory = TempDir::new().unwrap();
@@ -15300,6 +15328,79 @@ mod tests {
                     Arc::new(CountingWaiter::default()) as Arc<dyn CaptureWaiter>,
                 )
                 .expect("a different capture has its own bound");
+            runtime.shutdown().await;
+        }
+
+        /// A cancelled capture lets go of the queue slot it was holding, even with its camera down.
+        ///
+        /// This is the property the queue's per-entry watcher exists for, and it is worth pinning
+        /// because the obvious implementation does not have it: sweep cancelled descriptors only when
+        /// a consumer pops the queue, and a camera that is offline is never popped for -- so the
+        /// descriptor keeps its slot, and cancelling enough work on a camera that is down makes it
+        /// answer `QUEUE_FULL` for captures it could perfectly well take. Nothing pops here: no
+        /// supervisor is ever started.
+        #[tokio::test]
+        async fn a_cancelled_capture_releases_the_queue_slot_it_was_holding() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            // Room for exactly one waiting capture on this camera.
+            configuration.global.limits.max_queued_captures_per_camera = 1;
+            configuration.global.limits.max_pending_captures = 1;
+            let runtime = runtime(configuration, &directory).await;
+
+            // No supervisor: the camera is down, so nothing will ever pop this queue.
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "doomed".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "cancel-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let capture = match accepted {
+                crate::catalog::AcceptJobOutcome::Inserted(record)
+                | crate::catalog::AcceptJobOutcome::Existing(record) => record.capture_id,
+                crate::catalog::AcceptJobOutcome::Conflict => panic!("unexpected ledger conflict"),
+            };
+            assert_eq!(runtime.scheduler.pending(), 1);
+
+            runtime
+                .cancel_capture(CancelRequest {
+                    request_id: "cancel-the-doomed".to_string(),
+                    capture_id: Some(capture.clone()),
+                    capture_group_id: None,
+                    reason: Some("operator changed their mind".to_string()),
+                })
+                .await
+                .unwrap();
+
+            wait_for_queue_depth(&runtime, 0).await;
+            assert_eq!(
+                runtime.scheduler.pending_for("camera-a"),
+                0,
+                "the camera's own queue slot goes with it"
+            );
+
+            // And the freed slot is real: the camera takes new work, on a queue of exactly one.
+            runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "the-next-one".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "next-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .expect("the slot the cancelled capture gave up is available to a live one");
+            assert_eq!(runtime.scheduler.pending(), 1);
             runtime.shutdown().await;
         }
 
