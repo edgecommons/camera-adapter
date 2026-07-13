@@ -366,6 +366,8 @@ mod tests {
     /// A metric target that is unhappy must never be able to fail a capture.
     #[tokio::test]
     async fn a_failing_metric_target_is_reported_and_survived() {
+        use edgecommons::metrics::MetricService;
+
         struct Broken;
 
         #[async_trait::async_trait]
@@ -398,7 +400,8 @@ mod tests {
             async fn shutdown(&self) {}
         }
 
-        let metrics = CaptureMetrics::new(Arc::new(Broken));
+        let broken = Arc::new(Broken);
+        let metrics = CaptureMetrics::new(Arc::clone(&broken) as Arc<dyn MetricService>);
 
         // Neither call may panic or propagate: a capture that succeeded must not be reported as
         // failed because the metrics backend was down.
@@ -409,6 +412,20 @@ mod tests {
                 1.0,
             )]))
             .await;
+
+        // `CaptureMetrics` defines both metrics through this same service, so a target that refuses
+        // to emit must still have accepted the definitions -- otherwise the failure being survived
+        // here would be the wrong one.
+        assert!(broken.is_metric_defined(CAPTURE_METRIC));
+        assert!(
+            broken
+                .emit_metric_now(CAPTURE_METRIC, std::collections::HashMap::new())
+                .await
+                .is_err(),
+            "the immediate path must fail the same way the buffered one does"
+        );
+        assert!(broken.flush_metrics().await.is_ok());
+        broken.shutdown().await;
     }
 
     use super::*;
