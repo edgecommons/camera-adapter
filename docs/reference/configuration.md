@@ -10,7 +10,7 @@ configuration, messaging, credentials, and platform fields follow the core schem
 |---|---:|---|
 | `output.rootDirectory` | required | Absolute output root. |
 | `output.cameraDirectoryTemplate` | `{cameraId}/{yyyy}/{MM}/{dd}` | Relative per-camera directory template. |
-| `output.fileNameTemplate` | `{timestamp}-{captureId}.{extension}` | Relative final image name template. |
+| `output.fileNameTemplate` | `{timestamp}-{captureId}.{extension}` | Relative final image name template. Must contain `{captureId}` (or the camera directory must), because two captures that resolve to the same path cannot both be written: the second is refused and fails with `PERSISTENCE_FAILED`. |
 | `output.writeMetadataSidecar` | `false` | Write and finalize JSON metadata before exposing the image. |
 | `output.minimumFreeBytes` | 1 GiB | Free-byte floor after reservations. |
 | `output.minimumFreePercent` | 5 | Free-space percentage floor after reservations. |

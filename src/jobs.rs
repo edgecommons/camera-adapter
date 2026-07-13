@@ -1390,7 +1390,7 @@ impl JobEngine {
             .finish_failure(
                 &descriptor.runtime,
                 error.code(),
-                bounded_detail(error.to_string()),
+                bounded_detail(error.operator_detail().into_owned()),
             )
             .await;
         if outcome.is_err() {
@@ -1461,11 +1461,18 @@ impl JobEngine {
     ) -> Result<JobRecord> {
         if error.code() == ErrorCode::CaptureCancelled {
             return self
-                .cancel_runtime(runtime, bounded_detail(error.to_string()))
+                .cancel_runtime(
+                    runtime,
+                    bounded_detail(error.operator_detail().into_owned()),
+                )
                 .await;
         }
-        self.finish_failure(runtime, error.code(), bounded_detail(error.to_string()))
-            .await
+        self.finish_failure(
+            runtime,
+            error.code(),
+            bounded_detail(error.operator_detail().into_owned()),
+        )
+        .await
     }
 
     async fn finish_failure(

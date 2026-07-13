@@ -979,6 +979,26 @@ fn validate_global(global: &GlobalConfig) -> Result<()> {
     )?;
     validate_template(&global.output.camera_directory_template, true)?;
     validate_template(&global.output.file_name_template, false)?;
+    // DESIGN §10.2 calls this field "collision-resistant", and nothing made it so. `{captureId}` is
+    // the only token that is: `{cameraId}` and the date parts repeat by design, and two captures of
+    // one camera inside the same second share every one of them.
+    //
+    // Without this an operator writes the most natural template imaginable -- `latest.{extension}` --
+    // and gets a component that works exactly once. The second capture, and every capture after it
+    // for the life of the deployment, refuses to overwrite the first and fails with
+    // PERSISTENCE_FAILED. The atomic-install path is right to refuse; the config should never have
+    // been accepted.
+    if !global.output.file_name_template.contains("{captureId}")
+        && !global
+            .output
+            .camera_directory_template
+            .contains("{captureId}")
+    {
+        return config_error(
+            "component.global.output.fileNameTemplate",
+            "must contain {captureId} so that two captures cannot resolve to the same file;              {cameraId} and the date parts repeat, and a capture that cannot be written without              overwriting another is refused and fails with PERSISTENCE_FAILED",
+        );
+    }
     range(
         u64::from(global.output.minimum_free_percent),
         0,
@@ -2376,6 +2396,40 @@ mod tests {
             1,
             "the group schedule naming it survives -- it is declared, just not currently valid"
         );
+    }
+
+    /// The most natural filename an operator could write is the one that breaks the component.
+    ///
+    /// `latest.{extension}` works exactly once. The second capture refuses to overwrite the first and
+    /// fails with PERSISTENCE_FAILED, and so does every capture after it, forever. The install path is
+    /// right to refuse -- the config should never have been accepted. DESIGN §10.2 has always called
+    /// this field "collision-resistant"; it simply was not.
+    #[test]
+    fn an_output_template_that_cannot_be_collision_free_is_refused() {
+        let mut value = valid_config();
+        value["component"]["global"]["output"]["fileNameTemplate"] = json!("latest.{extension}");
+        assert_eq!(
+            reload_error_path(value),
+            "component.global.output.fileNameTemplate"
+        );
+
+        // A timestamp is not collision resistance: two captures of one camera in the same second
+        // share every part of it.
+        let mut value = valid_config();
+        value["component"]["global"]["output"]["fileNameTemplate"] =
+            json!("{yyyy}{MM}{dd}-{cameraId}.{extension}");
+        assert_eq!(
+            reload_error_path(value),
+            "component.global.output.fileNameTemplate"
+        );
+
+        // The capture id may live in the directory instead -- the PATH is what has to be unique.
+        let mut value = valid_config();
+        value["component"]["global"]["output"]["cameraDirectoryTemplate"] =
+            json!("{cameraId}/{captureId}");
+        value["component"]["global"]["output"]["fileNameTemplate"] = json!("latest.{extension}");
+        AdapterConfig::from_core_reload(&core(value))
+            .expect("a unique directory makes the path unique");
     }
 
     #[test]

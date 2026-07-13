@@ -1055,7 +1055,7 @@ impl AcceptanceHook for RuntimeJobHooks {
         else {
             return Ok(());
         };
-        if verb != "sb/capture" {
+        if verb != CommandVerb::Capture.as_str() {
             return Ok(());
         }
         let Some((waiter_id, token, correlation_id, request_uuid)) =
@@ -1133,8 +1133,16 @@ struct ResumableCapture {
 /// being demoted for having survived a restart.
 fn recovered_priority(record: &crate::catalog::JobRecord) -> crate::admission::CapturePriority {
     match record.verb.as_deref() {
-        Some("sb/capture" | "sb/capture-group") => crate::admission::CapturePriority::Direct,
-        Some("sb/capture-submit" | "sb/capture-group-submit") => {
+        Some(verb)
+            if verb == CommandVerb::Capture.as_str()
+                || verb == CommandVerb::CaptureGroup.as_str() =>
+        {
+            crate::admission::CapturePriority::Direct
+        }
+        Some(verb)
+            if verb == CommandVerb::CaptureSubmit.as_str()
+                || verb == CommandVerb::CaptureGroupSubmit.as_str() =>
+        {
             crate::admission::CapturePriority::Submitted
         }
         // No verb means no command ledger, which means a schedule fired it.
@@ -1843,8 +1851,11 @@ impl CameraRuntime {
         );
         let canonical = serde_json::Value::Object(canonical_arguments);
         let request_hash = crate::idempotency::canonical_request_hash(&canonical, true)?;
-        let ledger_key =
-            crate::catalog::LedgerKey::new("main", "sb/capture-group", body.request_id.clone())?;
+        let ledger_key = crate::catalog::LedgerKey::new(
+            "main",
+            CommandVerb::CaptureGroup.as_str(),
+            body.request_id.clone(),
+        )?;
         if let Some(group) = self.catalog.group_by_ledger(ledger_key.clone()).await? {
             if group.request_hash != request_hash {
                 return Err(crate::CameraError::rejected(
@@ -2479,7 +2490,7 @@ impl CameraRuntime {
         // instead of cancelling a second wave of work the operator never saw.
         let key = crate::catalog::LedgerKey::new(
             instance.clone().unwrap_or_else(|| "main".to_string()),
-            "sb/queue-clear",
+            CommandVerb::QueueClear.as_str(),
             request_id,
         )?;
         self.cancel_with_ledger(
@@ -2524,7 +2535,7 @@ impl CameraRuntime {
             });
             let key = crate::catalog::LedgerKey::new(
                 job.instance.clone(),
-                "sb/capture-cancel",
+                CommandVerb::CaptureCancel.as_str(),
                 request_id,
             )?;
             return self
@@ -2574,7 +2585,11 @@ impl CameraRuntime {
             "target": { "kind": "capture-group", "captureGroupId": &capture_group_id },
             "reason": canonical_reason,
         });
-        let key = crate::catalog::LedgerKey::new("main", "sb/capture-cancel", request_id)?;
+        let key = crate::catalog::LedgerKey::new(
+            "main",
+            CommandVerb::CaptureCancel.as_str(),
+            request_id,
+        )?;
         self.cancel_with_ledger(
             key,
             canonical,
@@ -5903,7 +5918,7 @@ impl CameraRuntime {
                 body.timeout_ms,
                 body.metadata,
                 correlation_id.clone(),
-                "sb/capture",
+                CommandVerb::Capture.as_str(),
                 crate::admission::CapturePriority::Direct,
             )
             .await?;
@@ -6041,10 +6056,19 @@ impl CameraCommandService for CameraRuntime {
                 "the camera adapter is draining a configuration replacement",
             ));
         }
-        if verb == "sb/capture" {
+        // The only place an unknown verb exists. Past this line the verb is a type, and the match
+        // below has no catch-all to fall through: a verb added to `CommandVerb` and forgotten here is
+        // a compile error, not an `UNSUPPORTED_CAPABILITY` an operator discovers in production.
+        let Some(verb) = CommandVerb::parse(verb) else {
+            return CommandOutcome::ImmediateError(CommandError::new(
+                crate::ErrorCode::UnsupportedCapability.as_str(),
+                "unsupported camera command",
+            ));
+        };
+        if verb == CommandVerb::Capture {
             return self.handle_deferred_capture(request, deferred).await;
         }
-        if verb == "sb/capture-group" {
+        if verb == CommandVerb::CaptureGroup {
             return self.handle_deferred_group_capture(request, deferred).await;
         }
         let config = match self.config_snapshot() {
@@ -6053,7 +6077,7 @@ impl CameraCommandService for CameraRuntime {
         };
         let outcome: Result<serde_json::Value> = async {
             match verb {
-                "sb/list" => {
+                CommandVerb::List => {
                     let body: ListRequest = commands::parse_closed(request.body.clone())?;
                     body.validate()?;
                     let query = serde_json::json!({
@@ -6101,11 +6125,11 @@ impl CameraCommandService for CameraRuntime {
                         "nextCursor": next_cursor,
                     }))
                 }
-                "sb/discover" => {
+                CommandVerb::Discover => {
                     let body: DiscoverRequest = commands::parse_closed(request.body.clone())?;
                     self.discover(body).await
                 }
-                "sb/status" => {
+                CommandVerb::Status => {
                     let body: StatusRequest = commands::parse_closed(request.body.clone())?;
                     body.validate()?;
                     match body.instance {
@@ -6113,7 +6137,7 @@ impl CameraCommandService for CameraRuntime {
                         None => Ok(serde_json::json!({ "cameras": self.registry.snapshots(1_000)? })),
                     }
                 }
-                "sb/capture-submit" => {
+                CommandVerb::CaptureSubmit => {
                     let body: CaptureRequest = commands::parse_closed(request.body.clone())?;
                     body.validate(config.global.limits.max_metadata_bytes)?;
                     let instance = self.registry.resolve_actuation_instance(body.instance.as_deref())?;
@@ -6124,7 +6148,7 @@ impl CameraCommandService for CameraRuntime {
                         body.timeout_ms,
                         body.metadata,
                         request.header.correlation_id.clone(),
-                        verb,
+                        verb.as_str(),
                         crate::admission::CapturePriority::Submitted,
                     ).await?;
                     let record = match accepted {
@@ -6139,10 +6163,10 @@ impl CameraCommandService for CameraRuntime {
                         "captureId": record.capture_id,
                         "state": record.state,
                         "acceptedAt": chrono::DateTime::from_timestamp_millis(record.accepted_at_ms),
-                        "statusVerb": "sb/capture-status",
+                        "statusVerb": CommandVerb::CaptureStatus.as_str(),
                     }))
                 }
-                "sb/capture-group-submit" => {
+                CommandVerb::CaptureGroupSubmit => {
                     let body: GroupCaptureRequest = commands::parse_closed(request.body.clone())?;
                     let group = self.submit_group(
                         body,
@@ -6160,7 +6184,7 @@ impl CameraCommandService for CameraRuntime {
                         })).collect::<Vec<_>>(),
                     }))
                 }
-                "sb/capture-status" => {
+                CommandVerb::CaptureStatus => {
                     let body: CaptureStatusRequest = commands::parse_closed(request.body.clone())?;
                     let limit = body.limit;
                     let cursor = body.cursor.clone();
@@ -6178,13 +6202,13 @@ impl CameraCommandService for CameraRuntime {
                         CaptureStatusMode::CameraRequest => {
                             let instance = body.instance.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::InvalidRequest, "instance is required"))?;
                             let request_id = body.request_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::InvalidRequest, "requestId is required"))?;
-                            let job = self.catalog.job_by_ledger(crate::catalog::LedgerKey::new(instance, "sb/capture", request_id)?).await?
+                            let job = self.catalog.job_by_ledger(crate::catalog::LedgerKey::new(instance, CommandVerb::Capture.as_str(), request_id)?).await?
                                 .ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::CaptureNotFound, "capture was not found"))?;
                             Ok(job_status_json(&job))
                         }
                         CaptureStatusMode::GroupRequest => {
                             let request_id = body.request_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::InvalidRequest, "requestId is required"))?;
-                            let group = self.catalog.group_by_ledger(crate::catalog::LedgerKey::new("main", "sb/capture-group", request_id)?).await?
+                            let group = self.catalog.group_by_ledger(crate::catalog::LedgerKey::new("main", CommandVerb::CaptureGroup.as_str(), request_id)?).await?
                                 .ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::CaptureNotFound, "capture group was not found"))?;
                             self.group_status_page(group, usize::from(limit), cursor.as_deref())
                         }
@@ -6193,36 +6217,42 @@ impl CameraCommandService for CameraRuntime {
                         }
                     }
                 }
-                "sb/capture-cancel" => {
+                CommandVerb::CaptureCancel => {
                     let body: CancelRequest = commands::parse_closed(request.body.clone())?;
                     self.cancel_capture(body).await
                 }
-                "sb/queue-status" => {
+                CommandVerb::QueueStatus => {
                     let body: commands::QueueStatusRequest =
                         commands::parse_closed(request.body.clone())?;
                     self.queue_status_command(body).await
                 }
-                "sb/queue-clear" => {
+                CommandVerb::QueueClear => {
                     let body: commands::QueueClearRequest =
                         commands::parse_closed(request.body.clone())?;
                     self.queue_clear_command(body).await
                 }
-                "sb/reconnect" => {
+                CommandVerb::Reconnect => {
                     let body: ReconnectRequest = commands::parse_closed(request.body.clone())?;
                     self.reconnect(body).await
                 }
-                "sb/ptz" => {
+                CommandVerb::Ptz => {
                     let body: PtzCommandRequest = commands::parse_closed(request.body.clone())?;
                     self.perform_ptz(body).await
                 }
-                "sb/ptz-presets" => {
+                CommandVerb::PtzPresets => {
                     let body: PtzPresetsRequest = commands::parse_closed(request.body.clone())?;
                     self.perform_presets(body).await
                 }
-                _ => Err(crate::CameraError::rejected(
-                    crate::ErrorCode::UnsupportedCapability,
-                    "unsupported camera command verb",
-                )),
+                // The deferred verbs are answered above, before this match is reached. They are
+                // named here rather than swept up by a `_`, because a `_` is what let a fifteenth
+                // verb register with the inbox and then fall through to UNSUPPORTED_CAPABILITY at
+                // runtime instead of failing to compile. There is no catch-all now: add a verb and
+                // this match stops building until somebody decides what it does.
+                CommandVerb::Capture | CommandVerb::CaptureGroup => Err(
+                    crate::CameraError::Catalog(
+                        "a deferred verb reached the immediate dispatch".to_string(),
+                    ),
+                ),
             }
         }.await;
         match outcome {
@@ -6289,22 +6319,106 @@ fn group_terminal_json(record: &crate::catalog::GroupRecord) -> serde_json::Valu
 }
 
 /// All application command verbs required by the binding design.
-pub const CAMERA_COMMAND_VERBS: [&str; 14] = [
-    "sb/list",
-    "sb/discover",
-    "sb/status",
-    "sb/capture",
-    "sb/capture-submit",
-    "sb/capture-group",
-    "sb/capture-group-submit",
-    "sb/capture-status",
-    "sb/capture-cancel",
-    "sb/queue-status",
-    "sb/queue-clear",
-    "sb/reconnect",
-    "sb/ptz",
-    "sb/ptz-presets",
-];
+/// A command this adapter answers.
+///
+/// The verb used to be a bare `&str` in three places that had to agree and were kept in step only by
+/// eye: a `[&str; 14]` registered with the inbox, a dispatch `match` with a `_` catch-all, and the
+/// durable ledger key -- typed out by hand at each call site.
+///
+/// The dispatch coupling was merely fragile: add a fifteenth verb to the array and it registers with
+/// the inbox, then falls through the catch-all to `UNSUPPORTED_CAPABILITY` at runtime instead of
+/// failing to compile.
+///
+/// The LEDGER coupling was worse. The verb is part of the durable idempotency key, so a typo at one of
+/// those call sites silently opens a NEW idempotency namespace: the retry a caller sends to get
+/// exactly-once semantics no longer finds the operation it is retrying, and does it again. Nothing
+/// catches that -- not the compiler, not a test, not a log line. A key is a key.
+///
+/// One spelling, in one place, and a `match` that will not compile if a verb is added and forgotten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandVerb {
+    /// `sb/list`
+    List,
+    /// `sb/discover`
+    Discover,
+    /// `sb/status`
+    Status,
+    /// `sb/capture` -- deferred.
+    Capture,
+    /// `sb/capture-submit`
+    CaptureSubmit,
+    /// `sb/capture-group` -- deferred.
+    CaptureGroup,
+    /// `sb/capture-group-submit`
+    CaptureGroupSubmit,
+    /// `sb/capture-status`
+    CaptureStatus,
+    /// `sb/capture-cancel`
+    CaptureCancel,
+    /// `sb/queue-status`
+    QueueStatus,
+    /// `sb/queue-clear`
+    QueueClear,
+    /// `sb/reconnect`
+    Reconnect,
+    /// `sb/ptz`
+    Ptz,
+    /// `sb/ptz-presets`
+    PtzPresets,
+}
+
+impl CommandVerb {
+    /// Every verb the adapter answers, in the order the inbox registers them.
+    pub const ALL: [Self; 14] = [
+        Self::List,
+        Self::Discover,
+        Self::Status,
+        Self::Capture,
+        Self::CaptureSubmit,
+        Self::CaptureGroup,
+        Self::CaptureGroupSubmit,
+        Self::CaptureStatus,
+        Self::CaptureCancel,
+        Self::QueueStatus,
+        Self::QueueClear,
+        Self::Reconnect,
+        Self::Ptz,
+        Self::PtzPresets,
+    ];
+
+    /// The exact wire spelling. This string is durable: it is part of the idempotency key.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::List => "sb/list",
+            Self::Discover => "sb/discover",
+            Self::Status => "sb/status",
+            Self::Capture => "sb/capture",
+            Self::CaptureSubmit => "sb/capture-submit",
+            Self::CaptureGroup => "sb/capture-group",
+            Self::CaptureGroupSubmit => "sb/capture-group-submit",
+            Self::CaptureStatus => "sb/capture-status",
+            Self::CaptureCancel => "sb/capture-cancel",
+            Self::QueueStatus => "sb/queue-status",
+            Self::QueueClear => "sb/queue-clear",
+            Self::Reconnect => "sb/reconnect",
+            Self::Ptz => "sb/ptz",
+            Self::PtzPresets => "sb/ptz-presets",
+        }
+    }
+
+    /// Recognises a verb arriving on the wire. The one place an unknown verb is a possibility.
+    #[must_use]
+    pub fn parse(verb: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|known| known.as_str() == verb)
+    }
+}
+
+/// The verbs registered with the command inbox, derived from [`CommandVerb::ALL`].
+#[must_use]
+pub fn camera_command_verbs() -> Vec<&'static str> {
+    CommandVerb::ALL.iter().map(|verb| verb.as_str()).collect()
+}
 
 /// Durable states in which a capture still owes the operator an outcome.
 const NON_TERMINAL_JOB_STATES: [crate::model::JobState; 5] = [
@@ -6498,8 +6612,10 @@ pub fn validate_configuration_candidate_with_credentials(
 /// error vocabulary at the command boundary.
 #[must_use]
 pub fn command_error(error: &crate::CameraError) -> CommandError {
+    // The detail a CALLER may see, not the one a log may. `Display` on the three variants that wrap a
+    // foreign error is written for a developer, and this string leaves the component.
     let message: String = error
-        .to_string()
+        .operator_detail()
         .chars()
         .filter(|character| !character.is_control())
         .take(256)
@@ -6873,7 +6989,7 @@ impl RuntimeCommandRouter {
     /// A registration failure is fatal to component construction; a partial command surface is
     /// never exposed as active.
     pub fn register(self: &Arc<Self>, inbox: &CommandInbox) -> edgecommons::Result<()> {
-        for verb in CAMERA_COMMAND_VERBS {
+        for verb in camera_command_verbs() {
             let router = Arc::clone(self);
             inbox.register_outcome(
                 verb,
@@ -12154,7 +12270,7 @@ mod tests {
             let inbox = core
                 .commands()
                 .expect("the MQTT core fixture must expose a command inbox");
-            for verb in CAMERA_COMMAND_VERBS {
+            for verb in camera_command_verbs() {
                 assert!(
                     inbox.verbs().contains(verb),
                     "router registration omitted required camera verb {verb}"
@@ -15407,6 +15523,39 @@ mod tests {
                 .expect("the slot the cancelled capture gave up is available to a live one");
             assert_eq!(runtime.scheduler.pending(), 1);
             runtime.shutdown().await;
+        }
+
+        /// Every verb has exactly one spelling, and it is the one the inbox registers.
+        ///
+        /// The verb is part of the DURABLE idempotency key. It was typed out by hand at each ledger
+        /// call site, so a typo at any one of them silently opened a new idempotency namespace: the
+        /// retry a caller sends precisely to get exactly-once semantics would no longer find the
+        /// operation it was retrying, and the adapter would do it again. Nothing catches that -- not
+        /// the compiler, not a test, not a log line. A key is a key.
+        #[test]
+        fn every_command_verb_has_one_spelling_and_the_dispatch_knows_them_all() {
+            let registered = camera_command_verbs();
+            assert_eq!(registered.len(), CommandVerb::ALL.len());
+
+            let mut seen = std::collections::BTreeSet::new();
+            for verb in CommandVerb::ALL {
+                assert!(
+                    verb.as_str().starts_with("sb/"),
+                    "{verb:?} is not a southbound verb"
+                );
+                assert!(
+                    seen.insert(verb.as_str()),
+                    "{verb:?} shares a wire spelling with another verb, so they share a durable                      idempotency namespace"
+                );
+                assert_eq!(
+                    CommandVerb::parse(verb.as_str()),
+                    Some(verb),
+                    "a verb the inbox registers must be one the router recognises"
+                );
+                assert!(registered.contains(&verb.as_str()));
+            }
+            assert_eq!(CommandVerb::parse("sb/capture-groups"), None);
+            assert_eq!(CommandVerb::parse("sb/not-a-verb"), None);
         }
 
         /// G2: a cron fires ONE synchronised group across several cameras.

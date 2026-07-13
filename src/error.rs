@@ -164,6 +164,38 @@ impl CameraError {
         }
     }
 
+    /// The detail that may leave the component: in a terminal message on the bus, or in a command
+    /// reply.
+    ///
+    /// `Display` is for logs, and it is not the same thing. Three variants wrap a foreign error whose
+    /// `Display` is written for a developer reading a stack trace -- and this string is broadcast to
+    /// every subscriber on the UNS bus. `SQLite error: UNIQUE constraint failed: jobs.capture_id` told
+    /// the whole fleet the adapter's table and column names, and the doc for the field it lands in
+    /// (`FailureSummary.message`) has always said "sanitized operator-safe detail".
+    ///
+    /// Everything else here is a string this codebase wrote on purpose, for an operator to read, and
+    /// passes through unchanged.
+    #[must_use]
+    pub fn operator_detail(&self) -> Cow<'static, str> {
+        match self {
+            Self::Rejected { message, .. } => message.clone(),
+            Self::Config { path, message } => {
+                Cow::Owned(format!("configuration error at {path}: {message}"))
+            }
+            Self::Backend { backend, message } => {
+                Cow::Owned(format!("backend '{backend}' failed: {message}"))
+            }
+            Self::Catalog(message) | Self::Messaging(message) | Self::Storage(message) => {
+                Cow::Owned(message.clone())
+            }
+            // The three that wrap somebody else's error type. An operator gets to know WHICH part of
+            // the component failed -- which is all they can act on anyway -- and no more.
+            Self::Io(_) => Cow::Borrowed("the output filesystem reported an error"),
+            Self::Json(_) => Cow::Borrowed("a request or record could not be parsed"),
+            Self::Sqlite(_) => Cow::Borrowed("the durable store reported an error"),
+        }
+    }
+
     /// Returns a stable public code when this error is command-visible.
     #[must_use]
     pub const fn code(&self) -> ErrorCode {
@@ -207,6 +239,46 @@ impl CameraError {
 
 #[cfg(test)]
 mod tests {
+
+    /// What an operator is told is not what a developer is told.
+    ///
+    /// `FailureSummary.message` is documented as "sanitized operator-safe detail" and is broadcast to
+    /// every subscriber on the UNS bus. It carried the raw `Display` of whatever went wrong -- so
+    /// `SQLite error: UNIQUE constraint failed: jobs.capture_id` told the whole fleet the adapter's
+    /// table and column names. No credential, but no business of theirs either, and not what the field
+    /// says it holds.
+    #[test]
+    fn the_detail_that_leaves_the_component_never_carries_a_foreign_error() {
+        let sqlite = CameraError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(2067),
+            Some("UNIQUE constraint failed: jobs.capture_id".to_owned()),
+        ));
+        let detail = sqlite.operator_detail();
+        assert!(
+            !detail.contains("jobs.capture_id") && !detail.contains("UNIQUE"),
+            "the durable store's schema is not the fleet's business: {detail}"
+        );
+        assert!(
+            sqlite.to_string().contains("jobs.capture_id"),
+            "the log still gets the whole truth -- that is what Display is for"
+        );
+
+        let io = CameraError::Io(std::io::Error::other("/srv/secret/path denied"));
+        assert!(!io.operator_detail().contains("/srv/secret/path"));
+
+        // A message this codebase wrote for an operator to read passes through untouched.
+        let rejected = CameraError::rejected(ErrorCode::QueueFull, "the camera queue is full");
+        assert_eq!(rejected.operator_detail(), "the camera queue is full");
+        let backend = CameraError::Backend {
+            backend: "onvif",
+            message: "the camera refused the media profile".to_owned(),
+        };
+        assert!(
+            backend
+                .operator_detail()
+                .contains("refused the media profile")
+        );
+    }
     use super::*;
 
     /// A busy disk is not a broken camera.
