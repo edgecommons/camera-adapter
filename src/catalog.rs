@@ -801,6 +801,81 @@ impl Catalog {
     }
 
     /// Performs the second durable acceptance phase, making one ACCEPTED job QUEUED.
+    /// Rebases a QUEUED capture's deadlines onto the moment it is admitted to a camera.
+    ///
+    /// Deadlines were write-once acceptance facts, and that is precisely what broke oversized
+    /// groups. A member's 30-second capture clock started when the GROUP was accepted, so anything
+    /// the component could not dispatch immediately spent its whole budget sitting in a queue and
+    /// then died of CAPTURE_TIMEOUT the moment a camera was free to serve it. Sequencing work into
+    /// waves is pointless if the later waves are already dead on arrival.
+    ///
+    /// So a capture's stage clocks now start when a camera actually takes it. How long it may WAIT
+    /// is a separate bound (`queue_at_ms`, from `profile.queueExpiryMs`) and is deliberately not
+    /// rebased -- otherwise a starved capture would wait forever, one rebase at a time.
+    ///
+    /// Only a QUEUED row may be rebased. A capture that has begun acquiring owns its clocks, and a
+    /// terminal one is finished; moving either one's deadline would be rewriting history.
+    pub async fn reschedule_deadlines(
+        &self,
+        capture_id: impl Into<String>,
+        deadlines: JobDeadlines,
+        rebased_at_ms: i64,
+    ) -> Result<JobRecord> {
+        let capture_id = capture_id.into();
+        require_nonempty("capture_id", &capture_id)?;
+        if deadlines.capture_at_ms > deadlines.terminal_at_ms
+            || deadlines.encode_at_ms > deadlines.terminal_at_ms
+            || deadlines.persist_at_ms > deadlines.terminal_at_ms
+            || deadlines
+                .queue_at_ms
+                .is_some_and(|deadline| deadline > deadlines.terminal_at_ms)
+        {
+            return Err(CameraError::Catalog(
+                "stage deadlines must not exceed the terminal deadline".to_owned(),
+            ));
+        }
+        self.execute(move |connection| {
+            let transaction = connection.transaction()?;
+            let state: String = transaction
+                .query_row(
+                    "SELECT state FROM jobs WHERE capture_id=?1",
+                    rusqlite::params![capture_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CameraError::rejected(
+                        crate::ErrorCode::CaptureNotFound,
+                        "capture was not found",
+                    )
+                })?;
+            if parse_job_state(&state)? != JobState::Queued {
+                return Err(CameraError::Catalog(format!(
+                    "only a QUEUED capture may be rebased onto its admission; found {state}"
+                )));
+            }
+            transaction.execute(
+                "UPDATE jobs SET terminal_deadline_ms=?2,queue_deadline_ms=?3,capture_deadline_ms=?4,                 encode_deadline_ms=?5,persist_deadline_ms=?6,updated_at_ms=?7 WHERE capture_id=?1",
+                rusqlite::params![
+                    capture_id,
+                    deadlines.terminal_at_ms,
+                    deadlines.queue_at_ms,
+                    deadlines.capture_at_ms,
+                    deadlines.encode_at_ms,
+                    deadlines.persist_at_ms,
+                    rebased_at_ms,
+                ],
+            )?;
+            let record = load_job(&transaction, &capture_id)?.ok_or_else(|| {
+                CameraError::Catalog("capture disappeared while being rebased".to_owned())
+            })?;
+            transaction.commit()?;
+            Ok(record)
+        })
+        .await
+    }
+
+    /// Performs the second durable acceptance phase, making one ACCEPTED job QUEUED.
     pub async fn queue_job(
         &self,
         capture_id: impl Into<String>,

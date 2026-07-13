@@ -110,6 +110,25 @@ impl<T> QueueInner<T> {
     }
 
     fn pop_best(&self, now: Instant) -> Option<QueuedCapture<T>> {
+        self.pop_best_admissible(now, |_| true)
+    }
+
+    /// Pops the best-scoring entry whose camera the consumer can actually serve right now.
+    ///
+    /// A fleet-wide consumer cannot simply take the globally best capture: that capture may belong
+    /// to a camera that is offline, or whose actor has no free slot, and popping it would strand it
+    /// -- off the queue, unbounded, owned by nobody. The predicate keeps the ORDERING global while
+    /// making the CHOICE only among cameras that can take work, which is the whole point of a
+    /// central queue: a Direct capture on a connected camera must not wait behind a Scheduled one on
+    /// a camera that is down.
+    ///
+    /// Expired and cancelled entries are still swept regardless of admissibility -- a dead capture
+    /// on an unreachable camera must not linger and hold its slot.
+    fn pop_best_admissible(
+        &self,
+        now: Instant,
+        admissible: impl Fn(&str) -> bool,
+    ) -> Option<QueuedCapture<T>> {
         let mut discarded = Vec::new();
         let mut state = self
             .state
@@ -133,6 +152,7 @@ impl<T> QueueInner<T> {
             .entries
             .iter()
             .enumerate()
+            .filter(|(_, entry)| admissible(&entry.camera_id))
             .max_by(|(_, left), (_, right)| {
                 effective_score(left, now, self.aging_interval)
                     .cmp(&effective_score(right, now, self.aging_interval))
@@ -301,6 +321,40 @@ impl<T: Send + 'static> CaptureAdmissionQueue<T> {
         });
         self.inner.notify.notify_one();
         Ok(ticket)
+    }
+
+    /// Waits for the best descriptor whose camera can be served right now.
+    ///
+    /// The fleet scheduler's consumer. It differs from [`Self::next`] in one way that matters: the
+    /// globally best capture may target a camera that is offline or whose actor is full, and popping
+    /// that would strand it. So the ORDER stays global while the CHOICE is confined to cameras that
+    /// can take work -- and when nothing is admissible, it waits to be told the world changed rather
+    /// than spinning.
+    ///
+    /// `changed` is raised by whoever alters admissibility: a camera coming online, an actor freeing
+    /// a slot. Without it this would have to poll, which is the 25,600-wakeups-per-second habit the
+    /// central queue exists to end.
+    pub async fn next_admissible(
+        &self,
+        cancellation: &CancellationToken,
+        changed: &Notify,
+        admissible: impl Fn(&str) -> bool,
+    ) -> Option<QueuedCapture<T>> {
+        loop {
+            // Register for BOTH wakeups before looking, or an arrival between the look and the wait
+            // is lost and the scheduler sleeps on work it already has.
+            let arrived = self.inner.notify.notified();
+            let capacity = changed.notified();
+            if let Some(entry) = self.inner.pop_best_admissible(Instant::now(), &admissible) {
+                return Some(entry);
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return None,
+                () = arrived => {},
+                () = capacity => {},
+            }
+        }
     }
 
     /// Waits for the best descriptor, or returns `None` when the consumer is cancelled.
@@ -1030,6 +1084,9 @@ impl AcquisitionLease {
         } = self;
         drop(resource_group);
         drop(global);
+        // Dropped here rather than carried into the processing lease: the ACQUISITION permit is what
+        // the scheduler meters against, and it has just been returned. Encoding and persistence have
+        // their own bounds and are not the scarce thing.
         Ok(ProcessingLease { disk, memory })
     }
 

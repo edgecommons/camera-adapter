@@ -83,6 +83,16 @@ impl CameraActorHandle {
         self.shared.slots.used.load(Ordering::Acquire)
     }
 
+    /// Whether this camera has a free capture slot right now.
+    ///
+    /// The fleet scheduler asks before it pops: taking the globally best capture for a camera that
+    /// cannot hold it would strand the descriptor -- off the queue, unbounded, owned by nobody.
+    #[must_use]
+    pub fn can_accept_capture(&self) -> bool {
+        self.shared.accepting.load(Ordering::Acquire)
+            && self.shared.slots.used.load(Ordering::Acquire) < self.shared.slots.maximum
+    }
+
     /// Current ordinary-control count, excluding the independent safety lane.
     #[must_use]
     pub fn queued_controls(&self) -> usize {
@@ -91,7 +101,13 @@ impl CameraActorHandle {
 }
 
 impl CaptureDispatcher for CameraActorHandle {
-    fn reserve(&self) -> Result<Box<dyn DispatchReservation>> {
+    fn reserve(&self, camera_id: &str) -> Result<Box<dyn DispatchReservation>> {
+        if camera_id != self.shared.instance {
+            return Err(CameraError::rejected(
+                ErrorCode::UnknownInstance,
+                "capture was dispatched to the wrong camera actor",
+            ));
+        }
         if !self.shared.accepting.load(Ordering::Acquire) {
             return Err(CameraError::rejected(
                 ErrorCode::ComponentStopping,
@@ -115,12 +131,17 @@ pub struct CameraActor {
 
 impl CameraActor {
     /// Creates an actor and non-owning command/dispatch handle.
+    ///
+    /// `capacity_changed` is the fleet scheduler's wake-up: the actor raises it whenever a capture
+    /// slot is freed, so the scheduler can hand this camera its next capture immediately instead of
+    /// polling to find out.
     pub fn new(
         instance: impl Into<String>,
         session: Box<dyn CameraSession>,
         engine: JobEngine,
         max_queued_captures: usize,
         max_queued_controls: usize,
+        capacity_changed: Arc<Notify>,
     ) -> Result<(Self, CameraActorHandle)> {
         let instance = instance.into();
         if instance.is_empty() || max_queued_captures == 0 {
@@ -140,6 +161,7 @@ impl CameraActor {
             slots: Arc::new(DescriptorSlots {
                 used: AtomicUsize::new(0),
                 maximum: max_queued_captures,
+                released: Arc::clone(&capacity_changed),
             }),
             accepting: AtomicBool::new(true),
             notify: Notify::new(),
@@ -373,6 +395,9 @@ impl QueuedDescriptor {
 struct DescriptorSlots {
     used: AtomicUsize,
     maximum: usize,
+    /// Raised whenever a slot is released, so the fleet scheduler learns this camera can take work
+    /// again instead of discovering it on the next tick of a timer.
+    released: Arc<Notify>,
 }
 
 impl DescriptorSlots {
@@ -401,6 +426,9 @@ impl Drop for DescriptorSlot {
         if !self.released {
             self.slots.used.fetch_sub(1, Ordering::AcqRel);
             self.released = true;
+            // Tell the scheduler. A camera that has just freed a slot is a camera that can be given
+            // the next capture, and the alternative to saying so is polling for it.
+            self.slots.released.notify_waiters();
         }
     }
 }
@@ -727,6 +755,7 @@ mod tests {
             engine.clone(),
             capture_capacity,
             control_capacity,
+            Arc::new(Notify::new()),
         )
         .unwrap();
         Harness {
@@ -1366,9 +1395,15 @@ mod tests {
             ordinary_started: Arc::clone(&ordinary_started),
             safety_stops: Arc::clone(&safety_stops),
         };
-        let (actor, handle) =
-            CameraActor::new("cam-a", Box::new(session), harness.engine.clone(), 2, 2)
-                .expect("test actor");
+        let (actor, handle) = CameraActor::new(
+            "cam-a",
+            Box::new(session),
+            harness.engine.clone(),
+            2,
+            2,
+            Arc::new(Notify::new()),
+        )
+        .expect("test actor");
         let shutdown = CancellationToken::new();
         let actor_task = tokio::spawn(actor.run(shutdown.clone()));
         let control_handle = handle.clone();

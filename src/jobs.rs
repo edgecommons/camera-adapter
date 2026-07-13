@@ -6,8 +6,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -112,8 +113,12 @@ pub trait DispatchReservation: Send {
 
 /// Bounded actor-dispatch seam used before the first catalog commit.
 pub trait CaptureDispatcher: Send + Sync {
-    /// Reserves capacity without exposing any descriptor to an actor.
-    fn reserve(&self) -> Result<Box<dyn DispatchReservation>>;
+    /// Reserves capacity for one camera without exposing any descriptor to an actor.
+    ///
+    /// The camera is now explicit. A per-camera dispatcher knew it implicitly; a fleet-wide queue
+    /// cannot, and it needs it to enforce the per-camera bound that keeps one busy camera from
+    /// eating the whole component's backlog.
+    fn reserve(&self, camera_id: &str) -> Result<Box<dyn DispatchReservation>>;
 }
 
 /// Exact EdgeCommons terminal-envelope encoder.
@@ -278,7 +283,16 @@ impl CaptureDescriptor {
     /// Absolute terminal deadline converted to the local monotonic clock.
     #[must_use]
     pub fn deadline(&self) -> Instant {
-        instant_for_epoch(self.runtime.spec.deadlines.terminal_at_ms)
+        instant_for_epoch(self.runtime.deadlines().terminal_at_ms)
+    }
+
+    /// The queue-expiry instant, when the profile sets one.
+    ///
+    /// This bounds how long the capture may WAIT for a camera, and is deliberately separate from the
+    /// deadlines that bound how long it may RUN.
+    #[must_use]
+    pub fn queue_expiry(&self) -> Option<Instant> {
+        self.runtime.deadlines().queue_at_ms.map(instant_for_epoch)
     }
 
     /// Cancellation watched by queue admission and backend work.
@@ -290,9 +304,31 @@ impl CaptureDescriptor {
 
 struct JobRuntime {
     spec: Arc<CaptureJobSpec>,
+    /// The deadlines currently in force, which are NOT `spec.deadlines`.
+    ///
+    /// `spec.deadlines` is the acceptance-time record and stays exactly as accepted. These are the
+    /// EFFECTIVE clocks, and they are rebased onto the moment a camera actually takes the capture.
+    /// A capture's 30-second budget used to start when it was ACCEPTED, so anything that could not
+    /// be dispatched at once spent its whole budget queueing and then died of CAPTURE_TIMEOUT the
+    /// instant a camera was free to serve it -- which is exactly why an oversized group degraded
+    /// into "most of your members failed" instead of taking longer.
+    deadlines: RwLock<JobDeadlines>,
+    /// Raised when the deadlines above are rebased, so the terminal timer stops sleeping on a clock
+    /// that no longer exists.
+    rebased: Notify,
     cancellation: CancellationToken,
     done: CancellationToken,
     trace: Mutex<ExecutionTrace>,
+}
+
+impl JobRuntime {
+    /// The deadlines currently in force.
+    fn deadlines(&self) -> JobDeadlines {
+        self.deadlines
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,7 +444,7 @@ impl JobEngine {
         submission: JobSubmission,
     ) -> Result<AcceptJobOutcome> {
         validate_submission(&submission)?;
-        let reservation = dispatcher.reserve()?;
+        let reservation = dispatcher.reserve(&submission.spec.instance)?;
         let outcome = self.catalog.accept_job(submission.job.clone()).await?;
         let AcceptJobOutcome::Inserted(_) = outcome else {
             return Ok(outcome);
@@ -435,6 +471,8 @@ impl JobEngine {
         };
         let initial_camera = submission.spec.camera.clone();
         let runtime = Arc::new(JobRuntime {
+            deadlines: RwLock::new(submission.spec.deadlines.clone()),
+            rebased: Notify::new(),
             spec: Arc::new(submission.spec),
             cancellation: CancellationToken::new(),
             done: CancellationToken::new(),
@@ -498,7 +536,7 @@ impl JobEngine {
         submission: JobSubmission,
     ) -> Result<JobRecord> {
         validate_submission(&submission)?;
-        let reservation = dispatcher.reserve()?;
+        let reservation = dispatcher.reserve(&submission.spec.instance)?;
         let accepted = self
             .catalog
             .job(&submission.job.capture_id)
@@ -527,6 +565,8 @@ impl JobEngine {
         };
         let initial_camera = submission.spec.camera.clone();
         let runtime = Arc::new(JobRuntime {
+            deadlines: RwLock::new(submission.spec.deadlines.clone()),
+            rebased: Notify::new(),
             spec: Arc::new(submission.spec),
             cancellation: CancellationToken::new(),
             done: CancellationToken::new(),
@@ -830,6 +870,8 @@ impl JobEngine {
             group_size,
         };
         let runtime = Arc::new(JobRuntime {
+            deadlines: RwLock::new(spec.deadlines.clone()),
+            rebased: Notify::new(),
             spec: Arc::new(spec),
             cancellation: CancellationToken::new(),
             done: CancellationToken::new(),
@@ -888,13 +930,13 @@ impl JobEngine {
 
         if let Err(error) = self
             .await_with_deadline(
-                runtime.spec.deadlines.terminal_at_ms,
+                runtime.deadlines().terminal_at_ms,
                 &runtime.cancellation,
                 self.availability.wait_until_ready(
                     &runtime.spec.instance,
                     runtime.spec.profile.offline_policy,
-                    runtime.spec.deadlines.queue_at_ms,
-                    runtime.spec.deadlines.terminal_at_ms,
+                    runtime.deadlines().queue_at_ms,
+                    runtime.deadlines().terminal_at_ms,
                     &runtime.cancellation,
                 ),
                 "camera availability",
@@ -914,7 +956,7 @@ impl JobEngine {
                 CaptureResourceRequest {
                     resource_group: runtime.spec.resource_group.clone(),
                     maximum_frame_bytes: runtime.spec.profile.maximum_frame_bytes,
-                    deadline: instant_for_epoch(runtime.spec.deadlines.capture_at_ms),
+                    deadline: instant_for_epoch(runtime.deadlines().capture_at_ms),
                 },
                 &runtime.cancellation,
             )
@@ -957,12 +999,12 @@ impl JobEngine {
             capture_id: runtime.spec.capture_id.clone(),
             profile: runtime.spec.profile.capture.clone(),
             maximum_frame_bytes: runtime.spec.profile.maximum_frame_bytes,
-            timeout: remaining_duration(runtime.spec.deadlines.capture_at_ms),
+            timeout: remaining_duration(runtime.deadlines().capture_at_ms),
             cancellation: runtime.cancellation.clone(),
         });
         let frame = match self
             .await_with_deadline(
-                runtime.spec.deadlines.capture_at_ms,
+                runtime.deadlines().capture_at_ms,
                 &runtime.cancellation,
                 capture,
                 "backend acquisition",
@@ -1014,7 +1056,7 @@ impl JobEngine {
             match self
                 .admission
                 .acquire_encoder(
-                    instant_for_epoch(runtime.spec.deadlines.encode_at_ms),
+                    instant_for_epoch(runtime.deadlines().encode_at_ms),
                     &runtime.cancellation,
                 )
                 .await
@@ -1028,7 +1070,7 @@ impl JobEngine {
         let writer = match self
             .admission
             .acquire_writer(
-                instant_for_epoch(runtime.spec.deadlines.persist_at_ms),
+                instant_for_epoch(runtime.deadlines().persist_at_ms),
                 &runtime.cancellation,
             )
             .await
@@ -1042,9 +1084,9 @@ impl JobEngine {
                 .spec
                 .deadlines
                 .encode_at_ms
-                .min(runtime.spec.deadlines.persist_at_ms)
+                .min(runtime.deadlines().persist_at_ms)
         } else {
-            runtime.spec.deadlines.persist_at_ms
+            runtime.deadlines().persist_at_ms
         };
         let prepared = match self
             .prepare_blocking(&runtime, frame, processing, encoder, writer, work_deadline)
@@ -1204,7 +1246,7 @@ impl JobEngine {
                 ));
             }
         }
-        let deadline = instant_for_epoch(runtime.spec.deadlines.capture_at_ms);
+        let deadline = instant_for_epoch(runtime.deadlines().capture_at_ms);
         if status_available {
             loop {
                 if Instant::now() >= deadline {
@@ -1220,7 +1262,7 @@ impl JobEngine {
                     PtzResult::Status(status) if status.moving != Some(true) => break,
                     PtzResult::Status(_) => {
                         self.await_with_deadline(
-                            runtime.spec.deadlines.capture_at_ms,
+                            runtime.deadlines().capture_at_ms,
                             &runtime.cancellation,
                             async {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1240,7 +1282,7 @@ impl JobEngine {
             }
         }
         self.await_with_deadline(
-            runtime.spec.deadlines.capture_at_ms,
+            runtime.deadlines().capture_at_ms,
             &runtime.cancellation,
             async {
                 tokio::time::sleep(Duration::from_millis(runtime.spec.profile.settle_ms)).await;
@@ -1257,7 +1299,7 @@ impl JobEngine {
         runtime: &Arc<JobRuntime>,
         request: PtzRequest,
     ) -> Result<PtzResult> {
-        let deadline = instant_for_epoch(runtime.spec.deadlines.capture_at_ms);
+        let deadline = instant_for_epoch(runtime.deadlines().capture_at_ms);
         match session
             .ptz_bounded(request, deadline, &runtime.cancellation)
             .await
@@ -1268,6 +1310,61 @@ impl JobEngine {
             )),
             result => result,
         }
+    }
+
+    /// Rebases a queued capture's clocks onto the moment a camera takes it.
+    ///
+    /// This is what makes sequencing work at all. A capture's stage deadlines used to start when it
+    /// was ACCEPTED, so a member of an oversized group spent its entire 30-second budget waiting for
+    /// a free camera and then died of CAPTURE_TIMEOUT the instant one appeared. The work was not too
+    /// slow; it was declared late before it was allowed to begin.
+    ///
+    /// The durable row and the in-memory clocks move together, and the durable write goes FIRST: if
+    /// the process dies between them, the row carries the deadline the capture will actually run to,
+    /// which is the direction that cannot lie to an operator reading the catalog.
+    ///
+    /// `queue_at_ms` is deliberately NOT rebased. It bounds how long a capture may WAIT, and a bound
+    /// that moved every time the capture was passed over would never expire -- a starved capture
+    /// would queue forever, one rebase at a time.
+    pub(crate) async fn rebase_onto_admission(
+        &self,
+        descriptor: &CaptureDescriptor,
+        timeouts: &crate::config::TimeoutsConfig,
+    ) -> Result<()> {
+        let runtime = &descriptor.runtime;
+        let accepted = runtime.spec.deadlines.clone();
+        let admitted_at_ms = now_ms();
+        let terminal_budget_ms = accepted
+            .terminal_at_ms
+            .saturating_sub(runtime.spec.accepted_at_ms)
+            .max(0);
+
+        let rebased = JobDeadlines {
+            terminal_at_ms: admitted_at_ms.saturating_add(terminal_budget_ms),
+            // NOT rebased: the wait bound is measured from acceptance, on purpose.
+            queue_at_ms: accepted.queue_at_ms,
+            capture_at_ms: admitted_at_ms
+                .saturating_add(i64::try_from(timeouts.capture_ms).unwrap_or(i64::MAX)),
+            encode_at_ms: admitted_at_ms
+                .saturating_add(i64::try_from(timeouts.encode_ms).unwrap_or(i64::MAX)),
+            persist_at_ms: admitted_at_ms
+                .saturating_add(i64::try_from(timeouts.persist_ms).unwrap_or(i64::MAX)),
+        };
+
+        self.catalog
+            .reschedule_deadlines(&runtime.spec.capture_id, rebased.clone(), admitted_at_ms)
+            .await?;
+        {
+            let mut effective = runtime
+                .deadlines
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *effective = rebased;
+        }
+        // The terminal timer is asleep on the OLD clock. Wake it, or it fires on a deadline that no
+        // longer exists -- while the capture it is watching has only just started.
+        runtime.rebased.notify_waiters();
+        Ok(())
     }
 
     /// Converts a caught actor/session panic into one durable terminal failure.
@@ -1468,18 +1565,34 @@ impl JobEngine {
         lock(&self.active).remove(&runtime.spec.capture_id);
     }
 
+    /// Fails a capture that outlives its terminal deadline -- the one that is in force NOW.
+    ///
+    /// The timer re-reads the deadline instead of capturing it once, because a queued capture's
+    /// clocks are rebased when a camera finally takes it. A timer that had latched the
+    /// acceptance-time deadline would fire while the capture it was watching had only just begun.
     fn spawn_terminal_deadline(&self, runtime: Arc<JobRuntime>) {
         let engine = self.clone();
         tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                _ = runtime.done.cancelled() => {}
-                _ = tokio::time::sleep_until(instant_for_epoch(runtime.spec.deadlines.terminal_at_ms)) => {
-                    let _ = engine.finish_failure(
-                        &runtime,
-                        ErrorCode::CaptureTimeout,
-                        "capture exceeded its terminal deadline",
-                    ).await;
+            loop {
+                let terminal_at_ms = runtime.deadlines().terminal_at_ms;
+                let rebased = runtime.rebased.notified();
+                tokio::select! {
+                    biased;
+                    _ = runtime.done.cancelled() => return,
+                    () = rebased => continue,
+                    _ = tokio::time::sleep_until(instant_for_epoch(terminal_at_ms)) => {
+                        // The deadline may have moved while this slept; only fire on the one that
+                        // is still in force.
+                        if runtime.deadlines().terminal_at_ms > terminal_at_ms {
+                            continue;
+                        }
+                        let _ = engine.finish_failure(
+                            &runtime,
+                            ErrorCode::CaptureTimeout,
+                            "capture exceeded its terminal deadline",
+                        ).await;
+                        return;
+                    }
                 }
             }
         });
@@ -2042,7 +2155,7 @@ mod tests {
     }
 
     impl CaptureDispatcher for RecordingDispatcher {
-        fn reserve(&self) -> Result<Box<dyn DispatchReservation>> {
+        fn reserve(&self, _camera_id: &str) -> Result<Box<dyn DispatchReservation>> {
             Ok(Box::new(RecordingReservation {
                 descriptors: Arc::clone(&self.descriptors),
                 fail_commit: self.fail_commit,
@@ -2129,6 +2242,8 @@ mod tests {
     fn runtime_from(spec: CaptureJobSpec) -> Arc<JobRuntime> {
         let camera = spec.camera.clone();
         Arc::new(JobRuntime {
+            deadlines: RwLock::new(spec.deadlines.clone()),
+            rebased: Notify::new(),
             spec: Arc::new(spec),
             cancellation: CancellationToken::new(),
             done: CancellationToken::new(),

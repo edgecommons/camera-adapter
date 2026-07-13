@@ -14,6 +14,7 @@ pub mod commands;
 pub mod config;
 #[cfg(feature = "onvif")]
 pub mod credential_provider;
+pub mod dispatch;
 pub mod encoding;
 pub mod error;
 pub mod idempotency;

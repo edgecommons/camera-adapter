@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ use edgecommons::config::{
 use edgecommons::facades::{AppFacade, EventsFacade, Severity};
 use edgecommons::messaging::Message;
 use edgecommons::platform::Platform;
-use tokio::sync::{Notify, Semaphore, watch};
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -45,10 +45,7 @@ use crate::{
     backend::{BackendRuntimeContext, ConnectRequest, DiscoveryCandidate},
     catalog::{Catalog, CatalogOptions},
     config::{AdapterConfig, GlobalConfig},
-    jobs::{
-        AcceptanceHook, AppTerminalEnvelopeEncoder, CaptureDescriptor, CaptureDispatcher,
-        CaptureJobSpec, DispatchReservation, JobEngine, JobHooks,
-    },
+    jobs::{AcceptanceHook, AppTerminalEnvelopeEncoder, CaptureJobSpec, JobEngine, JobHooks},
     outbox::{EdgeCommonsConfirmedPublisher, OutboxDurability, OutboxPressure, OutboxPublisher},
     registry::{CameraConnectionState, CameraRegistry, CameraStatusError},
     scheduler::{ScheduleDecision, ScheduleOccurrence, SchedulePlan},
@@ -678,7 +675,8 @@ pub struct CameraRuntime {
     scheduler_cancellations: RwLock<HashMap<(String, String), CancellationToken>>,
     discovery_cancellation: RwLock<Option<CancellationToken>>,
     discovery_cache: Mutex<DiscoveryCache>,
-    dispatchers: RwLock<BTreeMap<String, Arc<SupervisorDispatcher>>>,
+    /// The fleet-wide capture queue. One object, replacing N per-camera dispatch caches.
+    scheduler: crate::dispatch::CaptureScheduler,
     cancellation: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     connect_gate: Arc<Semaphore>,
@@ -709,7 +707,6 @@ struct RuntimeReloadCheckpoint {
     config: AdapterConfig,
     engines: BTreeMap<String, JobEngine>,
     events: BTreeMap<String, EventsFacade>,
-    dispatchers: BTreeMap<String, Arc<SupervisorDispatcher>>,
 }
 
 /// Process-local core deferred tokens paired with durable waiter records. The durable row makes
@@ -938,6 +935,12 @@ impl JobHooks for RuntimeJobHooks {
             crate::observability::terminal_measure(record.state),
         ) {
             runtime.metrics.count(measure).await;
+        }
+        // The execution slot the scheduler was holding on this capture's behalf, released on the one
+        // path every capture takes exactly once. Releasing it only on success would be a component
+        // that stops scheduling after its first failure.
+        if let Some(runtime) = self.runtime() {
+            runtime.scheduler.capture_finished(&record.capture_id);
         }
         let tokens = match self.tokens.lock() {
             Ok(mut tokens) => tokens.remove(&record.capture_id).unwrap_or_default(),
@@ -1210,7 +1213,10 @@ impl CameraRuntime {
         );
         let waiters = Arc::new(RuntimeJobHooks::new(resources.catalog.clone()));
         let mut engines = BTreeMap::new();
-        let mut dispatchers = BTreeMap::new();
+        // One queue for the whole fleet. There is no longer a dispatch cache per camera, so a camera
+        // that is added by a reload needs nothing built for it: it simply becomes a camera the
+        // scheduler can hand work to.
+        let scheduler = crate::dispatch::CaptureScheduler::new(&config.global.limits)?;
         for camera in &config.instances {
             let app = apps.get(&camera.id).ok_or_else(|| {
                 crate::CameraError::Catalog(format!(
@@ -1235,13 +1241,6 @@ impl CameraRuntime {
                 )
                 .with_acceptance_hook(Arc::clone(&waiters) as Arc<dyn AcceptanceHook>),
             );
-            dispatchers.insert(
-                camera.id.clone(),
-                Arc::new(SupervisorDispatcher::new(
-                    camera.id.clone(),
-                    config.global.limits.max_queued_captures_per_camera,
-                )?),
-            );
         }
 
         let runtime = Arc::new(Self {
@@ -1265,7 +1264,7 @@ impl CameraRuntime {
             scheduler_cancellations: RwLock::new(HashMap::new()),
             discovery_cancellation: RwLock::new(None),
             discovery_cache: Mutex::new(DiscoveryCache::default()),
-            dispatchers: RwLock::new(dispatchers),
+            scheduler,
             cancellation: CancellationToken::new(),
             tasks: Mutex::new(Vec::new()),
             connect_gate: Arc::new(Semaphore::new(max_connection_attempts)),
@@ -1279,6 +1278,7 @@ impl CameraRuntime {
         waiters.attach_runtime(Arc::downgrade(&runtime));
 
         runtime.refresh_storage_pressure().await;
+        runtime.start_capture_scheduler()?;
         runtime.start_storage_pressure_monitor()?;
         runtime.start_metric_sampler()?;
         runtime.recover_install_owned().await?;
@@ -1331,23 +1331,14 @@ impl CameraRuntime {
             })
     }
 
-    /// Returns the persistent dispatch queue for a camera.  Unlike a live actor handle, this
-    /// dispatcher survives a reconnect and is therefore the only capture admission seam used by
-    /// the command and scheduler paths.
-    pub fn dispatcher(&self, instance: &str) -> Result<Arc<SupervisorDispatcher>> {
-        self.dispatchers
-            .read()
-            .map_err(|_| {
-                crate::CameraError::Catalog("camera dispatcher map is unavailable".to_string())
-            })?
-            .get(instance)
-            .cloned()
-            .ok_or_else(|| {
-                crate::CameraError::rejected(
-                    crate::ErrorCode::UnknownInstance,
-                    format!("camera instance '{instance}' is not configured"),
-                )
-            })
+    /// The fleet capture queue, checked against a camera that is actually configured.
+    ///
+    /// This used to hand back that camera's own dispatch cache. There is one queue now, and the
+    /// instance check is what the map lookup used to give for free: a capture for a camera that does
+    /// not exist must be rejected before anything durable is written for it.
+    pub fn dispatcher(&self, instance: &str) -> Result<crate::dispatch::CaptureScheduler> {
+        self.registry.snapshot(instance)?;
+        Ok(self.scheduler.clone())
     }
 
     /// Resolves and durably accepts one single-camera capture before exposing it to the persistent
@@ -1541,7 +1532,7 @@ impl CameraRuntime {
         };
         let dispatcher = self.dispatcher(&instance)?;
         self.engine(&instance)?
-            .accept_and_queue(dispatcher.as_ref(), submission)
+            .accept_and_queue(&dispatcher, submission)
             .await
     }
 
@@ -1888,7 +1879,7 @@ impl CameraRuntime {
         for submission in submissions {
             let dispatcher = self.dispatcher(&submission.spec.instance)?;
             self.engine(&submission.spec.instance)?
-                .queue_preaccepted(dispatcher.as_ref(), submission)
+                .queue_preaccepted(&dispatcher, submission)
                 .await?;
         }
         self.waiters
@@ -2212,27 +2203,24 @@ impl CameraRuntime {
             // Rejects an unknown camera the same way every other targeted verb does.
             self.registry.snapshot(instance)?;
         }
-        self.sweep_cancelled_descriptors(instance.as_deref())?;
         let config = self.config_snapshot()?;
-        let dispatchers = self
-            .dispatchers
-            .read()
-            .map_err(|_| {
-                crate::CameraError::Catalog("camera dispatcher map is unavailable".into())
-            })?
+        // The fleet queue evicts cancelled and expired entries itself -- each carries a watcher task
+        // -- so there is no longer a sweep to run before the numbers can be trusted.
+        let cameras = config
+            .instances
             .iter()
-            .filter(|(id, _)| {
+            .filter(|camera| {
                 instance
                     .as_deref()
-                    .is_none_or(|target| target == id.as_str())
+                    .is_none_or(|target| target == camera.id.as_str())
             })
-            .map(|(id, dispatcher)| CameraQueueDepth {
-                instance: id.clone(),
-                queued: dispatcher.depth(),
-                capacity: dispatcher.capacity(),
+            .map(|camera| CameraQueueDepth {
+                instance: camera.id.clone(),
+                queued: self.scheduler.pending_for(&camera.id),
+                capacity: self.scheduler.capacity_per_camera(),
             })
             .collect::<Vec<_>>();
-        let dispatch_queued = dispatchers.iter().map(|camera| camera.queued).sum();
+        let dispatch_queued = self.scheduler.pending();
 
         let durable = self
             .catalog
@@ -2253,8 +2241,9 @@ impl CameraRuntime {
                 max_concurrent_captures: config.global.limits.max_concurrent_captures,
                 max_in_flight_bytes: config.global.limits.max_in_flight_bytes,
                 max_queued_captures_per_camera: config.global.limits.max_queued_captures_per_camera,
+                max_pending_captures: self.scheduler.capacity(),
             },
-            cameras: dispatchers,
+            cameras,
             dispatch_queued,
             durable,
             durable_backlog,
@@ -2299,7 +2288,6 @@ impl CameraRuntime {
                 .jobs_page(instance.clone(), states.clone(), None, 1_000)
                 .await?;
             if page.is_empty() {
-                self.sweep_cancelled_descriptors(instance.as_deref())?;
                 return Ok(outcome);
             }
             let drained = page.len();
@@ -2323,36 +2311,9 @@ impl CameraRuntime {
             // Every row in the page resisted the drain. Another pass would fetch the same rows and
             // fail on them again, forever, so stop and say so.
             if outcome.failed.len() >= drained && outcome.cancelled == 0 {
-                self.sweep_cancelled_descriptors(instance.as_deref())?;
                 return Ok(outcome);
             }
         }
-    }
-
-    /// Drops descriptors whose captures are already dead from the supervisor dispatchers.
-    ///
-    /// Cancelling a capture cancels its runtime token, but the descriptor keeps sitting in its
-    /// camera's dispatcher -- and keeps counting against that camera's queue ceiling -- until
-    /// something happens to call `reserve()` or `drain_into()`, both of which sweep on the way in.
-    /// So a camera whose backlog was just drained would report itself full, to the very operator who
-    /// drained it, until the next capture arrived to clean up. Sweeping here is not a semantic
-    /// change: it does exactly what the next `reserve()` would have done, only now, so that what an
-    /// operator is told is true when they are told it.
-    fn sweep_cancelled_descriptors(&self, instance: Option<&str>) -> Result<()> {
-        let dispatchers = self
-            .dispatchers
-            .read()
-            .map_err(|_| {
-                crate::CameraError::Catalog("camera dispatcher map is unavailable".into())
-            })?
-            .iter()
-            .filter(|(id, _)| instance.is_none_or(|target| target == id.as_str()))
-            .map(|(_, dispatcher)| Arc::clone(dispatcher))
-            .collect::<Vec<_>>();
-        for dispatcher in dispatchers {
-            dispatcher.discard_cancelled()?;
-        }
-        Ok(())
     }
 
     /// Answers `sb/queue-status` for the command layer.
@@ -3317,10 +3278,6 @@ impl CameraRuntime {
                     camera.id
                 )));
             }
-            let _ = SupervisorDispatcher::new(
-                camera.id.clone(),
-                replacement.global.limits.max_queued_captures_per_camera,
-            )?;
         }
         Ok(())
     }
@@ -3343,18 +3300,10 @@ impl CameraRuntime {
                 crate::CameraError::Catalog("camera events map is unavailable".to_string())
             })?
             .clone();
-        let dispatchers = self
-            .dispatchers
-            .read()
-            .map_err(|_| {
-                crate::CameraError::Catalog("camera dispatcher map is unavailable".to_string())
-            })?
-            .clone();
         Ok(RuntimeReloadCheckpoint {
             config,
             engines,
             events,
-            dispatchers,
         })
     }
 
@@ -3410,11 +3359,6 @@ impl CameraRuntime {
                 "camera events map is unavailable during rollback".to_string(),
             )
         })? = checkpoint.events;
-        *self.dispatchers.write().map_err(|_| {
-            crate::CameraError::Catalog(
-                "camera dispatcher map is unavailable during rollback".to_string(),
-            )
-        })? = checkpoint.dispatchers;
         *self.config.write().map_err(|_| {
             crate::CameraError::Catalog(
                 "runtime configuration lock is unavailable during rollback".to_string(),
@@ -3506,7 +3450,6 @@ impl CameraRuntime {
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
         let mut added_engines = Vec::new();
-        let mut added_dispatchers = Vec::new();
         let mut added_events = Vec::new();
         for camera in &replacement.instances {
             if existing_engine_ids.contains(&camera.id) {
@@ -3526,13 +3469,6 @@ impl CameraRuntime {
             })?;
             added_engines.push((camera.id.clone(), self.new_engine(app)));
             added_events.push((camera.id.clone(), event));
-            added_dispatchers.push((
-                camera.id.clone(),
-                Arc::new(SupervisorDispatcher::new(
-                    camera.id.clone(),
-                    replacement.global.limits.max_queued_captures_per_camera,
-                )?),
-            ));
         }
         // Core calls this method from its pre-commit application gate. Retire every old
         // supervisor before touching any published runtime generation: a timeout must veto the
@@ -3559,20 +3495,6 @@ impl CameraRuntime {
                 }
                 Err(_) => {
                     tracing::error!("camera engine map became unavailable while committing reload");
-                }
-            }
-        }
-        {
-            match self.dispatchers.write() {
-                Ok(mut dispatchers) => {
-                    for (instance, dispatcher) in added_dispatchers {
-                        dispatchers.insert(instance, dispatcher);
-                    }
-                }
-                Err(_) => {
-                    tracing::error!(
-                        "camera dispatcher map became unavailable while committing reload"
-                    );
                 }
             }
         }
@@ -3668,8 +3590,11 @@ impl CameraRuntime {
             if let Ok(mut engines) = self.engines.write() {
                 engines.retain(|instance, _| !diff.removed.contains(instance));
             }
-            if let Ok(mut dispatchers) = self.dispatchers.write() {
-                dispatchers.retain(|instance, _| !diff.removed.contains(instance));
+            // A removed camera needs nothing torn down in the queue: it is deregistered, its work
+            // is never admissible again, and each entry expires on its own wait deadline. The queue
+            // outliving one camera is the same property that lets it outlive a reconnect.
+            for instance in &diff.removed {
+                self.scheduler.camera_offline(instance);
             }
             if let Ok(mut events) = self.events.write() {
                 events.retain(|instance, _| !diff.removed.contains(instance));
@@ -3875,6 +3800,103 @@ impl CameraRuntime {
                 runtime.metrics.sample_queue(values).await;
             }
         })
+    }
+
+    /// Runs the fleet capture queue: pull the best admissible capture, and give it to its camera.
+    ///
+    /// This is the component's only capture consumer, and it is the whole of Q1. It replaces N
+    /// per-camera drain loops that each polled at 100 Hz and could see only their own camera's work.
+    /// The ordering it applies is fleet-wide -- a `Direct` capture on a connected camera can no
+    /// longer wait behind a `Scheduled` one that a busy camera happens to hold.
+    ///
+    /// It is also, without any further code, the fix for an oversized group. A wave is simply "as
+    /// many as capacity allows"; the members beyond that wait here, and each one's clocks start when
+    /// a camera actually takes it. "More work than I can do at once" became "this takes longer"
+    /// instead of "most of your members failed".
+    fn start_capture_scheduler(self: &Arc<Self>) -> Result<()> {
+        let runtime = Arc::clone(self);
+        let cancellation = self.cancellation.clone();
+        self.spawn_task(async move {
+            loop {
+                let Some((queued, slot)) = runtime.scheduler.next_admissible(&cancellation).await
+                else {
+                    return;
+                };
+                let instance = queued.camera_id.clone();
+                let descriptor = queued.payload.into_descriptor();
+                let capture_id = descriptor.capture_id().to_owned();
+
+                // The capture's clocks start NOW, not when it was accepted. Without this the whole
+                // queue is a way of making captures die tidily: a member that waited its turn would
+                // arrive at a free camera with its entire budget already spent.
+                let timeouts = match runtime.config_snapshot() {
+                    Ok(config) => config.global.timeouts.clone(),
+                    Err(error) => {
+                        tracing::error!(error = %error, "capture scheduler cannot read its configuration");
+                        continue;
+                    }
+                };
+                match runtime.engine(&instance) {
+                    Ok(engine) => {
+                        if let Err(error) = engine
+                            .rebase_onto_admission(&descriptor, &timeouts)
+                            .await
+                        {
+                            // The capture is already terminal or gone. Its own machinery has retired
+                            // it; dropping it here is correct and quiet.
+                            tracing::debug!(
+                                instance = %instance,
+                                capture = %descriptor.capture_id(),
+                                error = %error,
+                                "capture could not be rebased onto its admission and was not dispatched"
+                            );
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            instance = %instance,
+                            error = %error,
+                            "capture scheduler has no engine for this camera"
+                        );
+                        continue;
+                    }
+                }
+
+                // Held from here until the capture is terminal. The slot was taken BEFORE the pop,
+                // so the queue never hands a camera work the component has no capacity to run: a
+                // capture that would have waited a second time -- inside `execute`, invisibly, on a
+                // clock already started for it -- waits in the queue instead, where waiting is free.
+                runtime.scheduler.hold_execution_slot(&capture_id, slot);
+
+                if let Err(descriptor) = runtime.scheduler.dispatch(&instance, descriptor) {
+                    runtime.scheduler.capture_finished(&capture_id);
+                    // The camera went offline between the pop and the hand-off. The capture has been
+                    // durably promised, so it goes back in the queue rather than being dropped on the
+                    // floor -- it will be admitted when the camera returns, or expire waiting.
+                    tracing::debug!(
+                        instance = %instance,
+                        capture = %descriptor.capture_id(),
+                        "camera went offline during dispatch; the capture stays queued"
+                    );
+                    if let Err(error) = runtime.requeue(descriptor) {
+                        tracing::warn!(
+                            instance = %instance,
+                            error = %error,
+                            "a promised capture could not be returned to the queue"
+                        );
+                    }
+                }
+            }
+        })
+    }
+
+    /// Puts a descriptor back on the fleet queue after a failed hand-off.
+    fn requeue(&self, descriptor: crate::jobs::CaptureDescriptor) -> Result<()> {
+        let instance = descriptor.instance().to_owned();
+        let reservation = crate::jobs::CaptureDispatcher::reserve(&self.scheduler, &instance)?;
+        reservation.commit(descriptor)?;
+        Ok(())
     }
 
     fn start_storage_pressure_monitor(self: &Arc<Self>) -> Result<()> {
@@ -4685,7 +4707,7 @@ impl CameraRuntime {
         if matches!(outcome, crate::catalog::AcceptJobOutcome::Inserted(_)) {
             let dispatcher = self.dispatcher(&occurrence.instance)?;
             self.engine(&occurrence.instance)?
-                .queue_preaccepted(dispatcher.as_ref(), submission)
+                .queue_preaccepted(&dispatcher, submission)
                 .await?;
         }
         Ok(())
@@ -4845,6 +4867,7 @@ impl CameraRuntime {
                         engine.clone(),
                         global_config.limits.max_queued_captures_per_camera,
                         global_config.limits.max_queued_controls_per_camera,
+                        self.scheduler.capacity_signal(),
                     ) {
                         Ok(pair) => pair,
                         Err(error) => {
@@ -4883,79 +4906,41 @@ impl CameraRuntime {
                         chrono::Utc::now(),
                     );
                     let mut actor_task = tokio::spawn(actor.run(actor_cancellation));
-                    let dispatcher = match self.dispatcher(&camera.id) {
-                        Ok(dispatcher) => dispatcher,
-                        Err(error) => {
-                            actor_task.abort();
-                            let _ = actor_task.await;
-                            self.publish_camera_state(
-                                &camera.id,
-                                generation,
-                                CameraConnectionState::Backoff,
-                                None,
-                                Some(status_error(&error)),
-                                chrono::Utc::now(),
+                    // The camera is online: tell the fleet queue it can take work. There is no
+                    // per-camera cache to drain any more, and therefore no loop here that drains one
+                    // -- the scheduler pulls, it is not pushed to. This supervisor's only remaining
+                    // job while connected is to wait for its actor to finish or be cancelled.
+                    self.scheduler.camera_online(&camera.id, handle.clone());
+                    let result = tokio::select! {
+                        joined = &mut actor_task => joined.map_err(|error| crate::CameraError::Backend {
+                            backend: "actor",
+                            message: format!("actor task failed: {error}"),
+                        }).and_then(|result| result),
+                        _ = cancellation.cancelled() => {
+                            // The actor holds a child of this token and is already winding down, so
+                            // it must be awaited, not dropped: its teardown is what delivers the
+                            // shutdown safety stop and closes the session. The budget is the smaller
+                            // of the two deadlines that already bound this path — the shutdown grace
+                            // and the reload drain timeout — so a hung backend can defeat neither.
+                            let grace = Duration::from_millis(
+                                global_config
+                                    .timeouts
+                                    .shutdown_grace_ms
+                                    .min(global_config.timeouts.reload_drain_timeout_ms),
                             );
-                            continue;
-                        }
-                    };
-                    let result = loop {
-                        // D1: this loop used to run `drain_into` and then sleep 10 ms, forever, for
-                        // every camera -- 25,600 timer wakeups and as many mutex acquisitions per
-                        // second across a 256-camera fleet, on hardware that was otherwise idle,
-                        // because committing a descriptor never told anyone about it.
-                        //
-                        // A commit now raises `arrived`, so an idle camera waits on a notification
-                        // and burns nothing at all -- and a newly queued capture is dispatched at
-                        // once instead of waiting out a tick. The timer survives for exactly one
-                        // case: descriptors still held because the ACTOR's queue is full. That is
-                        // real backpressure, the actor gives no signal when it frees a slot, and it
-                        // only happens under load -- so the retry keeps its original 10 ms cadence
-                        // and pays for itself.
-                        let pending = match dispatcher.drain_into(&handle) {
-                            Ok(summary) => summary.pending,
-                            Err(error) => {
+                            if !join_actor_within_grace(&mut actor_task, grace).await {
                                 tracing::warn!(
                                     instance = %camera.id,
-                                    error = %error,
-                                    "supervisor could not hand queued captures to the camera actor"
+                                    grace_ms = grace.as_millis(),
+                                    "camera actor did not complete its shutdown teardown within the grace budget; aborting"
                                 );
-                                0
                             }
-                        };
-                        tokio::select! {
-                            joined = &mut actor_task => break joined.map_err(|error| crate::CameraError::Backend { backend: "actor", message: format!("actor task failed: {error}") }).and_then(|result| result),
-                            _ = cancellation.cancelled() => {
-                                // The actor holds a child of this token and is already winding
-                                // down, so it must be awaited, not dropped: its teardown is what
-                                // delivers the shutdown safety stop and closes the session. The
-                                // budget is the smaller of the two deadlines that already bound
-                                // this path — the shutdown grace and the reload drain timeout —
-                                // so a hung backend can defeat neither.
-                                let grace = Duration::from_millis(
-                                    global_config
-                                        .timeouts
-                                        .shutdown_grace_ms
-                                        .min(global_config.timeouts.reload_drain_timeout_ms),
-                                );
-                                if !join_actor_within_grace(&mut actor_task, grace).await {
-                                    tracing::warn!(
-                                        instance = %camera.id,
-                                        grace_ms = grace.as_millis(),
-                                        "camera actor did not complete its shutdown teardown within the grace budget; aborting"
-                                    );
-                                }
-                                break Ok(());
-                            }
-                            () = async {
-                                if pending > 0 {
-                                    tokio::time::sleep(Duration::from_millis(10)).await;
-                                } else {
-                                    dispatcher.arrival().await;
-                                }
-                            } => {}
+                            Ok(())
                         }
                     };
+                    // Its queued work stays queued. That is the entire point of a queue that outlives
+                    // the session: a camera that drops does not lose the captures promised to it.
+                    self.scheduler.camera_offline(&camera.id);
                     if let Ok(mut actors) = self.actors.write() {
                         actors.remove(&camera.id);
                     }
@@ -5431,220 +5416,6 @@ impl CameraCommandService for CameraRuntime {
     }
 }
 
-/// Persistent bounded descriptor queue owned by a camera supervisor rather than a connection.
-///
-/// This closes the reconnect race in which a `waitUntilDeadline` or `queue` capture is accepted
-/// while its camera has no session.  A fresh actor drains descriptors only after it is online;
-/// terminal-deadline cancellation is observed and discarded before it can consume future queue
-/// capacity.
-pub struct SupervisorDispatcher {
-    inner: Arc<SupervisorDispatcherInner>,
-}
-
-struct SupervisorDispatcherInner {
-    instance: String,
-    maximum: usize,
-    used: AtomicUsize,
-    queue: Mutex<VecDeque<CaptureDescriptor>>,
-    /// Raised whenever a descriptor is committed, so the supervisor can dispatch it immediately
-    /// instead of discovering it on the next tick of a timer.
-    arrived: Notify,
-}
-
-/// What one [`SupervisorDispatcher::drain_into`] pass did.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct DrainSummary {
-    /// Descriptors handed to the actor.
-    forwarded: usize,
-    /// Descriptors the actor refused because they were already dead (expired or cancelled). They
-    /// are retired durably by their own terminal-deadline task; the supervisor's job is only to
-    /// stop holding them -- and to release the queue slot they occupied.
-    retired: usize,
-    /// Descriptors still held because the actor's own queue is full.
-    ///
-    /// This is the only reason the supervisor ever needs a timer: it must retry when the actor
-    /// frees a slot, and the actor does not signal that. With nothing pending there is nothing to
-    /// retry, so the loop can simply wait to be told that work arrived.
-    pending: usize,
-}
-
-impl SupervisorDispatcher {
-    fn new(instance: String, maximum: usize) -> Result<Self> {
-        if instance.is_empty() || maximum == 0 {
-            return Err(crate::CameraError::rejected(
-                crate::ErrorCode::InvalidRequest,
-                "supervisor dispatcher requires a camera instance and positive queue capacity",
-            ));
-        }
-        Ok(Self {
-            inner: Arc::new(SupervisorDispatcherInner {
-                instance,
-                maximum,
-                used: AtomicUsize::new(0),
-                queue: Mutex::new(VecDeque::new()),
-                arrived: Notify::new(),
-            }),
-        })
-    }
-
-    /// Waits until a descriptor is committed to this dispatcher.
-    ///
-    /// `Notify` holds a permit when nobody is waiting, so a descriptor committed between a drain and
-    /// this call wakes it immediately rather than being missed.
-    async fn arrival(&self) {
-        self.inner.arrived.notified().await;
-    }
-
-    /// Captures this camera is holding: queued descriptors plus reservations not yet committed.
-    ///
-    /// This is the count that bounds new work, so it is the count an operator needs to see when a
-    /// camera starts refusing captures with QUEUE_FULL.
-    fn depth(&self) -> usize {
-        self.inner.used.load(Ordering::Acquire)
-    }
-
-    /// The per-camera ceiling this dispatcher enforces.
-    fn capacity(&self) -> usize {
-        self.inner.maximum
-    }
-
-    /// Forwards as many durable descriptors as the connected actor can reserve right now.
-    /// A full actor is normal; the descriptor remains owned by the supervisor and is retried
-    /// without ever re-running catalog acceptance.
-    fn drain_into(&self, actor: &CameraActorHandle) -> Result<DrainSummary> {
-        let mut queue = self.inner.queue.lock().map_err(|_| {
-            crate::CameraError::Catalog("supervisor capture queue is unavailable".to_string())
-        })?;
-        queue.retain(|descriptor| {
-            let keep = !descriptor.cancellation().is_cancelled();
-            if !keep {
-                self.inner.used.fetch_sub(1, Ordering::AcqRel);
-            }
-            keep
-        });
-        let mut summary = DrainSummary::default();
-        loop {
-            let Some(descriptor) = queue.pop_front() else {
-                return Ok(summary);
-            };
-            let reservation = match actor.reserve() {
-                Ok(reservation) => reservation,
-                Err(error) if error.code() == crate::ErrorCode::QueueFull => {
-                    queue.push_front(descriptor);
-                    summary.pending = queue.len();
-                    return Ok(summary);
-                }
-                Err(error) => {
-                    queue.push_front(descriptor);
-                    return Err(error);
-                }
-            };
-            // The descriptor is leaving this queue for good now, whichever way the commit goes:
-            // the actor either takes it, or refuses it as already dead. So release the slot HERE,
-            // before a fallible call, not after one.
-            //
-            // This is B5. The old code moved the descriptor into `commit(descriptor)?` and
-            // decremented `used` on the line AFTER it -- a line the `?` skips. `try_enqueue` returns
-            // Err the moment the capture's deadline has passed, which is precisely what happens to
-            // work that was queued while its camera was offline and is drained after a reconnect
-            // that outlasted the deadline. The descriptor was destroyed and its slot was never
-            // given back. After `maxQueuedCapturesPerCamera` such losses -- four, by default -- that
-            // camera answered QUEUE_FULL to every capture for the rest of the process's life. A
-            // flaky camera bricked its own queue, silently, because the caller wrote
-            // `let _ = dispatcher.drain_into(&handle)`.
-            //
-            // The tell that it was an oversight rather than a decision: both `reserve()` failure
-            // paths above carefully push the descriptor back. Only the commit path forgot.
-            let capture_id = descriptor.capture_id().to_string();
-            let committed = reservation.commit(descriptor);
-            self.inner.used.fetch_sub(1, Ordering::AcqRel);
-            match committed {
-                Ok(_) => summary.forwarded += 1,
-                Err(error) => {
-                    // Dead on arrival: expired or cancelled. Its durable row is retired by its own
-                    // terminal-deadline task, so there is nothing to do here but let it go -- and
-                    // keep draining. One dead capture must not hold up the live ones behind it.
-                    tracing::debug!(
-                        instance = %self.inner.instance,
-                        capture = %capture_id,
-                        error = %error,
-                        "supervisor discarded a capture the camera actor would not accept"
-                    );
-                    summary.retired += 1;
-                }
-            }
-        }
-    }
-
-    fn discard_cancelled(&self) -> Result<()> {
-        let mut queue = self.inner.queue.lock().map_err(|_| {
-            crate::CameraError::Catalog("supervisor capture queue is unavailable".to_string())
-        })?;
-        queue.retain(|descriptor| {
-            let keep = !descriptor.cancellation().is_cancelled();
-            if !keep {
-                self.inner.used.fetch_sub(1, Ordering::AcqRel);
-            }
-            keep
-        });
-        Ok(())
-    }
-}
-
-impl CaptureDispatcher for SupervisorDispatcher {
-    fn reserve(&self) -> Result<Box<dyn DispatchReservation>> {
-        self.discard_cancelled()?;
-        self.inner
-            .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                (used < self.inner.maximum).then_some(used + 1)
-            })
-            .map_err(|_| {
-                crate::CameraError::rejected(
-                    crate::ErrorCode::QueueFull,
-                    "camera capture queue is full",
-                )
-            })?;
-        Ok(Box::new(SupervisorReservation {
-            dispatcher: Arc::clone(&self.inner),
-            committed: false,
-        }))
-    }
-}
-
-struct SupervisorReservation {
-    dispatcher: Arc<SupervisorDispatcherInner>,
-    committed: bool,
-}
-
-impl DispatchReservation for SupervisorReservation {
-    fn commit(mut self: Box<Self>, descriptor: CaptureDescriptor) -> Result<usize> {
-        if descriptor.instance() != self.dispatcher.instance {
-            return Err(crate::CameraError::rejected(
-                crate::ErrorCode::UnknownInstance,
-                "capture descriptor was dispatched to the wrong camera supervisor",
-            ));
-        }
-        let mut queue = self.dispatcher.queue.lock().map_err(|_| {
-            crate::CameraError::Catalog("supervisor capture queue is unavailable".to_string())
-        })?;
-        queue.push_back(descriptor);
-        let queue_position = queue.len();
-        self.committed = true;
-        drop(queue);
-        self.dispatcher.arrived.notify_one();
-        Ok(queue_position)
-    }
-}
-
-impl Drop for SupervisorReservation {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.dispatcher.used.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-}
-
 fn status_error(error: &crate::CameraError) -> CameraStatusError {
     CameraStatusError {
         code: error.code().as_str().to_string(),
@@ -5781,6 +5552,8 @@ pub struct QueueLimits {
     pub max_in_flight_bytes: u64,
     /// Per-camera dispatcher ceiling.
     pub max_queued_captures_per_camera: usize,
+    /// The component's fleet-wide pending ceiling.
+    pub max_pending_captures: usize,
 }
 
 /// What a break-glass drain actually did.
@@ -6363,6 +6136,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::jobs::CaptureDispatcher;
 
     struct CountingService(AtomicUsize);
 
@@ -7172,7 +6946,6 @@ mod tests {
             let registry = Arc::new(CameraRegistry::new(&config).unwrap());
             let waiters = Arc::new(RuntimeJobHooks::new(catalog.clone()));
             let mut engines = BTreeMap::new();
-            let mut dispatchers = BTreeMap::new();
             for camera in &config.instances {
                 engines.insert(
                     camera.id.clone(),
@@ -7185,17 +6958,8 @@ mod tests {
                     )
                     .with_acceptance_hook(Arc::clone(&waiters) as Arc<dyn AcceptanceHook>),
                 );
-                dispatchers.insert(
-                    camera.id.clone(),
-                    Arc::new(
-                        SupervisorDispatcher::new(
-                            camera.id.clone(),
-                            config.global.limits.max_queued_captures_per_camera,
-                        )
-                        .unwrap(),
-                    ),
-                );
             }
+            let scheduler = crate::dispatch::CaptureScheduler::new(&config.global.limits).unwrap();
             let runtime = Arc::new(CameraRuntime {
                 config: RwLock::new(config),
                 backend_context: BackendRuntimeContext::new(
@@ -7220,7 +6984,7 @@ mod tests {
                 scheduler_cancellations: RwLock::new(HashMap::new()),
                 discovery_cancellation: RwLock::new(None),
                 discovery_cache: Mutex::new(DiscoveryCache::default()),
-                dispatchers: RwLock::new(dispatchers),
+                scheduler,
                 cancellation: CancellationToken::new(),
                 tasks: Mutex::new(Vec::new()),
                 connect_gate: Arc::new(Semaphore::new(1)),
@@ -7232,6 +6996,11 @@ mod tests {
             });
             let _ = runtime.self_reference.set(Arc::downgrade(&runtime));
             waiters.attach_runtime(Arc::downgrade(&runtime));
+            // The fleet queue needs its consumer. Without it a capture is durably accepted, queued,
+            // and then waits forever -- which is exactly what these tests would have shown.
+            runtime
+                .start_capture_scheduler()
+                .expect("the capture scheduler must start");
             runtime
         }
 
@@ -7901,8 +7670,25 @@ mod tests {
             runtime.shutdown().await;
         }
 
+        /// A capture whose durable state has moved on is refused BEFORE it can reach a camera.
+        ///
+        /// This test used to prove the opposite half of the contract: it corrupted a queued capture's
+        /// row (QUEUED -> ACQUIRING, simulating a crash/race) and asserted that the engine's fatal
+        /// error propagated all the way out through the actor, retiring it and forcing a reconnect.
+        /// That was the best the component could do when a per-camera cache pushed descriptors at an
+        /// actor with nothing in between.
+        ///
+        /// The fleet scheduler rebases a capture onto its admission before handing it over, and only
+        /// a QUEUED row may be rebased -- so a capture whose durable state has moved on never reaches
+        /// the camera at all. The camera keeps serving. Tearing down a healthy session because a
+        /// DURABLE row was inconsistent was never a good trade, and now it is not made.
+        ///
+        /// The supervisor-recovery path it used to cover is not lost: an actor that dies still retires
+        /// and advances its generation, which
+        /// `cancelled_actor_runs_its_safety_stop_and_session_close_within_the_grace` and the panic
+        /// isolation path both exercise.
         #[tokio::test]
-        async fn supervisor_recovers_from_a_fatal_actor_error_and_advances_generation() {
+        async fn a_capture_whose_durable_state_moved_on_never_reaches_the_camera() {
             let directory = TempDir::new().unwrap();
             let mut configuration = config(directory.path(), &["camera-a"], false);
             // Keep BACKOFF observable rather than relying on a scheduling race, while preserving
@@ -7950,46 +7736,51 @@ mod tests {
             runtime
                 .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
                 .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
 
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-            let backoff_generation = loop {
+            // The camera comes up and STAYS up. The scheduler refuses to rebase a row that is no
+            // longer QUEUED, so the inconsistent capture is never handed to it.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
                 let snapshot = runtime.registry.snapshot("camera-a").unwrap();
-                if snapshot.state == CameraConnectionState::Backoff {
-                    assert_eq!(
-                        snapshot
-                            .last_error
-                            .as_ref()
-                            .map(|error| error.code.as_str()),
-                        Some(crate::ErrorCode::BackendError.as_str())
-                    );
-                    assert!(
-                        !runtime.actors.read().unwrap().contains_key("camera-a"),
-                        "the failed actor must be retired before reconnecting"
-                    );
-                    break snapshot.generation;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "fatal actor error did not publish BACKOFF"
+                assert_ne!(
+                    snapshot.state,
+                    CameraConnectionState::Backoff,
+                    "a camera must not be torn down because a DURABLE row was inconsistent -- the                      session was healthy and the capture was the thing that was wrong"
                 );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            };
-
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-            loop {
-                let snapshot = runtime.registry.snapshot("camera-a").unwrap();
-                if snapshot.state == CameraConnectionState::Online
-                    && snapshot.generation > backoff_generation
-                {
-                    assert!(runtime.actors.read().unwrap().contains_key("camera-a"));
-                    break;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "supervisor did not establish a fresh session after fatal actor error"
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
+            assert_eq!(
+                runtime.registry.snapshot("camera-a").unwrap().state,
+                CameraConnectionState::Online,
+                "the camera keeps serving"
+            );
+
+            // And the camera still works: a well-formed capture succeeds on the same session.
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "healthy-after-the-bad-row".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "healthy-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let healthy_id = match accepted {
+                crate::catalog::AcceptJobOutcome::Inserted(record) => record.capture_id,
+                other => panic!("expected a newly accepted capture, got {other:?}"),
+            };
+            let terminal = wait_for_terminal(&runtime, &healthy_id).await;
+            assert_eq!(
+                terminal.state,
+                crate::model::JobState::Succeeded,
+                "the session was never broken, so it must still be capturing"
+            );
+
             runtime.shutdown().await;
         }
 
@@ -10357,38 +10148,53 @@ mod tests {
             );
         }
 
-        #[test]
-        fn supervisor_dispatcher_enforces_capacity_and_releases_uncommitted_reservations() {
-            assert_eq!(
-                match SupervisorDispatcher::new(String::new(), 1) {
-                    Err(error) => error.code(),
-                    Ok(_) => panic!("an empty dispatcher instance must be rejected"),
-                },
-                crate::ErrorCode::InvalidRequest
-            );
-            assert_eq!(
-                match SupervisorDispatcher::new("camera-a".to_string(), 0) {
-                    Err(error) => error.code(),
-                    Ok(_) => panic!("a zero-capacity dispatcher must be rejected"),
-                },
-                crate::ErrorCode::InvalidRequest
-            );
+        /// The fleet queue bounds the COMPONENT, not just each camera -- a bound that never existed.
+        ///
+        /// Queueing used to be per-camera only, so the real worst case was
+        /// `cameras x 2 x maxQueuedCapturesPerCamera` -- 2,048 descriptors at the design target --
+        /// with no single number capping it and nothing able to see the fleet's backlog at all.
+        #[tokio::test]
+        async fn the_fleet_queue_bounds_the_component_and_each_camera() {
+            let directory = TempDir::new().unwrap();
+            let base = config(directory.path(), &["camera-a"], false);
+            let limits = crate::config::LimitsConfig {
+                max_pending_captures: 3,
+                max_queued_captures_per_camera: 2,
+                ..base.global.limits.clone()
+            };
+            let scheduler = crate::dispatch::CaptureScheduler::new(&limits).unwrap();
 
-            let dispatcher = SupervisorDispatcher::new("camera-a".to_string(), 1).unwrap();
-            let reservation = CaptureDispatcher::reserve(&dispatcher).unwrap();
+            // The per-camera bound still holds.
+            let first = CaptureDispatcher::reserve(&scheduler, "camera-a").unwrap();
+            let second = CaptureDispatcher::reserve(&scheduler, "camera-a").unwrap();
             assert_eq!(
-                match CaptureDispatcher::reserve(&dispatcher) {
+                match CaptureDispatcher::reserve(&scheduler, "camera-a") {
                     Err(error) => error.code(),
-                    Ok(_) => panic!("the second reservation must observe queue capacity"),
+                    Ok(_) => panic!("a third capture must not exceed the per-camera bound"),
                 },
                 crate::ErrorCode::QueueFull,
-                "the bounded supervisor queue must not over-admit work"
             );
-            drop(reservation);
-            assert!(
-                CaptureDispatcher::reserve(&dispatcher).is_ok(),
-                "dropping an uncommitted reservation returns the queue slot"
+
+            // And now the fleet bound holds too: camera-b may queue one, then the COMPONENT is full,
+            // even though camera-c has queued nothing at all.
+            let third = CaptureDispatcher::reserve(&scheduler, "camera-b").unwrap();
+            assert_eq!(
+                match CaptureDispatcher::reserve(&scheduler, "camera-c") {
+                    Err(error) => error.code(),
+                    Ok(_) => panic!("the component's own backlog bound must hold"),
+                },
+                crate::ErrorCode::QueueFull,
+                "a camera that has queued nothing must still be refused once the FLEET is full --                  that is the bound the component never had"
             );
+            assert_eq!(scheduler.pending(), 3);
+            assert_eq!(scheduler.pending_for("camera-a"), 2);
+
+            // Dropping an uncommitted reservation returns its slot, to both bounds.
+            drop(second);
+            assert_eq!(scheduler.pending(), 2);
+            assert_eq!(scheduler.pending_for("camera-a"), 1);
+            assert!(CaptureDispatcher::reserve(&scheduler, "camera-c").is_ok());
+            drop((first, third));
         }
 
         #[tokio::test]
@@ -12652,6 +12458,7 @@ mod tests {
                 runtime.engine("camera-a").unwrap(),
                 2,
                 2,
+                runtime.scheduler.capacity_signal(),
             )
             .unwrap();
             handle
@@ -13145,103 +12952,177 @@ mod tests {
             );
         }
 
-        /// B5: any failed commit used to destroy the descriptor AND keep its queue slot, forever.
+        /// G1: an oversized group takes LONGER. It does not partially fail.
         ///
-        /// `drain_into` moved the descriptor into `commit(descriptor)?` and decremented the slot
-        /// counter on the line AFTER it -- a line the `?` skips. So a commit that failed lost the
-        /// descriptor and never gave the slot back. After `maxQueuedCapturesPerCamera` such losses
-        /// (four, by default) the camera answered QUEUE_FULL to every capture for the rest of the
-        /// process's life, and nobody saw it, because the caller wrote
-        /// `let _ = dispatcher.drain_into(&handle)`. The tell that it was an oversight: both
-        /// `reserve()` failure paths carefully push the descriptor back. Only the commit path forgot.
+        /// `submit_group` used to build every member and hand them all to their cameras at once. A
+        /// group larger than the component could serve did not degrade -- it broke: the members that
+        /// could not be dispatched immediately sat with their 30-second capture clock already
+        /// running, and died of CAPTURE_TIMEOUT the moment a camera was free to take them. An
+        /// oversized concurrent request silently became "most of your members failed", which the
+        /// group contract -- all-or-nothing acceptance, one collated result -- does not permit.
         ///
-        /// IN PRODUCTION the commit fails because the capture EXPIRED: work queued while a camera is
-        /// offline waits in the supervisor's dispatcher, and `try_enqueue` refuses anything already
-        /// past its deadline. That path is not what this test drives, because it is a race, and it is
-        /// worth being precise about why. When the terminal-deadline task fires it writes the
-        /// terminal row and only then cancels the runtime -- and a cancelled descriptor is reaped by
-        /// the `retain` above, which returns the slot correctly. The leak lives in the window between
-        /// the deadline passing and that write completing, and in the case where the write FAILS
-        /// outright and the cancellation therefore never happens. Both widen exactly when the catalog
-        /// is contended -- which is B6. The two defects compound.
+        /// Nothing in this fix is a wave scheduler. A wave is "as many as capacity allows", and that
+        /// is what a central queue does by construction: the members beyond capacity simply wait, and
+        /// each one's clocks start when a camera actually takes it. The whole of G1 is Q1 plus
+        /// rebasing.
         ///
-        /// So the invariant is pinned where it can be pinned deterministically, with no fault
-        /// injection in production code: a descriptor that leaves this queue returns its slot, no
-        /// matter why the actor refused it. Dispatching camera-a's work at camera-b's actor is
-        /// refused for a different reason and travels the identical line.
+        /// This group is deliberately wider than the component's execution capacity: four cameras
+        /// against a single concurrent-capture permit. Every member must still succeed.
         #[tokio::test]
-        async fn a_refused_capture_gives_its_queue_slot_back_instead_of_bricking_the_camera() {
+        async fn an_oversized_group_is_sequenced_rather_than_partially_failed() {
             let directory = TempDir::new().unwrap();
-            let mut configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+            let mut configuration = config(
+                directory.path(),
+                &["camera-a", "camera-b", "camera-c", "camera-d"],
+                false,
+            );
+            // One capture at a time, fleet-wide. Four members. Before Q1 this was three dead members.
+            configuration.global.limits.max_concurrent_captures = 1;
+            configuration.global.limits.max_in_flight_bytes =
+                configuration.global.limits.max_frame_bytes_per_camera;
+            // Each capture takes 250 ms and only one may run at a time, so the last member does not
+            // even START until ~750 ms in. Its acceptance-time capture clock is 400 ms. If the clock
+            // still began at acceptance -- as it did before Q1 -- the third and fourth members would
+            // arrive at a free camera already dead. That is the defect, and these two numbers are
+            // what make this test able to catch it.
+            configuration.global.timeouts.capture_ms = 400;
+            for camera in &mut configuration.instances {
+                if let crate::config::BackendConfig::Sim(sim) = &mut camera.backend {
+                    sim.capture_delay_ms = 250;
+                }
+            }
+            let runtime = runtime(configuration, &directory).await;
+            for camera in ["camera-a", "camera-b", "camera-c", "camera-d"] {
+                runtime
+                    .start_supervisor(camera.to_string(), runtime.engine(camera).unwrap())
+                    .unwrap();
+                wait_for_online(&runtime, camera).await;
+            }
+
+            let group = runtime
+                .submit_group(
+                    GroupCaptureRequest {
+                        request_id: "oversized-group".to_string(),
+                        instances: vec![
+                            "camera-a".to_string(),
+                            "camera-b".to_string(),
+                            "camera-c".to_string(),
+                            "camera-d".to_string(),
+                        ],
+                        capture_profile: None,
+                        profile_overrides: BTreeMap::new(),
+                        timeout_ms: None,
+                        metadata: serde_json::Map::new(),
+                    },
+                    "oversized-correlation".to_string(),
+                    crate::admission::CapturePriority::Submitted,
+                    None,
+                )
+                .await
+                .expect("acceptance is all-or-nothing and must succeed");
+            assert_eq!(group.members.len(), 4);
+
+            let terminal = wait_for_group_terminal(&runtime, &group.group_id).await;
+            let states: Vec<_> = terminal.members.iter().map(|member| member.state).collect();
+            assert!(
+                states
+                    .iter()
+                    .all(|state| *state == crate::model::JobState::Succeeded),
+                "every member of an oversized group must SUCCEED -- sequencing means it takes                  longer, not that most of it fails. Got: {states:?}"
+            );
+            assert_eq!(
+                terminal.state,
+                crate::model::JobState::Succeeded,
+                "and the collated group result must be a success, not a partial failure"
+            );
+
+            runtime.shutdown().await;
+        }
+
+        /// B5, carried forward: a slot must come back when its capture leaves the queue, however it
+        /// leaves.
+        ///
+        /// The original defect was a hand-decremented counter that the `?` operator skipped on the
+        /// failure path: a refused capture was destroyed AND kept its slot, and four of those made a
+        /// camera answer QUEUE_FULL for the rest of the process's life. The fleet queue cannot repeat
+        /// it by construction -- the slot is an RAII guard carried INSIDE the queued payload, so it is
+        /// released exactly when the descriptor leaves, whether a camera takes it, it is cancelled, or
+        /// it expires waiting. There is no longer a line for a `?` to skip.
+        ///
+        /// So this pins the PROPERTY rather than the old implementation, because the property is what
+        /// mattered: a component whose slots leak stops accepting work and never says why.
+        #[tokio::test]
+        async fn a_cancelled_capture_returns_its_slot_to_the_fleet_queue() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
             configuration.global.limits.max_queued_captures_per_camera = 1;
+            configuration.global.limits.max_pending_captures = 1;
             let runtime = runtime(configuration, &directory).await;
 
-            // No supervisor is running, so this descriptor simply waits in camera-a's dispatcher --
-            // exactly as it would for a camera that is offline.
-            runtime
+            // No supervisor: the capture waits in the fleet queue exactly as it would for an offline
+            // camera, and it is now the component's entire backlog budget.
+            let accepted = runtime
                 .submit_capture(
                     "camera-a".to_string(),
-                    "will-be-refused".to_string(),
+                    "will-be-cancelled".to_string(),
                     None,
                     None,
                     serde_json::Map::new(),
-                    "refusal-correlation".to_string(),
+                    "cancel-correlation".to_string(),
                     "sb/capture-submit",
                     crate::admission::CapturePriority::Submitted,
                 )
                 .await
                 .expect("the first capture must be accepted");
-
-            let session = TeardownSession {
-                capabilities: crate::model::CameraCapabilities {
-                    capture_modes: vec![crate::model::CaptureMode::Simulated],
-                    pixel_formats: vec![crate::model::PixelFormat::Rgb8],
-                    software_trigger: false,
-                    snapshot_uri: false,
-                    rtsp: false,
-                    ptz: false,
-                    ptz_status: false,
-                    presets: false,
-                    preset_mutation: false,
-                    vendor: None,
-                    model: None,
-                    firmware: None,
-                    serial: None,
-                    warnings: Vec::new(),
-                },
-                stops: Arc::new(Mutex::new(Vec::new())),
-                closes: Arc::new(AtomicUsize::new(0)),
+            let capture_id = match accepted {
+                crate::catalog::AcceptJobOutcome::Inserted(record) => record.capture_id,
+                other => panic!("expected a newly accepted capture, got {other:?}"),
             };
-            let (_actor, wrong_actor) = CameraActor::new(
-                "camera-b",
-                Box::new(session),
-                runtime.engine("camera-b").unwrap(),
-                2,
-                2,
-            )
-            .unwrap();
-
-            let summary = runtime
-                .dispatcher("camera-a")
-                .unwrap()
-                .drain_into(&wrong_actor)
-                .expect("a refused descriptor is not a dispatcher failure");
-
+            assert_eq!(runtime.scheduler.pending(), 1);
             assert_eq!(
-                summary,
-                DrainSummary {
-                    forwarded: 0,
-                    retired: 1,
-                    pending: 0,
-                },
-                "the actor must refuse the descriptor, and the supervisor must stop holding it"
+                runtime
+                    .submit_capture(
+                        "camera-a".to_string(),
+                        "refused-while-full".to_string(),
+                        None,
+                        None,
+                        serde_json::Map::new(),
+                        "refused-correlation".to_string(),
+                        "sb/capture-submit",
+                        crate::admission::CapturePriority::Submitted,
+                    )
+                    .await
+                    .expect_err("the queue is full, so this must be refused")
+                    .code(),
+                crate::ErrorCode::QueueFull,
+                "and refused BEFORE anything durable is written -- an operator must see QUEUE_FULL,                  not a capture that was accepted and then immediately died"
             );
 
-            // The bug, stated as a test: the camera must still accept work.
+            runtime
+                .engine("camera-a")
+                .unwrap()
+                .cancel_active(&capture_id, "operator cancellation")
+                .await
+                .expect("cancelling a queued capture must succeed");
+
+            // The queue evicts a cancelled entry through its own watcher task, so give it a moment to
+            // act on what the cancellation token already says.
+            for _ in 0..100 {
+                if runtime.scheduler.pending() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                runtime.scheduler.pending(),
+                0,
+                "a cancelled capture must give its slot back, or the component quietly stops                  accepting work and never says why"
+            );
+
             runtime
                 .submit_capture(
                     "camera-a".to_string(),
-                    "after-the-refusal".to_string(),
+                    "after-the-cancellation".to_string(),
                     None,
                     None,
                     serde_json::Map::new(),
@@ -13250,7 +13131,7 @@ mod tests {
                     crate::admission::CapturePriority::Submitted,
                 )
                 .await
-                .expect("a refused capture must not consume its camera's queue slot forever");
+                .expect("the returned slot must be usable");
         }
 
         // The grace is an upper bound, not a new way to hang: a backend that will not finish its

@@ -177,6 +177,18 @@ pub struct LimitsConfig {
     pub max_deferred_waiters_per_capture: usize,
     /// Maximum group fan-out.
     pub max_cameras_per_group: usize,
+    /// Captures the whole component may hold waiting for a camera.
+    ///
+    /// The fleet-wide backlog bound, and it did not exist before: queueing was bounded only per
+    /// camera, so the real worst case was `cameras x 2 x maxQueuedCapturesPerCamera` -- 2,048
+    /// descriptors at the design target -- with no single number capping it and nothing able to see
+    /// the fleet's backlog at all.
+    pub max_pending_captures: usize,
+    /// How long a capture may wait for a camera when its profile sets no `queueExpiryMs`.
+    ///
+    /// A capture that waits does not spend its execution budget -- its clocks start when a camera
+    /// takes it. Something must still bound the wait, or a starved capture would queue forever.
+    pub max_queue_wait_ms: u64,
     /// Named shared transport bounds.
     pub resource_groups: BTreeMap<String, ResourceGroupConfig>,
 }
@@ -210,6 +222,8 @@ impl Default for LimitsConfig {
             max_frame_bytes_per_camera: 64 * MIB,
             max_metadata_bytes: 8 * 1024,
             max_queued_captures_per_camera: 4,
+            max_pending_captures: 256,
+            max_queue_wait_ms: 300_000,
             max_queued_controls_per_camera: 32,
             max_deferred_waiters_per_capture: 8,
             max_cameras_per_group: 32,
@@ -1033,6 +1047,26 @@ fn validate_global(global: &GlobalConfig) -> Result<()> {
     )?;
     // The byte budget must cover the concurrency the component ADVERTISES, not one frame of it.
     //
+    // The fleet backlog must be able to hold at least one camera's worth of queued work, or the
+    // per-camera bound is a lie: a single camera could never fill the queue it is allowed to fill.
+    // This is B2's lesson in a different costume -- a bound that is smaller than the thing it is
+    // supposed to hold does not fail loudly, it silently caps the system somewhere else.
+    if limits.max_pending_captures < limits.max_queued_captures_per_camera {
+        return config_error(
+            "component.global.limits.maxPendingCaptures",
+            format!(
+                "must be at least maxQueuedCapturesPerCamera ({}); {} would cap the component's                  whole backlog below what a single camera is permitted to queue",
+                limits.max_queued_captures_per_camera, limits.max_pending_captures,
+            ),
+        );
+    }
+    if limits.max_pending_captures == 0 || limits.max_queue_wait_ms == 0 {
+        return config_error(
+            "component.global.limits.maxPendingCaptures",
+            "maxPendingCaptures and maxQueueWaitMs must be positive".to_owned(),
+        );
+    }
+
     // A capture reserves `maxFrameBytesPerCamera` — the DECLARED cap, not the frame's actual size —
     // for its whole admission. So the number of captures that can hold a memory reservation at once
     // is floor(maxInFlightBytes / maxFrameBytesPerCamera), and THAT, not maxConcurrentCaptures, is
