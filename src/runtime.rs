@@ -1982,6 +1982,160 @@ impl CameraRuntime {
             .map_err(crate::CameraError::from)
     }
 
+    /// Answers `sb/queue-status`.
+    ///
+    /// Read-only and cheap: the admission and dispatcher numbers are atomics, and the durable
+    /// counts are one grouped COUNT rather than a page of rows -- which matters, because the moment
+    /// an operator asks this question is exactly the moment the catalog is least able to afford a
+    /// scan.
+    pub async fn queue_status(&self, instance: Option<String>) -> Result<QueueStatus> {
+        if let Some(instance) = instance.as_deref() {
+            // Rejects an unknown camera the same way every other targeted verb does.
+            self.registry.snapshot(instance)?;
+        }
+        self.sweep_cancelled_descriptors(instance.as_deref())?;
+        let config = self.config_snapshot()?;
+        let dispatchers = self
+            .dispatchers
+            .read()
+            .map_err(|_| {
+                crate::CameraError::Catalog("camera dispatcher map is unavailable".into())
+            })?
+            .iter()
+            .filter(|(id, _)| {
+                instance
+                    .as_deref()
+                    .is_none_or(|target| target == id.as_str())
+            })
+            .map(|(id, dispatcher)| CameraQueueDepth {
+                instance: id.clone(),
+                queued: dispatcher.depth(),
+                capacity: dispatcher.capacity(),
+            })
+            .collect::<Vec<_>>();
+        let dispatch_queued = dispatchers.iter().map(|camera| camera.queued).sum();
+
+        let durable = self
+            .catalog
+            .count_jobs_by_state(instance, NON_TERMINAL_JOB_STATES.to_vec())
+            .await?;
+        let total_for = |states: &[crate::model::JobState]| -> u64 {
+            states
+                .iter()
+                .filter_map(|state| durable.get(crate::catalog::job_state_token(*state)))
+                .sum()
+        };
+        let durable_backlog = total_for(&BACKLOG_JOB_STATES);
+        let durable_in_flight = total_for(&NON_TERMINAL_JOB_STATES) - durable_backlog;
+
+        Ok(QueueStatus {
+            admission: self.admission.snapshot(),
+            limits: QueueLimits {
+                max_concurrent_captures: config.global.limits.max_concurrent_captures,
+                max_in_flight_bytes: config.global.limits.max_in_flight_bytes,
+                max_queued_captures_per_camera: config.global.limits.max_queued_captures_per_camera,
+            },
+            cameras: dispatchers,
+            dispatch_queued,
+            durable,
+            durable_backlog,
+            durable_in_flight,
+        })
+    }
+
+    /// Answers `sb/queue-clear` -- the break-glass drain.
+    ///
+    /// Cancels the durable backlog (and, only if asked, work already in flight) through the same
+    /// `cancel_active` path a single `sb/capture-cancel` uses, so a drained capture reaches the same
+    /// terminal state, publishes the same terminal message, and releases the same admission capacity
+    /// as one cancelled by hand. There is no second cancellation mechanism to keep correct.
+    ///
+    /// It pages, because the whole point is that it is reached for when the backlog has run away,
+    /// and a drain that tried to hold a runaway backlog in memory would fail exactly when it was
+    /// needed. It reports what it could not cancel rather than claiming a clean sweep.
+    async fn clear_queue(
+        &self,
+        instance: Option<String>,
+        include_in_flight: bool,
+        reason: String,
+    ) -> Result<QueueClearOutcome> {
+        if let Some(instance) = instance.as_deref() {
+            self.registry.snapshot(instance)?;
+        }
+        let states = if include_in_flight {
+            NON_TERMINAL_JOB_STATES.to_vec()
+        } else {
+            BACKLOG_JOB_STATES.to_vec()
+        };
+        let mut outcome = QueueClearOutcome {
+            cancelled: 0,
+            already_terminal: 0,
+            failed: Vec::new(),
+        };
+        // Cancelling moves a row out of the queried states, so each page is drawn fresh from the
+        // head rather than walked with a cursor: the set shrinks under us by design.
+        loop {
+            let page = self
+                .catalog
+                .jobs_page(instance.clone(), states.clone(), None, 1_000)
+                .await?;
+            if page.is_empty() {
+                self.sweep_cancelled_descriptors(instance.as_deref())?;
+                return Ok(outcome);
+            }
+            let drained = page.len();
+            for job in page {
+                match self.engine(&job.instance) {
+                    Ok(engine) => match engine.cancel_active(&job.capture_id, reason.clone()).await
+                    {
+                        Ok(result) if result.cancelled => outcome.cancelled += 1,
+                        Ok(_) => outcome.already_terminal += 1,
+                        Err(error) => outcome.failed.push(QueueClearFailure {
+                            capture_id: job.capture_id,
+                            error: error.to_string(),
+                        }),
+                    },
+                    Err(error) => outcome.failed.push(QueueClearFailure {
+                        capture_id: job.capture_id,
+                        error: error.to_string(),
+                    }),
+                }
+            }
+            // Every row in the page resisted the drain. Another pass would fetch the same rows and
+            // fail on them again, forever, so stop and say so.
+            if outcome.failed.len() >= drained && outcome.cancelled == 0 {
+                self.sweep_cancelled_descriptors(instance.as_deref())?;
+                return Ok(outcome);
+            }
+        }
+    }
+
+    /// Drops descriptors whose captures are already dead from the supervisor dispatchers.
+    ///
+    /// Cancelling a capture cancels its runtime token, but the descriptor keeps sitting in its
+    /// camera's dispatcher -- and keeps counting against that camera's queue ceiling -- until
+    /// something happens to call `reserve()` or `drain_into()`, both of which sweep on the way in.
+    /// So a camera whose backlog was just drained would report itself full, to the very operator who
+    /// drained it, until the next capture arrived to clean up. Sweeping here is not a semantic
+    /// change: it does exactly what the next `reserve()` would have done, only now, so that what an
+    /// operator is told is true when they are told it.
+    fn sweep_cancelled_descriptors(&self, instance: Option<&str>) -> Result<()> {
+        let dispatchers = self
+            .dispatchers
+            .read()
+            .map_err(|_| {
+                crate::CameraError::Catalog("camera dispatcher map is unavailable".into())
+            })?
+            .iter()
+            .filter(|(id, _)| instance.is_none_or(|target| target == id.as_str()))
+            .map(|(_, dispatcher)| Arc::clone(dispatcher))
+            .collect::<Vec<_>>();
+        for dispatcher in dispatchers {
+            dispatcher.discard_cancelled()?;
+        }
+        Ok(())
+    }
+
     async fn cancel_capture(&self, body: CancelRequest) -> Result<serde_json::Value> {
         body.validate()?;
         let CancelRequest {
@@ -4940,6 +5094,55 @@ impl CameraCommandService for CameraRuntime {
                     let body: CancelRequest = commands::parse_closed(request.body.clone())?;
                     self.cancel_capture(body).await
                 }
+                "sb/queue-status" => {
+                    let body: commands::QueueStatusRequest =
+                        commands::parse_closed(request.body.clone())?;
+                    body.validate()?;
+                    let status = self.queue_status(body.instance).await?;
+                    Ok(serde_json::to_value(status)?)
+                }
+                "sb/queue-clear" => {
+                    let body: commands::QueueClearRequest =
+                        commands::parse_closed(request.body.clone())?;
+                    body.validate()?;
+                    let commands::QueueClearRequest {
+                        request_id,
+                        instance,
+                        all_cameras: _,
+                        include_in_flight,
+                        reason,
+                    } = body;
+                    let canonical_reason = reason.clone();
+                    let reason = reason.unwrap_or_else(|| "operator queue drain".to_string());
+                    let canonical = serde_json::json!({
+                        "requestId": &request_id,
+                        "instance": &instance,
+                        "includeInFlight": include_in_flight,
+                        "reason": canonical_reason,
+                    });
+                    // Ledgered like every other mutating verb: a retried drain returns the original
+                    // outcome instead of cancelling a second wave of work the operator never saw.
+                    let key = crate::catalog::LedgerKey::new(
+                        instance.clone().unwrap_or_else(|| "main".to_string()),
+                        "sb/queue-clear",
+                        request_id,
+                    )?;
+                    self.cancel_with_ledger(
+                        key,
+                        canonical,
+                        serde_json::json!({
+                            "cancelled": 0,
+                            "alreadyTerminal": 0,
+                            "failed": [],
+                        }),
+                        async {
+                            let outcome =
+                                self.clear_queue(instance, include_in_flight, reason).await?;
+                            Ok(serde_json::to_value(outcome)?)
+                        },
+                    )
+                    .await
+                }
                 "sb/reconnect" => {
                     let body: ReconnectRequest = commands::parse_closed(request.body.clone())?;
                     self.reconnect(body).await
@@ -5027,6 +5230,19 @@ impl SupervisorDispatcher {
     /// this call wakes it immediately rather than being missed.
     async fn arrival(&self) {
         self.inner.arrived.notified().await;
+    }
+
+    /// Captures this camera is holding: queued descriptors plus reservations not yet committed.
+    ///
+    /// This is the count that bounds new work, so it is the count an operator needs to see when a
+    /// camera starts refusing captures with QUEUE_FULL.
+    fn depth(&self) -> usize {
+        self.inner.used.load(Ordering::Acquire)
+    }
+
+    /// The per-camera ceiling this dispatcher enforces.
+    fn capacity(&self) -> usize {
+        self.inner.maximum
     }
 
     /// Forwards as many durable descriptors as the connected actor can reserve right now.
@@ -5223,7 +5439,7 @@ fn group_terminal_json(record: &crate::catalog::GroupRecord) -> serde_json::Valu
 }
 
 /// All application command verbs required by the binding design.
-pub const CAMERA_COMMAND_VERBS: [&str; 12] = [
+pub const CAMERA_COMMAND_VERBS: [&str; 14] = [
     "sb/list",
     "sb/discover",
     "sb/status",
@@ -5233,10 +5449,99 @@ pub const CAMERA_COMMAND_VERBS: [&str; 12] = [
     "sb/capture-group-submit",
     "sb/capture-status",
     "sb/capture-cancel",
+    "sb/queue-status",
+    "sb/queue-clear",
     "sb/reconnect",
     "sb/ptz",
     "sb/ptz-presets",
 ];
+
+/// Durable states in which a capture still owes the operator an outcome.
+const NON_TERMINAL_JOB_STATES: [crate::model::JobState; 5] = [
+    crate::model::JobState::Accepted,
+    crate::model::JobState::Queued,
+    crate::model::JobState::Acquiring,
+    crate::model::JobState::Encoding,
+    crate::model::JobState::Persisting,
+];
+
+/// Durable states in which a capture has been promised but no physical work has begun.
+const BACKLOG_JOB_STATES: [crate::model::JobState; 2] = [
+    crate::model::JobState::Accepted,
+    crate::model::JobState::Queued,
+];
+
+/// What one camera is holding.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraQueueDepth {
+    /// Camera instance token.
+    pub instance: String,
+    /// Descriptors queued plus reservations taken, i.e. what counts against the camera's ceiling.
+    pub queued: usize,
+    /// The ceiling itself. A camera at `queued == capacity` is answering QUEUE_FULL.
+    pub capacity: usize,
+}
+
+/// The live answer to "is the component coping, and if not, where is it stuck?"
+///
+/// It is assembled from three places on purpose, because no one of them can answer it alone:
+/// admission says what capacity is left, the per-camera dispatchers say what is waiting to be
+/// handed to a camera, and the catalog says what the component still owes -- the only one of the
+/// three that survives a restart.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueStatus {
+    /// Live admission capacity: permits, unreserved frame memory, outstanding disk bytes.
+    pub admission: crate::admission::AdmissionSnapshot,
+    /// The configured ceilings the numbers above should be read against.
+    pub limits: QueueLimits,
+    /// Per-camera dispatcher depth.
+    pub cameras: Vec<CameraQueueDepth>,
+    /// Total descriptors held across every camera's dispatcher.
+    pub dispatch_queued: usize,
+    /// Durable non-terminal counts, keyed by state token.
+    pub durable: BTreeMap<String, u64>,
+    /// Durable captures promised but not started (ACCEPTED + QUEUED).
+    pub durable_backlog: u64,
+    /// Durable captures already doing physical work (ACQUIRING + ENCODING + PERSISTING).
+    pub durable_in_flight: u64,
+}
+
+/// The ceilings a [`QueueStatus`] should be read against.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueLimits {
+    /// Global acquisition permits.
+    pub max_concurrent_captures: usize,
+    /// Frame-memory budget.
+    pub max_in_flight_bytes: u64,
+    /// Per-camera dispatcher ceiling.
+    pub max_queued_captures_per_camera: usize,
+}
+
+/// What a break-glass drain actually did.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueClearOutcome {
+    /// Captures cancelled by this call.
+    pub cancelled: usize,
+    /// Captures that reached a terminal state on their own before the drain got to them.
+    pub already_terminal: usize,
+    /// Captures the drain could not cancel, with the reason. Bounded; a drain reports what it could
+    /// not do rather than claiming a clean sweep.
+    pub failed: Vec<QueueClearFailure>,
+}
+
+/// One capture a drain could not cancel.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueClearFailure {
+    /// The capture that survived the drain.
+    pub capture_id: String,
+    /// Operator-safe reason.
+    pub error: String,
+}
 
 /// Performs the side-effect-free adapter half of core candidate validation.
 ///
@@ -12026,6 +12331,107 @@ mod tests {
                 closes.load(Ordering::SeqCst),
                 1,
                 "the protocol session must be closed instead of leaked server-side"
+            );
+        }
+
+        /// Q3/Q4: the operator can finally SEE the queue, and drain it.
+        ///
+        /// Every number here already existed. `AdmissionSnapshot` was compiled only into
+        /// `cfg(all(test, linux, standalone, onvif, capacity-harness))`, so the sole consumer was the
+        /// capacity harness -- the observability had been built for the test rather than for the
+        /// person holding the pager, and an operator watching a backlog run away had no way to ask
+        /// how deep it was or to stop it.
+        #[tokio::test]
+        async fn queue_status_reports_the_backlog_and_queue_clear_drains_it() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            configuration.global.limits.max_queued_captures_per_camera = 4;
+            let runtime = runtime(configuration, &directory).await;
+
+            // No supervisor: the captures sit exactly where a backlog for an offline camera sits.
+            for index in 0..3 {
+                runtime
+                    .submit_capture(
+                        "camera-a".to_string(),
+                        format!("backlog-{index}"),
+                        None,
+                        None,
+                        serde_json::Map::new(),
+                        format!("backlog-correlation-{index}"),
+                        "sb/capture-submit",
+                        crate::admission::CapturePriority::Submitted,
+                    )
+                    .await
+                    .expect("captures must be accepted");
+            }
+
+            let status = runtime.queue_status(None).await.unwrap();
+            assert_eq!(
+                status.durable_backlog, 3,
+                "the durable backlog is what survives a restart"
+            );
+            assert_eq!(status.durable_in_flight, 0);
+            assert_eq!(
+                status.dispatch_queued, 3,
+                "and the dispatcher is holding all three"
+            );
+            assert_eq!(
+                status.cameras,
+                vec![CameraQueueDepth {
+                    instance: "camera-a".to_string(),
+                    queued: 3,
+                    capacity: 4,
+                }],
+                "a camera at queued == capacity is the one answering QUEUE_FULL, so both are reported"
+            );
+            assert_eq!(
+                status.limits.max_concurrent_captures, status.admission.available_acquisitions,
+                "nothing is acquiring yet, so every acquisition permit must still be free"
+            );
+
+            // Break glass.
+            let outcome = runtime
+                .clear_queue(None, false, "operator drain".to_string())
+                .await
+                .unwrap();
+            assert_eq!(outcome.cancelled, 3);
+            assert!(
+                outcome.failed.is_empty(),
+                "the drain must not leave work behind silently"
+            );
+
+            let drained = runtime.queue_status(None).await.unwrap();
+            assert_eq!(
+                drained.durable_backlog, 0,
+                "the durable backlog is gone, not just forgotten"
+            );
+            assert_eq!(
+                drained.dispatch_queued, 0,
+                "and the descriptors must not still be occupying the camera's queue slots"
+            );
+        }
+
+        /// The drain reaches durable work regardless of whether an unknown camera is named.
+        #[tokio::test]
+        async fn queue_status_and_clear_reject_an_unknown_camera() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+
+            assert_eq!(
+                runtime
+                    .queue_status(Some("camera-nope".to_string()))
+                    .await
+                    .expect_err("an unknown camera must be rejected, not reported as empty")
+                    .code(),
+                crate::ErrorCode::UnknownInstance
+            );
+            assert_eq!(
+                runtime
+                    .clear_queue(Some("camera-nope".to_string()), false, "drain".to_string())
+                    .await
+                    .expect_err("an unknown camera must be rejected")
+                    .code(),
+                crate::ErrorCode::UnknownInstance
             );
         }
 

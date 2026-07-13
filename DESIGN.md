@@ -1103,6 +1103,8 @@ camera adapter.
 | `sb/capture-group-submit` | immediate acceptance | Durably submit a group capture and return `captureGroupId` plus member `captureId`s. |
 | `sb/capture-status` | immediate | Retrieve one job, one group, or a bounded, paged list of recent jobs. |
 | `sb/capture-cancel` | immediate | Request cancellation of a non-terminal job. |
+| `sb/queue-status` | immediate | Report live admission capacity, per-camera queue depth, and the durable backlog. |
+| `sb/queue-clear` | immediate | Break-glass: cancel the durable backlog for one camera or, explicitly, the fleet. |
 | `sb/reconnect` | immediate acceptance | Close and reconnect a configured camera session. |
 | `sb/ptz` | immediate | Execute or inspect a capability-gated PTZ operation. |
 | `sb/ptz-presets` | immediate | List, recall, create, or remove presets subject to policy. |
@@ -1345,6 +1347,59 @@ Paged request:
 The single result uses the same terminal metadata shape as `sb/capture`, or the current state and timing
 when non-terminal. Pagination is stable by `(acceptedAt, captureId)`. Expired records return
 `CAPTURE_NOT_FOUND`.
+
+### 13.9a `sb/queue-status` and `sb/queue-clear`
+
+The operator surface over the backlog. `sb/queue-status` is read-only; `sb/queue-clear` is the
+break-glass drain (D-CAM-Q4, decision taken 2026-07-12).
+
+`sb/queue-status` request (`instance` optional; absent means the fleet):
+
+```json
+{ "instance": "camera-a" }
+```
+
+The reply assembles three sources, because no one of them can answer the question alone:
+
+| Field | Source | Says |
+|-------|--------|------|
+| `admission` | `AdmissionController::snapshot()` | Unused acquisition/encoder/writer permits, unreserved frame memory, outstanding disk bytes. |
+| `limits` | current config | The ceilings the numbers above must be read against. |
+| `cameras[]`, `dispatchQueued` | per-camera `SupervisorDispatcher` | What is waiting to be handed to each camera. `queued == capacity` is a camera answering `QUEUE_FULL`. |
+| `durable`, `durableBacklog`, `durableInFlight` | catalog | What the component still owes. The only figure that survives a restart. |
+
+`AdmissionSnapshot` was formerly compiled only under
+`cfg(all(test, target_os = "linux", standalone, onvif, capacity-harness))`, so its only consumer was
+the capacity harness and none of it reached an operator. It is a production surface.
+
+The durable figures come from one grouped `COUNT`, not a page of rows: the moment this question is
+asked is the moment the catalog can least afford a scan.
+
+`sb/queue-clear` request:
+
+```json
+{
+  "requestId": "drain-8472",
+  "instance": "camera-a",
+  "includeInFlight": false,
+  "reason": "line stopped"
+}
+```
+
+- Targets one camera by `instance`, or the fleet with `allCameras: true`. Omitting `instance` without
+  `allCameras` is **rejected**: a fleet-wide drain must not be reachable by leaving a field out.
+- `includeInFlight` defaults to `false` — the backlog is drained and captures already acquiring,
+  encoding, or persisting are left alone. `true` cancels those too.
+- Every capture is cancelled through the same `cancel_active` path as `sb/capture-cancel`, so it
+  reaches the same terminal state, publishes the same terminal message, and releases the same
+  admission capacity. There is no second cancellation mechanism to keep correct.
+- The reply reports `cancelled`, `alreadyTerminal`, and `failed[]`. A drain reports what it could not
+  cancel rather than claiming a clean sweep.
+- Ledgered on `requestId` like every mutating verb, so a retried drain returns the original outcome
+  instead of cancelling a second wave of work the operator never saw.
+- The drain sweeps cancelled descriptors out of the supervisor dispatchers before returning.
+  Otherwise a just-drained camera would keep reporting itself full — the descriptors are only swept
+  when something next calls `reserve()`/`drain_into()` — to the very operator who drained it.
 
 ### 13.9 `sb/capture-cancel`
 

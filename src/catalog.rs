@@ -917,6 +917,55 @@ impl Catalog {
         .await
     }
 
+    /// Counts durable jobs per state, optionally for one camera.
+    ///
+    /// The backlog an operator cares about is the durable one -- the rows that will still be there
+    /// after a restart -- and it is the one thing an in-memory queue depth cannot tell them. Counting
+    /// in SQL rather than paging rows keeps a break-glass question from becoming a scan of the whole
+    /// catalog at exactly the moment the catalog is already the thing under strain.
+    pub async fn count_jobs_by_state(
+        &self,
+        instance: Option<String>,
+        states: Vec<JobState>,
+    ) -> Result<std::collections::BTreeMap<String, u64>> {
+        self.execute(move |connection| {
+            let mut sql = "SELECT state,COUNT(*) FROM jobs WHERE 1=1".to_owned();
+            let mut parameters = Vec::<rusqlite::types::Value>::new();
+            if let Some(instance) = instance {
+                sql.push_str(" AND instance=?");
+                parameters.push(instance.into());
+            }
+            if !states.is_empty() {
+                sql.push_str(" AND state IN (");
+                for (index, state) in states.iter().enumerate() {
+                    if index != 0 {
+                        sql.push(',');
+                    }
+                    sql.push('?');
+                    parameters.push(job_state_token(*state).to_owned().into());
+                }
+                sql.push(')');
+            }
+            sql.push_str(" GROUP BY state");
+            let mut statement = connection.prepare(&sql)?;
+            let counted = statement
+                .query_map(rusqlite::params_from_iter(parameters), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut totals = std::collections::BTreeMap::new();
+            for (token, count) in counted {
+                // Parsed to reject a durable row whose state token is not one we know, then keyed by
+                // the token itself: the caller is answering an operator's question over the wire, and
+                // the durable token IS the name that question is asked in.
+                parse_job_state(&token)?;
+                totals.insert(token, u64::try_from(count).unwrap_or(0));
+            }
+            Ok(totals)
+        })
+        .await
+    }
+
     /// Returns one stable, bounded page of jobs in descending `(acceptedAt,captureId)` order.
     ///
     /// `before` is the final tuple returned by the previous page. It is intentionally a typed
@@ -3518,7 +3567,7 @@ fn parse_job_state(value: &str) -> Result<JobState> {
     }
 }
 
-const fn job_state_token(state: JobState) -> &'static str {
+pub(crate) const fn job_state_token(state: JobState) -> &'static str {
     match state {
         JobState::Accepted => "ACCEPTED",
         JobState::Queued => "QUEUED",
