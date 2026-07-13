@@ -565,16 +565,48 @@ mod tests {
         let factory = context
             .onvif_factory(&global(&[], crate::config::SecurityConfig::default()))
             .expect("ONVIF factory with credential service");
+        let reference = crate::config::SecretRef {
+            secret: "camera/login".to_owned(),
+            field: None,
+        };
+        let cancellation = CancellationToken::new();
         let credentials = factory
-            .resolve_login_for_test(&crate::config::SecretRef {
-                secret: "camera/login".to_owned(),
-                field: None,
-            })
+            .resolve_login_bounded_for_test(
+                &reference,
+                Instant::now() + Duration::from_secs(5),
+                &cancellation,
+            )
             .await
             .expect("EdgeCommons credential resolution");
 
         assert_eq!(credentials.username().expect("username"), "operator");
         assert_eq!(credentials.password().expect("password"), "camera-secret");
+
+        // The bound is the part production actually depends on, and the old `_for_test` accessor
+        // skipped it: it called the provider directly, so a credential store that hung would have
+        // hung a camera connect with nothing here to notice.
+        assert_eq!(
+            factory
+                .resolve_login_bounded_for_test(&reference, Instant::now(), &cancellation)
+                .await
+                .expect_err("an elapsed deadline must not reach the credential store")
+                .code(),
+            crate::ErrorCode::CaptureTimeout
+        );
+
+        cancellation.cancel();
+        assert_eq!(
+            factory
+                .resolve_login_bounded_for_test(
+                    &reference,
+                    Instant::now() + Duration::from_secs(5),
+                    &cancellation,
+                )
+                .await
+                .expect_err("a cancelled connect must not reach the credential store")
+                .code(),
+            crate::ErrorCode::CaptureCancelled
+        );
     }
 
     #[cfg(feature = "onvif")]

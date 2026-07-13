@@ -672,8 +672,6 @@ pub struct CameraRuntime {
     cursors: CursorStore,
     reload_gate: tokio::sync::Mutex<()>,
     reloading: AtomicBool,
-    #[cfg(test)]
-    fail_next_reload_after_supervisor_retirement: AtomicBool,
     self_reference: OnceLock<Weak<Self>>,
 }
 
@@ -1232,7 +1230,6 @@ impl CameraRuntime {
             reload_gate: tokio::sync::Mutex::new(()),
             reloading: AtomicBool::new(false),
             #[cfg(test)]
-            fail_next_reload_after_supervisor_retirement: AtomicBool::new(false),
             self_reference: OnceLock::new(),
         });
         let _ = runtime.self_reference.set(Arc::downgrade(&runtime));
@@ -3119,17 +3116,6 @@ impl CameraRuntime {
         self.wait_for_active_jobs(&restarting, drain_timeout)
             .await?;
         self.replace_supervisors(&restarting, drain_timeout).await?;
-
-        #[cfg(test)]
-        if self
-            .fail_next_reload_after_supervisor_retirement
-            .swap(false, Ordering::AcqRel)
-        {
-            return Err(crate::CameraError::rejected(
-                crate::ErrorCode::BackendError,
-                "controlled reload transition failure after supervisor retirement",
-            ));
-        }
 
         // The retirement barrier above has confirmed that no old generation can mutate a camera
         // after this point. All remaining fallible preparation has completed, so the registry and
@@ -6584,7 +6570,6 @@ mod tests {
                 reload_gate: tokio::sync::Mutex::new(()),
                 reloading: AtomicBool::new(false),
                 #[cfg(test)]
-                fail_next_reload_after_supervisor_retirement: AtomicBool::new(false),
                 self_reference: OnceLock::new(),
             });
             let _ = runtime.self_reference.set(Arc::downgrade(&runtime));
@@ -9415,10 +9400,22 @@ mod tests {
                 panic!("test fixture must use the simulator backend");
             };
             sim.seed = Some(712);
+            // Fail the commit the way it can actually fail.
+            //
+            // This used to be driven by a `#[cfg(test)] fail_next_reload_after_supervisor_retirement`
+            // AtomicBool -- a field on the PRODUCTION `CameraRuntime` struct, read by a branch inside
+            // the production reload commit. It injected a failure that cannot occur, at a point in
+            // the sequence where no real failure lives, which meant the rollback being asserted here
+            // had never once been driven by anything the runtime could actually do.
+            //
+            // The real post-retirement failure is `registry.apply_validated_config`, and it rejects
+            // a roster with duplicate camera IDs. That check sits immediately after the supervisor
+            // retirement barrier, which is exactly the window this test exists to cover, so a
+            // duplicated instance drives the genuine path -- and the assertion below proves the
+            // supervisors really were retired before it fired.
+            let duplicate = replacement.instances[0].clone();
+            replacement.instances.push(duplicate);
             let checkpoint = runtime.reload_checkpoint().unwrap();
-            runtime
-                .fail_next_reload_after_supervisor_retirement
-                .store(true, Ordering::Release);
             let mut transaction = RuntimeReloadTransaction {
                 runtime: Arc::clone(&runtime),
                 replacement,
@@ -9429,7 +9426,11 @@ mod tests {
 
             assert!(
                 transaction.commit().await.is_err(),
-                "the controlled post-retirement transition failure must reject the candidate"
+                "a roster the registry refuses must reject the candidate"
+            );
+            assert!(
+                retired_supervisor.is_cancelled(),
+                "the failure must land AFTER the retirement barrier -- otherwise this test would                  not be covering the post-retirement rollback it claims to cover"
             );
             // Core calls rollback after any failed commit. It is intentionally idempotent because
             // commit performed the restoration before returning its error.

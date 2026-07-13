@@ -2558,10 +2558,20 @@ impl OnvifBackendFactory {
             .map(<[String]>::to_vec)
     }
 
+    /// Resolves a secret reference through the SAME bounded path a session uses.
+    ///
+    /// It used to call `provider.resolve_login()` straight, which production never does: production
+    /// goes through [`resolve_login_bounded`], which adds the deadline and cancellation guards. So
+    /// the accessor re-implemented the production path minus exactly the part that can fail, and the
+    /// test that leaned on it proved the credential wiring worked while proving nothing about the
+    /// code that actually runs. It now delegates, and takes the bounds as arguments so a caller can
+    /// exercise them.
     #[cfg(test)]
-    pub(crate) async fn resolve_login_for_test(
+    pub(crate) async fn resolve_login_bounded_for_test(
         &self,
         reference: &SecretRef,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<Arc<OnvifCredentials>> {
         let provider =
             self.dependencies
@@ -2571,7 +2581,7 @@ impl OnvifBackendFactory {
                     path: "component.credentials".to_owned(),
                     message: "ONVIF secret references require EdgeCommons credentials".to_owned(),
                 })?;
-        provider.resolve_login(reference).await
+        resolve_login_bounded(provider, reference, deadline, cancellation).await
     }
 
     #[cfg(test)]
