@@ -47,7 +47,10 @@ native-all = ["genicam", "rtsp"]
 capacity-harness = []
 
 [dependencies]
-edgecommons = { path = "../core/libs/rust", default-features = false, features = ["credentials"] }
+# Pinned to a published rev so CI (a standalone repo) can resolve it. Local dev builds against
+# the sibling checkout via the gitignored `.cargo/config.toml` [patch] override, which replaces
+# this source outright. Same pattern as file-replicator.
+edgecommons = { git = "https://github.com/edgecommons/edgecommons.git", rev = "640e32f4ca9f610b70a709617afe17160e00e3e6", default-features = false, features = ["credentials"] }
 anyhow = "1"
 async-trait = "0.1"
 bytes = "1"
@@ -97,7 +100,7 @@ rustls-pemfile = { version = "2", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 
 [dev-dependencies]
-edgecommons = { path = "../core/libs/rust", default-features = false, features = ["credentials", "standalone"] }
+edgecommons = { git = "https://github.com/edgecommons/edgecommons.git", rev = "640e32f4ca9f610b70a709617afe17160e00e3e6", default-features = false, features = ["credentials", "standalone"] }
 proptest = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "test-util"] }
 

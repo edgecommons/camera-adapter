@@ -1,0 +1,95 @@
+name: ci
+
+on:
+  push:
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+jobs:
+  ci:
+    # Reusable component CI from the org defaults repo (build / test / clippy). `secrets: inherit`
+    # passes the org-level EDGECOMMONS_READ_TOKEN so cargo can fetch the private edgecommons git
+    # dependency; this repo must be on that secret's repository allow-list.
+    #
+    # Default features only (standalone + onvif) — those are pure Rust. `rtsp` needs GStreamer and
+    # `genicam` needs Aravis, both system libraries; they are compiled and exercised in the
+    # simulator-backed containers (simulators/rtsp_validation.Dockerfile,
+    # simulators/native_all_validation.Dockerfile), not here.
+    permissions:
+      contents: read
+    uses: edgecommons/.github/.github/workflows/component-ci.yml@main
+    with:
+      language: RUST
+    secrets: inherit
+
+  coverage:
+    # The reusable workflow does build/test/clippy and nothing else — its own header says to
+    # specialize per component "as real CI needs surface (coverage gates, ...)". This repo shipped
+    # with no CI at all, and it is not a coincidence that it is the component that accumulated a
+    # retention subsystem that was never called, an observability module with zero call sites, and a
+    # capacity harness that could not generate its own advertised load. Nothing was gating it.
+    #
+    # Two gates, and the second is the one that matters:
+    #
+    #   bundle  90% lines — where the crate honestly is today (90.12%). A ratchet, not an
+    #           aspiration: raise it as real tests land, never lower it to pass.
+    #
+    #   diff    95% of CHANGED lines — the lever. A bundle average is a LAGGING indicator that a
+    #           large under-tested change hides inside; that is exactly how ~7.5k lines of
+    #           under-tested core code nearly merged upstream. The diff gate asks the question that
+    #           matters on day one: is the code THIS PR changed tested?
+    #
+    # NOTE: diff-cover must run from the repo ROOT. Run it from a subdirectory and the source paths
+    # stop matching what `git diff` reports, it announces "no lines with coverage information", and
+    # the gate passes having checked nothing.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # diff-cover needs the merge base with the base branch.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Authenticate to the private edgecommons git dependency
+        env:
+          EDGECOMMONS_READ_TOKEN: ${{ secrets.EDGECOMMONS_READ_TOKEN }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons.git".insteadOf \
+            "https://github.com/edgecommons/edgecommons.git"
+          git config --global \
+            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons".insteadOf \
+            "https://github.com/edgecommons/edgecommons"
+
+      # Collect once, then report twice from the same profile data. Folding the gate into a
+      # `--cobertura --output-path` run suppresses llvm-cov's summary table, so a failing run tells
+      # you only THAT it failed, never by how much. A gate that will not tell you the number is a
+      # bad gate.
+      - name: Collect coverage
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: cargo llvm-cov --no-report
+
+      - name: Coverage summary + 90% line gate
+        run: cargo llvm-cov report --summary-only --fail-under-lines 90
+
+      - name: Cobertura report for the diff gate
+        if: always()
+        run: cargo llvm-cov report --cobertura --output-path target/cobertura.xml
+
+      - name: Diff coverage gate (95% of changed lines)
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          pip install diff-cover
+          diff-cover target/cobertura.xml --compare-branch=origin/main --fail-under=95
