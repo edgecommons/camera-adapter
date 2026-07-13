@@ -15076,20 +15076,22 @@ mod tests {
             configuration.global.limits.max_concurrent_captures = 1;
             configuration.global.limits.max_in_flight_bytes =
                 configuration.global.limits.max_frame_bytes_per_camera;
-            // Each capture takes 600 ms and only one may run at a time, so member three does not start
-            // until ~1.2 s in and member four until ~1.8 s. Their capture clock is 1 s. If that clock
-            // still began at ACCEPTANCE -- as it did before Q1 -- both would arrive at a free camera
-            // already dead, and the group would come back mostly timed out. That is the defect, and
-            // the gap between 1 s and 1.8 s is what lets this test see it.
+            // One capture at a time, 1.5 s each, and a capture clock of 2.8 s.
             //
-            // A rebased clock, by contrast, gives each member the full second to do 600 ms of work.
-            // The 400 ms of slack is deliberate: this ran with 150 ms and passed everywhere except a
-            // two-core CI runner under coverage instrumentation, which is a statement about the
-            // runner and not about the component.
-            configuration.global.timeouts.capture_ms = 1_000;
+            // The teeth are STRUCTURAL, not a matter of margin: member three cannot start until
+            // members one and two have finished, so it always starts at or after 2 x 1.5 s = 3 s --
+            // on any machine, however slow -- and 3 s is past a 2.8 s clock that began at ACCEPTANCE.
+            // A slower machine only pushes it later, so the defect this test exists to see can never
+            // hide behind a fast one.
+            //
+            // The slack, by contrast, is what a machine can eat: a rebased clock gives each member
+            // 2.8 s to do 1.5 s of work, so it takes 1.3 s of scheduling overhead per capture to fail
+            // this test honestly. Earlier cuts of this test allowed 150 ms and then 400 ms, and a
+            // two-core CI runner under coverage instrumentation ate both.
+            configuration.global.timeouts.capture_ms = 2_800;
             for camera in &mut configuration.instances {
                 if let crate::config::BackendConfig::Sim(sim) = &mut camera.backend {
-                    sim.capture_delay_ms = 600;
+                    sim.capture_delay_ms = 1_500;
                 }
             }
             let runtime = runtime(configuration, &directory).await;
@@ -15123,7 +15125,9 @@ mod tests {
                 .expect("acceptance is all-or-nothing and must succeed");
             assert_eq!(group.members.len(), 4);
 
-            let terminal = wait_for_group_terminal(&runtime, &group.group_id).await;
+            let terminal =
+                wait_for_group_terminal_within(&runtime, &group.group_id, Duration::from_secs(30))
+                    .await;
             let states: Vec<_> = terminal.members.iter().map(|member| member.state).collect();
             assert!(
                 states
