@@ -2028,9 +2028,18 @@ impl CameraRuntime {
     /// `instances[]` array, fed by a provider, precisely so a multi-instance adapter can report each
     /// connection's health without minting a UNS instance per camera. This is that provider.
     ///
-    /// `detail` is deliberately low-cardinality: the connection state, plus the stable error CODE
-    /// when a camera is down. Never the error text, never a URL -- this rides a keepalive that is
-    /// published every few seconds, for every camera, forever.
+    /// Each optional member of the element carries what it was designed to carry, and the difference
+    /// matters to whoever reads it:
+    ///
+    /// * `connected` -- the normalized flag every consumer can act on without knowing what a camera is.
+    /// * `state` -- this component's own richer condition token. `BACKOFF` and `CONNECTING` are both
+    ///   `connected: false`, and an operator deciding whether to intervene needs to know which.
+    /// * `detail` -- why it is down, in the camera's own words, when it has given us any.
+    /// * `attributes` -- the open bag, for what only a camera adapter understands: the backend, the
+    ///   connection generation, and the stable code of the error that put it there.
+    ///
+    /// The same element shape answers core's built-in `status` verb, so one sampler serves both the
+    /// push and the pull.
     #[must_use]
     pub fn camera_connectivity(&self) -> Vec<edgecommons::heartbeat::InstanceConnectivity> {
         let Ok(snapshots) = self.registry.snapshots(MAX_CONNECTIVITY_INSTANCES) else {
@@ -2040,19 +2049,40 @@ impl CameraRuntime {
             .into_iter()
             .map(|snapshot| {
                 let connected = snapshot.state == CameraConnectionState::Online;
-                let detail = if connected {
-                    None
-                } else {
-                    Some(match snapshot.last_error.as_ref() {
-                        Some(error) => format!("{:?}: {}", snapshot.state, error.code),
-                        None => format!("{:?}", snapshot.state),
-                    })
-                };
-                edgecommons::heartbeat::InstanceConnectivity::new(
+                let mut attributes = serde_json::Map::new();
+                attributes.insert(
+                    "backend".to_owned(),
+                    serde_json::to_value(snapshot.backend).unwrap_or(serde_json::Value::Null),
+                );
+                attributes.insert(
+                    "generation".to_owned(),
+                    serde_json::Value::from(snapshot.generation),
+                );
+                if let Some(error) = snapshot.last_error.as_ref() {
+                    attributes.insert(
+                        "lastErrorCode".to_owned(),
+                        serde_json::Value::from(error.code.clone()),
+                    );
+                }
+                let state = serde_json::to_value(snapshot.state)
+                    .ok()
+                    .and_then(|token| token.as_str().map(str::to_owned));
+                let detail = snapshot
+                    .last_error
+                    .as_ref()
+                    .filter(|_| !connected)
+                    .map(|error| error.message.clone());
+
+                let sample = edgecommons::heartbeat::InstanceConnectivity::new(
                     snapshot.instance,
                     connected,
                     detail,
                 )
+                .with_attributes(attributes);
+                match state {
+                    Some(state) => sample.with_state(state),
+                    None => sample,
+                }
             })
             .collect()
     }
@@ -12818,8 +12848,15 @@ mod tests {
                 "a camera that has never connected must not be reported as connected"
             );
             assert!(
-                cold.iter().all(|camera| camera.detail.is_some()),
-                "a camera that is down must say what it is doing -- that is the whole point of the push"
+                cold.iter()
+                    .all(|camera| camera.state.as_deref() == Some("OFFLINE")),
+                "a camera that is down must say WHICH kind of down: BACKOFF and CONNECTING are both                  `connected: false`, and an operator deciding whether to intervene needs to know which"
+            );
+            assert!(
+                cold.iter()
+                    .all(|camera| camera.attributes.contains_key("backend")
+                        && camera.attributes.contains_key("generation")),
+                "the open bag carries what only a camera adapter understands"
             );
 
             runtime
@@ -12836,9 +12873,14 @@ mod tests {
                 connected.connected,
                 "an online camera must be reported as connected"
             );
+            assert_eq!(
+                connected.state.as_deref(),
+                Some("ONLINE"),
+                "and it must publish its own condition token, not only the normalized flag"
+            );
             assert!(
                 connected.detail.is_none(),
-                "a healthy camera needs no detail: this rides a keepalive published every few                  seconds, for every camera, forever"
+                "a healthy camera has nothing to explain: this rides a keepalive published every                  few seconds, for every camera, forever"
             );
             assert!(
                 warm.iter()

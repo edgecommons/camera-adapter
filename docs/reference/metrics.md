@@ -37,13 +37,16 @@ per measure. Per-camera queue depth is answered by `sb/queue-status`.
 ## Per-camera presence
 
 Every configured camera's reachability is published in the component's `main` state keepalive, in the
-`instances[]` array: `instance` is the camera ID, `connected` is true only while its session is online,
-and `detail` names the connection state and, when the camera is down and an error is known, the stable
-error code. A healthy camera carries no `detail`. Consumers learn that a camera has dropped from the
-keepalive rather than by polling `sb/list` or `sb/status`.
+`instances[]` array, and the same element answers the built-in `status` verb. Consumers learn that a
+camera has dropped from the keepalive rather than by polling `sb/list` or `sb/status`.
 
-The keepalive stays low-cardinality by design: `detail` never carries error text or a camera URL, because
-it is published for every camera every few seconds.
+| Member | Meaning |
+|---|---|
+| `instance` | The camera ID. |
+| `connected` | True only while the camera's protocol session is online. The normalized flag any consumer can act on. |
+| `state` | The camera's own condition token: `ONLINE`, `CONNECTING`, `BACKOFF`, `OFFLINE`, `DEGRADED`, `DISABLED`, `STOPPING`. `BACKOFF` and `CONNECTING` are both `connected: false`, and they call for different responses. |
+| `detail` | Why the camera is down, in its own words, when it has reported an error. A healthy camera carries none. |
+| `attributes` | Camera-specific data: `backend`, the connection `generation`, and `lastErrorCode` when an error is known. |
 
 Readiness is a component gate, not a claim that every camera is online. It requires validated
 configuration, recovered catalog, usable output, active acknowledged command subscription, constructed
