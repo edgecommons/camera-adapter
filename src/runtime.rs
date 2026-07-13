@@ -1229,7 +1229,6 @@ impl CameraRuntime {
             cursors: CursorStore::default(),
             reload_gate: tokio::sync::Mutex::new(()),
             reloading: AtomicBool::new(false),
-            #[cfg(test)]
             self_reference: OnceLock::new(),
         });
         let _ = runtime.self_reference.set(Arc::downgrade(&runtime));
@@ -6569,7 +6568,6 @@ mod tests {
                 cursors: CursorStore::default(),
                 reload_gate: tokio::sync::Mutex::new(()),
                 reloading: AtomicBool::new(false),
-                #[cfg(test)]
                 self_reference: OnceLock::new(),
             });
             let _ = runtime.self_reference.set(Arc::downgrade(&runtime));
