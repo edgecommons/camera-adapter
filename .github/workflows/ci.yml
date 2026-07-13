@@ -9,9 +9,12 @@ on:
 
 jobs:
   ci:
-    # Reusable component CI from the org defaults repo (build / test / clippy). `secrets: inherit`
-    # passes the org-level EDGECOMMONS_READ_TOKEN so cargo can fetch the private edgecommons git
-    # dependency; this repo must be on that secret's repository allow-list.
+    # Reusable component CI from the org defaults repo (build / test / clippy).
+    #
+    # No credentials: `edgecommons` is a PUBLIC repository now, so the pinned git dependency needs no
+    # token. The `insteadOf` rewriting this used to do was not merely redundant once the dependency
+    # went public -- with an empty secret it rewrites the URL to `x-access-token:@github.com` and
+    # breaks a fetch that would otherwise have just worked.
     #
     # Default features only (standalone + onvif) — those are pure Rust. `rtsp` needs GStreamer and
     # `genicam` needs Aravis, both system libraries; they are compiled and exercised in the
@@ -61,16 +64,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Authenticate to the private edgecommons git dependency
-        env:
-          EDGECOMMONS_READ_TOKEN: ${{ secrets.EDGECOMMONS_READ_TOKEN }}
-        run: |
-          git config --global \
-            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons.git".insteadOf \
-            "https://github.com/edgecommons/edgecommons.git"
-          git config --global \
-            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons".insteadOf \
-            "https://github.com/edgecommons/edgecommons"
 
       # Collect once, then report twice from the same profile data. Folding the gate into a
       # `--cobertura --output-path` run suppresses llvm-cov's summary table, so a failing run tells
@@ -111,16 +104,6 @@ jobs:
       - name: Install the MSRV toolchain
         run: rustup toolchain install 1.85 --profile minimal
 
-      - name: Authenticate to the private edgecommons git dependency
-        env:
-          EDGECOMMONS_READ_TOKEN: ${{ secrets.EDGECOMMONS_READ_TOKEN }}
-        run: |
-          git config --global \
-            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons.git".insteadOf \
-            "https://github.com/edgecommons/edgecommons.git"
-          git config --global \
-            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons".insteadOf \
-            "https://github.com/edgecommons/edgecommons"
 
       # NOTE: no `--locked`, and `Cargo.lock` is not tracked. Three things cannot all be true at once:
       #   1. a committed lockfile must record the pinned GIT source, or it lies to a fresh clone;
@@ -169,16 +152,6 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component clippy
 
-      - name: Authenticate to the private edgecommons git dependency
-        env:
-          EDGECOMMONS_READ_TOKEN: ${{ secrets.EDGECOMMONS_READ_TOKEN }}
-        run: |
-          git config --global \
-            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons.git".insteadOf \
-            "https://github.com/edgecommons/edgecommons.git"
-          git config --global \
-            url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons".insteadOf \
-            "https://github.com/edgecommons/edgecommons"
 
       - name: Clippy (rtsp backend)
         env:
