@@ -4355,6 +4355,67 @@ mod tests {
         );
     }
 
+    /// Rebasing a capture's clocks is a durable write, and it refuses everything it should.
+    ///
+    /// The scheduler rebases a capture the moment a camera takes it, so this write sits on the hot
+    /// path of every capture that ever waits. Its guards are what keep a queue from corrupting the
+    /// durable record: only a QUEUED row may be rebased (a terminal one has already been decided),
+    /// the stage clocks must fit inside the terminal one, and a capture that is not there is not
+    /// silently invented.
+    #[tokio::test]
+    async fn only_a_queued_capture_with_coherent_clocks_may_be_rebased() {
+        let directory = TempDir::new().unwrap();
+        let catalog = Catalog::open(CatalogOptions::new(directory.path().join("state")))
+            .await
+            .unwrap();
+        let job = direct_job("cap_rebase", "rebase-request");
+        let deadlines = job.deadlines.clone();
+        let accepted = catalog.accept_job(job).await.unwrap();
+        let capture = match accepted {
+            AcceptJobOutcome::Inserted(record) | AcceptJobOutcome::Existing(record) => {
+                record.capture_id
+            }
+            AcceptJobOutcome::Conflict => panic!("unexpected conflict"),
+        };
+
+        // A capture that does not exist is not invented.
+        let missing = catalog
+            .reschedule_deadlines("cap_absent", deadlines.clone(), 1)
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), crate::ErrorCode::CaptureNotFound);
+
+        // A stage clock may not outlive the terminal clock it is supposed to sit inside.
+        let mut incoherent = deadlines.clone();
+        incoherent.capture_at_ms = incoherent.terminal_at_ms + 1;
+        assert!(
+            catalog
+                .reschedule_deadlines(capture.clone(), incoherent, 1)
+                .await
+                .is_err(),
+            "a stage deadline past the terminal deadline is a clock that can never be met"
+        );
+
+        // ACCEPTED is not QUEUED: a capture is only rebased when it is actually waiting.
+        assert!(
+            catalog
+                .reschedule_deadlines(capture.clone(), deadlines.clone(), 1)
+                .await
+                .is_err(),
+            "only a QUEUED capture may be rebased"
+        );
+
+        catalog
+            .queue_job(capture.clone(), 1)
+            .await
+            .expect("the capture reaches the queue");
+        let rebased = catalog
+            .reschedule_deadlines(capture.clone(), deadlines.clone(), 4_242)
+            .await
+            .expect("a QUEUED capture rebases onto the moment a camera took it");
+        assert_eq!(rebased.capture_id, capture);
+    }
+
     #[tokio::test]
     async fn latest_schedule_occurrence_uses_the_durable_unjittered_key() {
         let directory = TempDir::new().unwrap();

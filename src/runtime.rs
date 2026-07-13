@@ -13426,6 +13426,59 @@ mod tests {
             );
         }
 
+        /// A group schedule that cannot read its recovery cursor does not run on a guessed one.
+        ///
+        /// The cursor is what separates an occurrence the component missed while it was down from one
+        /// that has not come due. Without it the schedule cannot tell those apart, so it stops rather
+        /// than firing a synchronised capture at a line on a cursor it invented.
+        #[tokio::test]
+        async fn a_group_schedule_that_cannot_read_its_cursor_does_not_run() {
+            let directory = TempDir::new().unwrap();
+            let cameras = ["camera-a", "camera-b"];
+            let mut configuration = config(directory.path(), &cameras, false);
+            configuration.global.capture_group_schedules = vec![group_schedule(
+                "line-a-sync",
+                &cameras,
+                crate::config::OverlapPolicy::Skip,
+            )];
+            let runtime = runtime(configuration, &directory).await;
+            for camera in cameras {
+                runtime
+                    .start_supervisor(camera.to_string(), runtime.engine(camera).unwrap())
+                    .unwrap();
+                wait_for_online(&runtime, camera).await;
+            }
+
+            let database = directory
+                .path()
+                .join("state")
+                .join("camera-adapter.sqlite3");
+            let break_store = rusqlite::Connection::open(&database).unwrap();
+            break_store
+                .execute_batch(
+                    "ALTER TABLE group_schedule_cursors RENAME TO group_schedule_cursors_unavailable",
+                )
+                .unwrap();
+
+            runtime.start_schedulers().unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            break_store
+                .execute_batch(
+                    "ALTER TABLE group_schedule_cursors_unavailable RENAME TO group_schedule_cursors",
+                )
+                .unwrap();
+            assert!(
+                runtime
+                    .catalog
+                    .group_schedule_cursor("line-a-sync")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a schedule that could not read its cursor must not have fired anything"
+            );
+        }
+
         /// A catalog that cannot answer "is the previous group still running?" fails CLOSED.
         ///
         /// Firing a second synchronised group on top of one that may still be moving cameras is worse
@@ -13522,6 +13575,13 @@ mod tests {
                 jitter: Duration::ZERO,
             };
             assert!(runtime.submit_scheduled(&camera_scoped).await.is_err());
+
+            // And the converse: a GROUP occurrence has no single camera, so the camera path must
+            // refuse it rather than pick one.
+            assert!(
+                runtime.submit_scheduled(&occurrence).await.is_err(),
+                "a group occurrence cannot be submitted as a single-camera capture"
+            );
         }
 
         /// A capture the STORE could not rebase goes back on the queue -- it is not destroyed.
