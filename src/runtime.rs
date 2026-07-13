@@ -70,6 +70,13 @@ const CURSOR_TTL: Duration = Duration::from_secs(300);
 const MAX_RETAINED_CURSORS: usize = 256;
 const MAX_RETAINED_SNAPSHOT_VALUES: usize = 10_000;
 const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// How often the component's queue levels are sampled into `camera_queue`.
+///
+/// Levels, not events: a capture that starts and finishes between two samples is still counted,
+/// because counts ride the job hooks instead. So this only has to be fast enough to show a backlog
+/// building, and slow enough that watching the component costs nothing -- the sample takes one
+/// grouped COUNT against a catalog that the capture path is also using.
+const METRIC_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 const SCHEDULER_MISFIRE_GRACE: Duration = Duration::from_secs(5);
 // Lifecycle events are diagnostic-only. Keep their detached work bounded so a stalled broker
 // cannot delay a durable acceptance, physical acquisition, or consume unbounded task memory.
@@ -653,6 +660,8 @@ pub struct CameraRuntime {
     storage_pressure: Option<StoragePressureMonitor>,
     storage_alarm: Arc<Mutex<StorageAlarmState>>,
     readiness: RuntimeReadiness,
+    /// Capture counters and sampled queue levels. See `observability::CaptureMetrics`.
+    metrics: Arc<crate::observability::CaptureMetrics>,
     actors: Arc<RwLock<HashMap<String, CameraActorHandle>>>,
     /// Per-supervisor shutdown tokens.  A child token also observes process shutdown, while a
     /// reload can retire one connecting/backing-off supervisor without stopping the whole runtime.
@@ -900,6 +909,15 @@ impl JobHooks for RuntimeJobHooks {
         record: &crate::catalog::JobRecord,
         terminal_body: &serde_json::Value,
     ) {
+        // Counted here because `after_terminal` calls this for EVERY terminal, whatever produced
+        // it -- success, failure, cancellation, a deadline, an isolated panic. A capture that ends
+        // must be counted once, and there is exactly one place that sees all of them.
+        if let (Some(runtime), Some(measure)) = (
+            self.runtime(),
+            crate::observability::terminal_measure(record.state),
+        ) {
+            runtime.metrics.count(measure).await;
+        }
         let tokens = match self.tokens.lock() {
             Ok(mut tokens) => tokens.remove(&record.capture_id).unwrap_or_default(),
             Err(_) => return,
@@ -975,6 +993,8 @@ pub struct RuntimeServices {
     pub backend_context: BackendRuntimeContext,
     /// Confirmed local publisher for durable terminal envelopes.
     pub messaging: Arc<dyn edgecommons::messaging::MessagingService>,
+    /// Component metric service. Capture counts ride the job hooks; queue levels are sampled.
+    pub metrics: Arc<dyn edgecommons::metrics::MetricService>,
 }
 
 fn capture_trigger_type(trigger: &crate::messages::CaptureTrigger) -> &'static str {
@@ -1056,6 +1076,7 @@ impl CameraRuntime {
         spec: CaptureJobSpec,
         queue_position: usize,
     ) {
+        self.metrics.count("queued").await;
         let Some(events) = self.lifecycle_events(&spec.instance) else {
             return;
         };
@@ -1092,6 +1113,10 @@ impl CameraRuntime {
     }
 
     async fn emit_capture_started(&self, spec: CaptureJobSpec) {
+        // Counted before the early return below: whether a camera has an event facade installed says
+        // nothing about whether it is doing work, and a metric that quietly stops counting is worse
+        // than no metric.
+        self.metrics.count("started").await;
         let Some(events) = self.lifecycle_events(&spec.instance) else {
             return;
         };
@@ -1156,7 +1181,9 @@ impl CameraRuntime {
             readiness,
             backend_context,
             messaging,
+            metrics,
         } = services;
+        let metrics = Arc::new(crate::observability::CaptureMetrics::new(metrics));
         backend_context.validate_config(&config)?;
         let max_connection_attempts = config.global.limits.max_concurrent_connects;
         let storage_pressure = StoragePressureMonitor::new(
@@ -1214,6 +1241,7 @@ impl CameraRuntime {
             storage_pressure: Some(storage_pressure),
             storage_alarm: Arc::new(Mutex::new(StorageAlarmState::default())),
             readiness,
+            metrics,
             actors: Arc::new(RwLock::new(HashMap::new())),
             supervisor_cancellations: Arc::new(RwLock::new(HashMap::new())),
             supervisor_finished: Arc::new(RwLock::new(HashMap::new())),
@@ -1236,6 +1264,7 @@ impl CameraRuntime {
 
         runtime.refresh_storage_pressure().await;
         runtime.start_storage_pressure_monitor()?;
+        runtime.start_metric_sampler()?;
         runtime.recover_install_owned().await?;
         runtime.start_outbox(messaging)?;
         runtime.start_supervisors()?;
@@ -3573,6 +3602,76 @@ impl CameraRuntime {
             ));
         }
         Ok(())
+    }
+
+    /// Samples what the component is holding into the `camera_queue` metric.
+    ///
+    /// The counts in `camera_captures` say what has happened; this says what is happening. An
+    /// operator needs both: a fleet with a healthy success rate and a backlog that only grows is
+    /// failing, and the counters alone cannot show it.
+    fn start_metric_sampler(self: &Arc<Self>) -> Result<()> {
+        let runtime = Arc::clone(self);
+        let cancellation = self.cancellation.clone();
+        self.spawn_task(async move {
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => return,
+                    () = tokio::time::sleep(METRIC_SAMPLE_INTERVAL) => {}
+                }
+                let status = match runtime.queue_status(None).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "camera queue metrics could not be sampled");
+                        continue;
+                    }
+                };
+                let configured = status.cameras.len();
+                let online = runtime
+                    .registry
+                    .snapshots(configured.max(1))
+                    .map(|snapshots| {
+                        snapshots
+                            .into_iter()
+                            .filter(|snapshot| snapshot.state == CameraConnectionState::Online)
+                            .count()
+                    })
+                    .unwrap_or_default();
+                let mut values = std::collections::HashMap::new();
+                let mut put = |name: &str, value: f64| {
+                    values.insert(name.to_owned(), value);
+                };
+                #[allow(clippy::cast_precision_loss)]
+                // Counts and byte budgets; f64 is the metric wire type.
+                {
+                    put("dispatchQueued", status.dispatch_queued as f64);
+                    put("durableBacklog", status.durable_backlog as f64);
+                    put("durableInFlight", status.durable_in_flight as f64);
+                    put(
+                        "availableAcquisitions",
+                        status.admission.available_acquisitions as f64,
+                    );
+                    put(
+                        "availableEncoders",
+                        status.admission.available_encoders as f64,
+                    );
+                    put(
+                        "availableWriters",
+                        status.admission.available_writers as f64,
+                    );
+                    put(
+                        "availableMemoryBytes",
+                        status.admission.available_memory_bytes as f64,
+                    );
+                    put(
+                        "outstandingDiskBytes",
+                        status.admission.outstanding_disk_bytes as f64,
+                    );
+                    put("camerasOnline", online as f64);
+                    put("camerasConfigured", configured as f64);
+                }
+                runtime.metrics.sample_queue(values).await;
+            }
+        })
     }
 
     fn start_storage_pressure_monitor(self: &Arc<Self>) -> Result<()> {
@@ -6728,6 +6827,66 @@ mod tests {
 
         type RecordedMqttPublishes = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
+        /// Records what the component emits, so a test can assert that it emits anything at all.
+        ///
+        /// The camera adapter shipped with zero call sites for the metric subsystem, so the useful
+        /// assertion is not "the numbers are right" but "the wiring exists" -- a metric nobody emits
+        /// is indistinguishable from a metric that does not exist.
+        #[derive(Default)]
+        struct RecordingMetrics {
+            defined: Mutex<Vec<String>>,
+            emitted: Mutex<Vec<(String, std::collections::HashMap<String, f64>)>>,
+        }
+
+        impl RecordingMetrics {
+            fn counts(&self, metric: &str, measure: &str) -> f64 {
+                self.emitted
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(name, _)| name == metric)
+                    .filter_map(|(_, values)| values.get(measure))
+                    .sum()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl edgecommons::metrics::MetricService for RecordingMetrics {
+            fn define_metric(&self, metric: edgecommons::metrics::Metric) {
+                self.defined
+                    .lock()
+                    .unwrap()
+                    .push(metric.get_name().to_owned());
+            }
+
+            fn is_metric_defined(&self, name: &str) -> bool {
+                self.defined.lock().unwrap().iter().any(|held| held == name)
+            }
+
+            async fn emit_metric(
+                &self,
+                name: &str,
+                values: std::collections::HashMap<String, f64>,
+            ) -> edgecommons::Result<()> {
+                self.emitted.lock().unwrap().push((name.to_owned(), values));
+                Ok(())
+            }
+
+            async fn emit_metric_now(
+                &self,
+                name: &str,
+                values: std::collections::HashMap<String, f64>,
+            ) -> edgecommons::Result<()> {
+                self.emit_metric(name, values).await
+            }
+
+            async fn flush_metrics(&self) -> edgecommons::Result<()> {
+                Ok(())
+            }
+
+            async fn shutdown(&self) {}
+        }
+
         struct TestTerminalEncoder;
 
         impl crate::jobs::TerminalEnvelopeEncoder for TestTerminalEncoder {
@@ -6800,10 +6959,41 @@ mod tests {
             runtime_with_storage_pressure(config, directory, None).await
         }
 
+        /// Builds the test runtime and hands back the metric recorder wired into it.
+        async fn runtime_with_metrics(
+            config: AdapterConfig,
+            directory: &TempDir,
+        ) -> (Arc<CameraRuntime>, Arc<RecordingMetrics>) {
+            let recorder = Arc::new(RecordingMetrics::default());
+            let runtime = runtime_with_storage_pressure_and_metrics(
+                config,
+                directory,
+                None,
+                Arc::clone(&recorder) as Arc<dyn edgecommons::metrics::MetricService>,
+            )
+            .await;
+            (runtime, recorder)
+        }
+
         async fn runtime_with_storage_pressure(
             config: AdapterConfig,
             directory: &TempDir,
             storage_pressure: Option<StoragePressureMonitor>,
+        ) -> Arc<CameraRuntime> {
+            runtime_with_storage_pressure_and_metrics(
+                config,
+                directory,
+                storage_pressure,
+                Arc::new(RecordingMetrics::default()),
+            )
+            .await
+        }
+
+        async fn runtime_with_storage_pressure_and_metrics(
+            config: AdapterConfig,
+            directory: &TempDir,
+            storage_pressure: Option<StoragePressureMonitor>,
+            metrics: Arc<dyn edgecommons::metrics::MetricService>,
         ) -> Arc<CameraRuntime> {
             let state = directory.path().join("state");
             std::fs::create_dir_all(&state).unwrap();
@@ -6858,6 +7048,7 @@ mod tests {
                 storage_pressure,
                 storage_alarm: Arc::new(Mutex::new(StorageAlarmState::default())),
                 readiness: RuntimeReadiness::noop(),
+                metrics: Arc::new(crate::observability::CaptureMetrics::new(metrics)),
                 actors: Arc::new(RwLock::new(HashMap::new())),
                 supervisor_cancellations: Arc::new(RwLock::new(HashMap::new())),
                 supervisor_finished: Arc::new(RwLock::new(HashMap::new())),
@@ -10554,6 +10745,7 @@ mod tests {
                     apps,
                     events,
                     outbox_events: core.events(),
+                    metrics: Arc::new(RecordingMetrics::default()),
                     readiness: readiness.clone(),
                     backend_context: BackendRuntimeContext::new(
                         None,
@@ -12332,6 +12524,82 @@ mod tests {
                 1,
                 "the protocol session must be closed instead of leaked server-side"
             );
+        }
+
+        /// Q2: the component emitted no metrics at all.
+        ///
+        /// There was not one call site for `metrics()`, `MetricBuilder`, or `MetricService` anywhere
+        /// in the crate. Every number an operator would want -- what is queued, what is running, what
+        /// succeeded, what failed -- existed inside the process and left no trace outside it. A
+        /// failed capture was a log line.
+        ///
+        /// So the assertion that matters is not that the numbers are right, it is that the wiring
+        /// exists: a metric nobody emits is indistinguishable from a metric that does not exist, and
+        /// nothing in the build could tell the difference.
+        #[tokio::test]
+        async fn captures_are_counted_as_they_happen() {
+            let directory = TempDir::new().unwrap();
+            let (runtime, metrics) =
+                runtime_with_metrics(config(directory.path(), &["camera-a"], false), &directory)
+                    .await;
+
+            {
+                use edgecommons::metrics::MetricService as _;
+                assert!(
+                    metrics.is_metric_defined(crate::observability::CAPTURE_METRIC)
+                        && metrics.is_metric_defined(crate::observability::QUEUE_METRIC),
+                    "both metrics must be defined at startup, not on first use"
+                );
+            }
+
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "counted".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "counted-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let capture_id = match accepted {
+                crate::catalog::AcceptJobOutcome::Inserted(record) => record.capture_id,
+                other => panic!("expected a newly accepted capture, got {other:?}"),
+            };
+            let terminal = wait_for_terminal(&runtime, &capture_id).await;
+            assert_eq!(terminal.state, crate::model::JobState::Succeeded);
+
+            let counted = crate::observability::CAPTURE_METRIC;
+            assert_eq!(
+                metrics.counts(counted, "queued"),
+                1.0,
+                "an accepted capture must be counted when it is accepted"
+            );
+            assert_eq!(
+                metrics.counts(counted, "started"),
+                1.0,
+                "and again when it actually starts doing physical work"
+            );
+            assert_eq!(
+                metrics.counts(counted, "succeeded"),
+                1.0,
+                "and its outcome must be counted -- this is the number an operator watches"
+            );
+            assert_eq!(
+                metrics.counts(counted, "failed"),
+                0.0,
+                "a capture that succeeded must not also be counted as a failure"
+            );
+
+            runtime.shutdown().await;
         }
 
         /// Q3/Q4: the operator can finally SEE the queue, and drain it.

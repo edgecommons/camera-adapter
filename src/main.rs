@@ -104,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
             readiness: readiness.clone(),
             backend_context,
             messaging: gg.messaging()?,
+            metrics: gg.metrics(),
         },
     )
     .await?;
