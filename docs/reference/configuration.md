@@ -20,7 +20,7 @@ configuration, messaging, credentials, and platform fields follow the core schem
 | `state.resultRetentionHours` | 72 | Terminal ledger retention. |
 | `state.maxResultRecords` | 100000 | Soft cap for terminal records. |
 | `state.outboxRetentionHours` | 168 | Delivered outbox retention. |
-| `state.queuedRecoveryPolicy` | `requeue` | `requeue` valid work after restart or `interrupt` it. |
+| `state.queuedRecoveryPolicy` | `requeue` | What becomes of captures still queued when the component stopped. `requeue` puts them back on the queue, provided the capture had not yet reached a camera, its deadlines have not passed, and its camera is still configured, enabled, and on the same backend. `interrupt` retires them all with `PROCESS_INTERRUPTED`. Anything a camera had already started is retired either way. |
 | `limits.maxConnectedCameras` | 256 | Maximum enabled camera supervisors. |
 | `limits.maxConcurrentCaptures` | 32 | Captures the component runs at once, fleet-wide. A capture holds one of these from the moment a camera takes it until it is terminal. |
 | `limits.maxConcurrentEncodes` | `min(CPU,8)` | Global encoding concurrency. |

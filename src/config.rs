@@ -2180,6 +2180,30 @@ mod tests {
     fn group_schedule_validation_rejects_what_the_command_path_would_reject() {
         let cases: Vec<(&str, ConfigMutation, &str)> = vec![
             (
+                "a fleet backlog smaller than one camera is allowed to queue",
+                Box::new(|value| {
+                    value["component"]["global"]["limits"] = json!({
+                        "maxPendingCaptures": 2,
+                        "maxQueuedCapturesPerCamera": 4
+                    });
+                }),
+                "component.global.limits.maxPendingCaptures",
+            ),
+            (
+                "a fleet backlog of zero",
+                Box::new(|value| {
+                    value["component"]["global"]["limits"] = json!({ "maxPendingCaptures": 0 });
+                }),
+                "component.global.limits.maxPendingCaptures",
+            ),
+            (
+                "a queue wait of zero",
+                Box::new(|value| {
+                    value["component"]["global"]["limits"] = json!({ "maxQueueWaitMs": 0 });
+                }),
+                "component.global.limits.maxPendingCaptures",
+            ),
+            (
                 "a camera that is not declared anywhere",
                 Box::new(|value| {
                     value["component"]["global"]["captureGroupSchedules"][0]["instances"] =

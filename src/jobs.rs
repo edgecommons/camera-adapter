@@ -802,6 +802,57 @@ impl JobEngine {
             .await
     }
 
+    /// Puts a capture that was still waiting when the process died back on the queue.
+    ///
+    /// The durable record is the whole contract: the resolved profile, the intended output path, the
+    /// trigger, the deadlines and the correlation are all committed before a capture is ever exposed
+    /// to a camera, so a waiting capture can be rebuilt exactly rather than re-resolved against a
+    /// configuration that may have moved underneath it.
+    ///
+    /// Only a capture that has not yet touched a camera may come back this way. Anything that reached
+    /// `ACQUIRING` or beyond has side effects behind it and is interrupted instead -- a replay is not
+    /// a recovery.
+    pub async fn requeue_recovered(
+        &self,
+        dispatcher: &dyn CaptureDispatcher,
+        record: JobRecord,
+        resource_group: Option<String>,
+        group_size: Option<usize>,
+        priority: CapturePriority,
+    ) -> Result<JobRecord> {
+        if record.state != JobState::Queued || record.install_started {
+            return Err(CameraError::Catalog(
+                "only a QUEUED capture may be requeued after a restart".to_string(),
+            ));
+        }
+        let spec = spec_from_record(&record, resource_group, group_size)?;
+        let job = NewJob {
+            capture_id: record.capture_id.clone(),
+            instance: record.instance.clone(),
+            // The ledger row already exists and is not re-inserted; `queue_preaccepted` reads the
+            // durable record by capture id and never re-accepts it.
+            ledger_key: None,
+            canonical_request: record.canonical_request.clone(),
+            request_hash: record.request_hash,
+            effective_profile: record.effective_profile.clone(),
+            deadlines: record.deadlines.clone(),
+            trigger: record.trigger.clone(),
+            origin_correlation_id: record.origin_correlation_id.clone(),
+            intended_output: record.intended_output.clone(),
+            accepted_at_ms: record.accepted_at_ms,
+            group_id: record.group_id.clone(),
+        };
+        self.queue_preaccepted(
+            dispatcher,
+            JobSubmission {
+                job,
+                spec,
+                priority,
+            },
+        )
+        .await
+    }
+
     async fn interrupt_nonterminal(
         &self,
         record: JobRecord,
@@ -812,63 +863,8 @@ impl JobEngine {
                 "interruption recovery requires a non-terminal, non-install-owned job".to_string(),
             ));
         }
-        let profile: JobProfileSnapshot = serde_json::from_value(record.effective_profile.clone())
-            .map_err(|_| {
-                CameraError::Catalog("recovery record has an invalid effective profile".to_string())
-            })?;
-        let trigger: CaptureTrigger =
-            serde_json::from_value(record.trigger.clone()).map_err(|_| {
-                CameraError::Catalog("recovery record has an invalid capture trigger".to_string())
-            })?;
-        let metadata = record
-            .canonical_request
-            .get("metadata")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|_| {
-                CameraError::Catalog("recovery record has invalid capture metadata".to_string())
-            })?
-            .unwrap_or_default();
-        let backend = record
-            .intended_output
-            .get("backend")
-            .and_then(Value::as_str)
-            .and_then(|value| serde_json::from_value(Value::String(value.to_owned())).ok())
-            .ok_or_else(|| {
-                CameraError::Catalog("recovery record lacks a valid backend kind".to_string())
-            })?;
-        let relative_path = record
-            .intended_output
-            .get("relativePath")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                CameraError::Catalog("recovery record lacks relativePath".to_string())
-            })?;
-        let group_size = record.group_id.as_ref().map(|_| 1_usize);
-        let spec = CaptureJobSpec {
-            capture_id: record.capture_id.clone(),
-            instance: record.instance.clone(),
-            profile,
-            resource_group: None,
-            relative_path: RelativeOutputPath::from_stored(relative_path)?,
-            deadlines: record.deadlines.clone(),
-            accepted_at_ms: record.accepted_at_ms,
-            trigger,
-            correlation_id: record
-                .origin_correlation_id
-                .clone()
-                .unwrap_or_else(|| record.capture_id.clone()),
-            metadata,
-            camera: CameraSummary {
-                backend,
-                vendor: None,
-                model: None,
-                firmware: None,
-                serial: None,
-            },
-            group_size,
-        };
+        let spec = spec_from_record(&record, None, record.group_id.as_ref().map(|_| 1_usize))?;
+        let backend = spec.camera.backend;
         let runtime = Arc::new(JobRuntime {
             deadlines: RwLock::new(spec.deadlines.clone()),
             rebased: Notify::new(),
@@ -1717,6 +1713,71 @@ impl JobEngine {
             result = &mut future => result,
         }
     }
+}
+
+/// Rebuilds a capture's immutable execution snapshot from its durable record.
+///
+/// Everything a capture needs to run is committed before it is exposed to a camera, so a record is
+/// sufficient to reconstruct it. Nothing here consults the live configuration: a capture runs under
+/// the contract it was accepted with, or it does not run at all.
+fn spec_from_record(
+    record: &JobRecord,
+    resource_group: Option<String>,
+    group_size: Option<usize>,
+) -> Result<CaptureJobSpec> {
+    let profile: JobProfileSnapshot = serde_json::from_value(record.effective_profile.clone())
+        .map_err(|_| {
+            CameraError::Catalog("recovery record has an invalid effective profile".to_string())
+        })?;
+    let trigger: CaptureTrigger = serde_json::from_value(record.trigger.clone()).map_err(|_| {
+        CameraError::Catalog("recovery record has an invalid capture trigger".to_string())
+    })?;
+    let metadata = record
+        .canonical_request
+        .get("metadata")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| {
+            CameraError::Catalog("recovery record has invalid capture metadata".to_string())
+        })?
+        .unwrap_or_default();
+    let backend = record
+        .intended_output
+        .get("backend")
+        .and_then(Value::as_str)
+        .and_then(|value| serde_json::from_value(Value::String(value.to_owned())).ok())
+        .ok_or_else(|| {
+            CameraError::Catalog("recovery record lacks a valid backend kind".to_string())
+        })?;
+    let relative_path = record
+        .intended_output
+        .get("relativePath")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CameraError::Catalog("recovery record lacks relativePath".to_string()))?;
+    Ok(CaptureJobSpec {
+        capture_id: record.capture_id.clone(),
+        instance: record.instance.clone(),
+        profile,
+        resource_group,
+        relative_path: RelativeOutputPath::from_stored(relative_path)?,
+        deadlines: record.deadlines.clone(),
+        accepted_at_ms: record.accepted_at_ms,
+        trigger,
+        correlation_id: record
+            .origin_correlation_id
+            .clone()
+            .unwrap_or_else(|| record.capture_id.clone()),
+        metadata,
+        camera: CameraSummary {
+            backend,
+            vendor: None,
+            model: None,
+            firmware: None,
+            serial: None,
+        },
+        group_size,
+    })
 }
 
 fn validate_submission(submission: &JobSubmission) -> Result<()> {

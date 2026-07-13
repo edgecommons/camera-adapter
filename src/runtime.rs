@@ -1044,6 +1044,28 @@ fn capture_mode_type(mode: crate::model::CaptureMode) -> &'static str {
     }
 }
 
+/// What a capture needs from the live configuration in order to resume after a restart.
+struct ResumableCapture {
+    resource_group: Option<String>,
+    group_size: Option<usize>,
+    priority: crate::admission::CapturePriority,
+}
+
+/// The queue priority a recovered capture returns with.
+///
+/// Taken from the durable record, so a capture keeps the place it was originally given rather than
+/// being demoted for having survived a restart.
+fn recovered_priority(record: &crate::catalog::JobRecord) -> crate::admission::CapturePriority {
+    match record.verb.as_deref() {
+        Some("sb/capture" | "sb/capture-group") => crate::admission::CapturePriority::Direct,
+        Some("sb/capture-submit" | "sb/capture-group-submit") => {
+            crate::admission::CapturePriority::Submitted
+        }
+        // No verb means no command ledger, which means a schedule fired it.
+        _ => crate::admission::CapturePriority::Scheduled,
+    }
+}
+
 impl CameraRuntime {
     fn config_snapshot(&self) -> Result<AdapterConfig> {
         self.config
@@ -5086,6 +5108,9 @@ impl CameraRuntime {
         // A PERSISTING record whose install CAS won has a fully staged success envelope and can
         // be reconciled without reconnecting any camera.  Other active states need a fresh
         // command/runtime recovery policy; never quietly drop them during startup.
+        let policy = self.config_snapshot()?.global.state.queued_recovery_policy;
+        let mut requeued = 0_usize;
+        let mut interrupted = 0_usize;
         for record in self.catalog.recovery_jobs().await? {
             let engine = self.engine(&record.instance)?;
             if record.install_started {
@@ -5093,11 +5118,132 @@ impl CameraRuntime {
                 engine
                     .recover_install_started(record, &cancellation)
                     .await?;
-            } else {
-                engine.interrupt_recovered(record).await?;
+                continue;
             }
+            let resumable = if policy == crate::config::QueuedRecoveryPolicy::Requeue {
+                self.resumable_after_restart(&record).await?
+            } else {
+                None
+            };
+            if let Some(resumable) = resumable {
+                let capture = record.capture_id.clone();
+                let instance = record.instance.clone();
+                match engine
+                    .requeue_recovered(
+                        &self.scheduler,
+                        record,
+                        resumable.resource_group,
+                        resumable.group_size,
+                        resumable.priority,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        requeued += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        // The capture could not be put back -- most likely the fleet queue is full of
+                        // work recovered before it. It must still be retired, not left QUEUED with
+                        // nothing to drive it, so it falls through to the interrupt below.
+                        tracing::warn!(
+                            instance = %instance,
+                            capture = %capture,
+                            error = %error,
+                            "a waiting capture could not be requeued after the restart and is interrupted"
+                        );
+                        let Some(record) = self.catalog.job(&capture).await? else {
+                            continue;
+                        };
+                        if record.state.is_terminal() {
+                            continue;
+                        }
+                        engine.interrupt_recovered(record).await?;
+                        interrupted += 1;
+                        continue;
+                    }
+                }
+            }
+            engine.interrupt_recovered(record).await?;
+            interrupted += 1;
+        }
+        if requeued > 0 || interrupted > 0 {
+            tracing::info!(
+                requeued,
+                interrupted,
+                policy = ?policy,
+                "captures left waiting by the previous run were recovered"
+            );
         }
         Ok(())
+    }
+
+    /// Decides whether a capture that was still waiting when the process died may simply resume.
+    ///
+    /// The rule is DESIGN §17.1: *"For `QUEUED` jobs, requeue only when `queuedRecoveryPolicy =
+    /// requeue`, the queue deadline has not expired, and the snapshotted camera/profile can still
+    /// run."* `Some` means resume; `None` means it is not the same piece of work any more and is
+    /// retired with `PROCESS_INTERRUPTED`, like everything else the restart caught mid-flight.
+    ///
+    /// * **`QUEUED` only.** An `ACCEPTED` capture never completed its durable queue transition, and
+    ///   §17.1 retires it; anything at `ACQUIRING` or beyond has side effects behind it, and a replay
+    ///   is not a recovery.
+    /// * **The queue deadline must still be ahead** -- the capture's own bound on how long it was
+    ///   willing to wait, which a restart does not get to extend.
+    /// * **The terminal deadline must still be ahead too.** This is stricter than §17.1 asks, and
+    ///   deliberately so: a capture with no `queueExpiryMs` has no queue deadline at all, and stage
+    ///   clocks are now rebased when a camera takes the capture -- so without this an image requested
+    ///   hours before the crash would come back with a fresh clock and be taken for a live request.
+    /// * **The camera must still be the same device** -- configured, enabled, and on the backend the
+    ///   capture was accepted for. The durable profile is the contract, and a camera that has become
+    ///   something else does not get to honour it.
+    async fn resumable_after_restart(
+        &self,
+        record: &crate::catalog::JobRecord,
+    ) -> Result<Option<ResumableCapture>> {
+        if record.state != crate::model::JobState::Queued {
+            return Ok(None);
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if record
+            .deadlines
+            .queue_at_ms
+            .is_some_and(|queue_at_ms| queue_at_ms <= now_ms)
+        {
+            return Ok(None);
+        }
+        if record.deadlines.terminal_at_ms <= now_ms {
+            return Ok(None);
+        }
+        let Ok(camera) = self.registry.camera_config(&record.instance) else {
+            return Ok(None);
+        };
+        if !camera.enabled {
+            return Ok(None);
+        }
+        let accepted_backend = record
+            .intended_output
+            .get("backend")
+            .and_then(serde_json::Value::as_str);
+        if accepted_backend != Some(camera.backend.kind().as_str()) {
+            return Ok(None);
+        }
+        // A group member must carry its real group size: the runtime snapshot is rejected without
+        // it, and the terminal envelope reports it.
+        let group_size = match record.group_id.as_ref() {
+            Some(group_id) => {
+                let Some(group) = self.catalog.group(group_id.clone()).await? else {
+                    return Ok(None);
+                };
+                Some(group.members.len())
+            }
+            None => None,
+        };
+        Ok(Some(ResumableCapture {
+            resource_group: camera.resource_group.clone(),
+            group_size,
+            priority: recovered_priority(record),
+        }))
     }
 
     async fn run_supervisor(
@@ -8119,8 +8265,609 @@ mod tests {
             runtime.shutdown().await;
         }
 
+        /// A requeued capture is not just re-listed -- it actually runs.
+        ///
+        /// Putting the row back on the queue is half a promise. The other half is that a camera
+        /// picks it up and it reaches a terminal state of its own, which is the whole point of
+        /// recovering it rather than interrupting it.
         #[tokio::test]
-        async fn startup_recovery_interrupts_pending_jobs_and_fences_hazardous_commands() {
+        async fn a_capture_requeued_after_a_restart_actually_runs() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-b"], false);
+            let runtime = runtime(configuration.clone(), &directory).await;
+
+            let pending = queued_job(&configuration, "cap-requeue-runs");
+            runtime.catalog.accept_job(pending).await.unwrap();
+            runtime
+                .catalog
+                .queue_job("cap-requeue-runs", chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap();
+
+            runtime.recover_install_owned().await.unwrap();
+            assert_eq!(runtime.scheduler.pending(), 1);
+
+            runtime
+                .start_supervisor("camera-b".to_string(), runtime.engine("camera-b").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-b").await;
+
+            let record =
+                wait_for_terminal_within(&runtime, "cap-requeue-runs", Duration::from_secs(20))
+                    .await;
+            assert_eq!(
+                record.state,
+                crate::model::JobState::Succeeded,
+                "the capture the previous run could not get to must complete on this one"
+            );
+            runtime.shutdown().await;
+        }
+
+        /// A capture that cannot be put back is retired -- never left QUEUED with nothing to drive it.
+        ///
+        /// Recovery can run out of queue before it runs out of captures. The tempting thing is to log
+        /// and move on, which leaves a durable `QUEUED` row that no scheduler holds and no deadline
+        /// task watches -- the exact stranded-capture shape this whole branch exists to prevent. So a
+        /// capture that cannot be requeued falls through to being interrupted instead.
+        #[tokio::test]
+        async fn a_capture_that_cannot_be_requeued_is_interrupted_rather_than_stranded() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-b"], false);
+            // Room for exactly one waiting capture, fleet-wide.
+            configuration.global.limits.max_pending_captures = 1;
+            configuration.global.limits.max_queued_captures_per_camera = 1;
+            let runtime = runtime(configuration.clone(), &directory).await;
+
+            for (capture, request) in [
+                ("cap-refill-1", "refill-request-1"),
+                ("cap-refill-2", "refill-request-2"),
+            ] {
+                // The shared fixture pins one ledger key; two captures need two.
+                let mut pending = queued_job(&configuration, capture);
+                pending.ledger_key = Some(
+                    crate::catalog::LedgerKey::new("camera-b", "sb/capture", request).unwrap(),
+                );
+                pending.trigger = serde_json::to_value(crate::messages::CaptureTrigger::Command {
+                    request_id: request.to_string(),
+                })
+                .unwrap();
+                runtime.catalog.accept_job(pending).await.unwrap();
+                runtime
+                    .catalog
+                    .queue_job(capture, chrono::Utc::now().timestamp_millis())
+                    .await
+                    .unwrap();
+            }
+
+            runtime.recover_install_owned().await.unwrap();
+
+            let states = [
+                runtime
+                    .catalog
+                    .job("cap-refill-1")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                runtime
+                    .catalog
+                    .job("cap-refill-2")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+            ];
+            tracing::error!(
+                "DIAG states={:?} pending={}",
+                states,
+                runtime.scheduler.pending()
+            );
+            assert_eq!(
+                runtime.scheduler.pending(),
+                1,
+                "the queue holds exactly what it has room for"
+            );
+            assert!(
+                states.contains(&crate::model::JobState::Queued),
+                "the capture that fit must be requeued: {states:?}"
+            );
+            assert!(
+                states.contains(&crate::model::JobState::Interrupted),
+                "the capture that did not fit must be retired, not left QUEUED with nothing to drive \
+                 it: {states:?}"
+            );
+            runtime.shutdown().await;
+        }
+
+        /// A group left waiting by the previous run comes back whole -- and runs.
+        ///
+        /// The durable rows are built here and no descriptor is ever registered in memory, which is
+        /// exactly the state a restart leaves behind: the catalog remembers the group, the process
+        /// that accepted it does not.
+        ///
+        /// The group SIZE is what earns this test its place. A member's runtime snapshot is rejected
+        /// outright unless it carries the real size of the group it belongs to, so a recovery that
+        /// guessed -- or that reused the interrupt path's placeholder of one -- would fail to requeue
+        /// every group member it ever touched, and quietly interrupt them all instead.
+        #[tokio::test]
+        async fn a_group_left_waiting_by_the_previous_run_is_requeued_whole() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+            let runtime = runtime(configuration.clone(), &directory).await;
+
+            let group_id = "grp_restart";
+            let canonical = json!({ "requestId": "group-across-restart", "metadata": {} });
+            let request_hash =
+                crate::idempotency::canonical_request_hash(&canonical, true).unwrap();
+            let members: Vec<crate::catalog::NewJob> = ["camera-a", "camera-b"]
+                .iter()
+                .enumerate()
+                .map(|(index, instance)| {
+                    let mut member =
+                        queued_job(&configuration, &format!("cap-group-restart-{index}"));
+                    member.instance = (*instance).to_string();
+                    member.ledger_key = None;
+                    member.group_id = Some(group_id.to_string());
+                    member.trigger =
+                        serde_json::to_value(crate::messages::CaptureTrigger::GroupCommand {
+                            request_id: "group-across-restart".to_string(),
+                            capture_group_id: group_id.to_string(),
+                        })
+                        .unwrap();
+                    member.intended_output = json!({
+                        "relativePath": format!("{instance}/cap-{index}.jpg"),
+                        "backend": "sim"
+                    });
+                    member
+                })
+                .collect();
+
+            runtime
+                .catalog
+                .accept_group(crate::catalog::NewGroup {
+                    group_id: group_id.to_string(),
+                    ledger_key: crate::catalog::LedgerKey::new(
+                        "main",
+                        "sb/capture-group",
+                        "group-across-restart",
+                    )
+                    .unwrap(),
+                    canonical_request: canonical,
+                    request_hash,
+                    origin_correlation_id: Some("restart-correlation".to_string()),
+                    accepted_at_ms: chrono::Utc::now().timestamp_millis(),
+                    members,
+                })
+                .await
+                .unwrap();
+            runtime
+                .catalog
+                .queue_group(group_id.to_string(), chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap();
+            assert_eq!(
+                runtime.scheduler.pending(),
+                0,
+                "the durable group exists; nothing is holding it in memory"
+            );
+
+            runtime.recover_install_owned().await.unwrap();
+            assert_eq!(
+                runtime.scheduler.pending(),
+                2,
+                "both members of the waiting group must be requeued -- a wrong group size would \
+                 interrupt them all instead"
+            );
+
+            for camera in ["camera-a", "camera-b"] {
+                runtime
+                    .start_supervisor(camera.to_string(), runtime.engine(camera).unwrap())
+                    .unwrap();
+                wait_for_online(&runtime, camera).await;
+            }
+
+            let terminal =
+                wait_for_group_terminal_within(&runtime, group_id, Duration::from_secs(20)).await;
+            assert_eq!(terminal.members.len(), 2);
+            assert!(
+                terminal
+                    .members
+                    .iter()
+                    .all(|member| member.state == crate::model::JobState::Succeeded),
+                "a group interrupted by a restart must complete on the next run: {:?}",
+                terminal
+                    .members
+                    .iter()
+                    .map(|member| member.state)
+                    .collect::<Vec<_>>()
+            );
+            runtime.shutdown().await;
+        }
+
+        /// A recovered capture keeps the place it was originally given.
+        ///
+        /// Priority is read back from the durable record, not reset: a direct capture that a caller
+        /// was waiting on does not get demoted behind a batch of scheduled work for the crime of
+        /// having survived a restart.
+        #[tokio::test]
+        async fn a_recovered_capture_keeps_its_original_priority() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-b"], false);
+            let runtime = runtime(configuration.clone(), &directory).await;
+            runtime
+                .catalog
+                .accept_job(queued_job(&configuration, "cap-priority"))
+                .await
+                .unwrap();
+            let mut record = runtime.catalog.job("cap-priority").await.unwrap().unwrap();
+
+            record.verb = Some("sb/capture".to_string());
+            assert_eq!(
+                recovered_priority(&record),
+                crate::admission::CapturePriority::Direct
+            );
+            record.verb = Some("sb/capture-submit".to_string());
+            assert_eq!(
+                recovered_priority(&record),
+                crate::admission::CapturePriority::Submitted
+            );
+            record.verb = Some("sb/capture-group".to_string());
+            assert_eq!(
+                recovered_priority(&record),
+                crate::admission::CapturePriority::Direct
+            );
+            record.verb = None;
+            assert_eq!(
+                recovered_priority(&record),
+                crate::admission::CapturePriority::Scheduled,
+                "no command ledger means a schedule fired it"
+            );
+            runtime.shutdown().await;
+        }
+
+        /// A group member requeued without its group is refused, and so is the reverse.
+        ///
+        /// This is the guard that makes the group size load-bearing rather than cosmetic: a member
+        /// whose snapshot does not agree with its durable group row is rejected outright. It is the
+        /// reason recovery has to look the size up instead of assuming one, and the reason a wrong
+        /// answer would have interrupted every group member instead of quietly capturing a half-group.
+        #[tokio::test]
+        async fn a_requeued_snapshot_must_agree_with_the_durable_group() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+            let runtime = runtime(configuration.clone(), &directory).await;
+
+            // A group member, durably.
+            let group_id = "grp_snapshot";
+            let canonical = json!({ "requestId": "snapshot-group", "metadata": {} });
+            let mut member = queued_job(&configuration, "cap-snapshot-member");
+            member.ledger_key = None;
+            member.group_id = Some(group_id.to_string());
+            member.trigger = serde_json::to_value(crate::messages::CaptureTrigger::GroupCommand {
+                request_id: "snapshot-group".to_string(),
+                capture_group_id: group_id.to_string(),
+            })
+            .unwrap();
+            let mut second = member.clone();
+            second.capture_id = "cap-snapshot-member-2".to_string();
+            second.instance = "camera-a".to_string();
+            second.intended_output =
+                json!({ "relativePath": "camera-a/two.jpg", "backend": "sim" });
+
+            runtime
+                .catalog
+                .accept_group(crate::catalog::NewGroup {
+                    group_id: group_id.to_string(),
+                    ledger_key: crate::catalog::LedgerKey::new(
+                        "main",
+                        "sb/capture-group",
+                        "snapshot-group",
+                    )
+                    .unwrap(),
+                    canonical_request: canonical.clone(),
+                    request_hash: crate::idempotency::canonical_request_hash(&canonical, true)
+                        .unwrap(),
+                    origin_correlation_id: Some("snapshot-correlation".to_string()),
+                    accepted_at_ms: chrono::Utc::now().timestamp_millis(),
+                    members: vec![member, second],
+                })
+                .await
+                .unwrap();
+            runtime
+                .catalog
+                .queue_group(group_id.to_string(), chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap();
+
+            let record = runtime
+                .catalog
+                .job("cap-snapshot-member")
+                .await
+                .unwrap()
+                .unwrap();
+            let engine = runtime.engine("camera-b").unwrap();
+
+            // A group member with no group size is not a group member.
+            let error = engine
+                .requeue_recovered(
+                    &runtime.scheduler,
+                    record.clone(),
+                    None,
+                    None,
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .expect_err("a group member must carry the size of the group it belongs to");
+            assert!(
+                error
+                    .to_string()
+                    .contains("group runtime snapshot is inconsistent"),
+                "the group snapshot guard must be what rejects it, not something upstream: {error}"
+            );
+
+            // And a size that does not match a group of two is equally wrong.
+            let error = engine
+                .requeue_recovered(
+                    &runtime.scheduler,
+                    record,
+                    None,
+                    Some(1),
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .expect_err("a group of one is not a group");
+            assert!(
+                error
+                    .to_string()
+                    .contains("group runtime snapshot is inconsistent"),
+                "{error}"
+            );
+            assert_eq!(runtime.scheduler.pending(), 0);
+            runtime.shutdown().await;
+        }
+
+        /// The requeue entry point refuses anything that is not simply waiting.
+        ///
+        /// The state check is not decoration: a capture past `QUEUED` has already reached for a
+        /// camera, and putting it back on the queue would replay it.
+        #[tokio::test]
+        async fn requeue_refuses_a_capture_that_is_not_merely_queued() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-b"], false);
+            let runtime = runtime(configuration.clone(), &directory).await;
+
+            let pending = queued_job(&configuration, "cap-not-queued");
+            runtime.catalog.accept_job(pending).await.unwrap();
+            let accepted = runtime
+                .catalog
+                .job("cap-not-queued")
+                .await
+                .unwrap()
+                .unwrap();
+
+            let error = runtime
+                .engine("camera-b")
+                .unwrap()
+                .requeue_recovered(
+                    &runtime.scheduler,
+                    accepted,
+                    None,
+                    None,
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .expect_err("an ACCEPTED capture never reached the queue and cannot return to it");
+            assert!(matches!(error, crate::CameraError::Catalog(_)));
+            assert_eq!(runtime.scheduler.pending(), 0);
+            runtime.shutdown().await;
+        }
+
+        /// An ACCEPTED capture is retired, not resumed -- DESIGN §17.1(2).
+        ///
+        /// Acceptance never completed its durable queue transition, so the capture was never really
+        /// waiting: it was mid-commit. Only `QUEUED` work comes back.
+        #[tokio::test]
+        async fn an_accepted_capture_is_interrupted_rather_than_requeued() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-b"], false);
+            let runtime = runtime(configuration.clone(), &directory).await;
+
+            // Accepted, and never queued.
+            let pending = queued_job(&configuration, "cap-accepted-only");
+            runtime.catalog.accept_job(pending).await.unwrap();
+
+            runtime.recover_install_owned().await.unwrap();
+
+            let record = runtime
+                .catalog
+                .job("cap-accepted-only")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                record.state,
+                crate::model::JobState::Interrupted,
+                "acceptance that never reached the queue is not queued work"
+            );
+            assert_eq!(runtime.scheduler.pending(), 0);
+            runtime.shutdown().await;
+        }
+
+        /// A capture whose queue deadline expired while the process was down is retired -- §17.1(3).
+        ///
+        /// `queueExpiryMs` is the capture's own statement of how long it was prepared to wait. A
+        /// restart does not get to extend it.
+        #[tokio::test]
+        async fn a_capture_whose_queue_deadline_expired_is_not_requeued() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-b"], false);
+            let runtime = runtime(configuration.clone(), &directory).await;
+
+            let mut waited_too_long = queued_job(&configuration, "cap-queue-expired");
+            let now = chrono::Utc::now().timestamp_millis();
+            // The terminal clock is still ahead; only the queue bound has run out, so this test
+            // fails if the queue deadline is not being consulted.
+            waited_too_long.deadlines.queue_at_ms = Some(now - 1_000);
+            waited_too_long.deadlines.terminal_at_ms = now + 600_000;
+            runtime.catalog.accept_job(waited_too_long).await.unwrap();
+            runtime
+                .catalog
+                .queue_job("cap-queue-expired", now)
+                .await
+                .unwrap();
+
+            runtime.recover_install_owned().await.unwrap();
+
+            let record = runtime
+                .catalog
+                .job("cap-queue-expired")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, crate::model::JobState::Interrupted);
+            assert_eq!(
+                runtime.scheduler.pending(),
+                0,
+                "a capture that already waited longer than it agreed to is not requeued"
+            );
+            runtime.shutdown().await;
+        }
+
+        /// `queuedRecoveryPolicy: interrupt` still interrupts.
+        ///
+        /// The knob was parsed, validated, and read by nothing at all -- the component always
+        /// interrupted, whatever the operator asked for. Both branches are now real, and this pins
+        /// the one that is no longer the default.
+        #[tokio::test]
+        async fn the_interrupt_recovery_policy_retires_waiting_work_instead() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-b"], false);
+            configuration.global.state.queued_recovery_policy =
+                crate::config::QueuedRecoveryPolicy::Interrupt;
+            let runtime = runtime(configuration.clone(), &directory).await;
+
+            let pending = queued_job(&configuration, "cap-interrupt-policy");
+            runtime.catalog.accept_job(pending).await.unwrap();
+            runtime
+                .catalog
+                .queue_job(
+                    "cap-interrupt-policy",
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .unwrap();
+
+            runtime.recover_install_owned().await.unwrap();
+
+            let record = runtime
+                .catalog
+                .job("cap-interrupt-policy")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, crate::model::JobState::Interrupted);
+            assert_eq!(
+                record.error_code.as_deref(),
+                Some(crate::ErrorCode::ProcessInterrupted.as_str())
+            );
+            assert_eq!(
+                runtime.scheduler.pending(),
+                0,
+                "an interrupted capture must not also be queued"
+            );
+            runtime.shutdown().await;
+        }
+
+        /// A capture whose deadline ran out while the process was down is retired, not resurrected.
+        ///
+        /// Recovering waiting work must not mean running an image request that expired hours ago.
+        /// The capture was not interrupted -- it EXPIRED -- and the honest terminal for it is a
+        /// terminal, not a place in the queue.
+        #[tokio::test]
+        async fn a_capture_whose_deadline_passed_while_the_process_was_down_is_not_resurrected() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-b"], false);
+            let runtime = runtime(configuration.clone(), &directory).await;
+
+            let mut expired = queued_job(&configuration, "cap-expired-while-down");
+            let long_ago = chrono::Utc::now().timestamp_millis() - 3_600_000;
+            expired.accepted_at_ms = long_ago;
+            expired.deadlines = crate::catalog::JobDeadlines {
+                terminal_at_ms: long_ago + 1_000,
+                queue_at_ms: None,
+                capture_at_ms: long_ago + 500,
+                encode_at_ms: long_ago + 500,
+                persist_at_ms: long_ago + 500,
+            };
+            runtime.catalog.accept_job(expired).await.unwrap();
+            runtime
+                .catalog
+                .queue_job(
+                    "cap-expired-while-down",
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .unwrap();
+
+            runtime.recover_install_owned().await.unwrap();
+
+            let record = runtime
+                .catalog
+                .job("cap-expired-while-down")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, crate::model::JobState::Interrupted);
+            assert_eq!(
+                runtime.scheduler.pending(),
+                0,
+                "an image requested an hour ago and already past its deadline is not work to resume"
+            );
+            runtime.shutdown().await;
+        }
+
+        /// A capture whose camera has become a different device is retired, not resumed.
+        ///
+        /// The durable profile is the contract the capture was accepted under. A camera that is no
+        /// longer configured -- or that is now a different backend entirely -- does not get to
+        /// honour it, so the capture is interrupted exactly as a reload interrupts incompatible work.
+        #[tokio::test]
+        async fn a_capture_whose_camera_is_gone_is_not_resumed() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+            let runtime = runtime(configuration.clone(), &directory).await;
+
+            let pending = queued_job(&configuration, "cap-camera-gone");
+            runtime.catalog.accept_job(pending).await.unwrap();
+            runtime
+                .catalog
+                .queue_job("cap-camera-gone", chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap();
+
+            // camera-b is no longer configured on this run.
+            let replacement = config(directory.path(), &["camera-a"], false);
+            *runtime.config.write().unwrap() = replacement.clone();
+            runtime
+                .registry
+                .apply_validated_config(&replacement)
+                .expect("the registry accepts a config without camera-b");
+
+            runtime.recover_install_owned().await.unwrap();
+
+            let record = runtime
+                .catalog
+                .job("cap-camera-gone")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.state, crate::model::JobState::Interrupted);
+            assert_eq!(runtime.scheduler.pending(), 0);
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn startup_recovery_requeues_waiting_work_and_fences_hazardous_commands() {
             let directory = TempDir::new().unwrap();
             let configuration = config(directory.path(), &["camera-b"], false);
             let runtime = runtime(configuration.clone(), &directory).await;
@@ -8168,19 +8915,23 @@ mod tests {
 
             runtime.recover_install_owned().await.unwrap();
 
+            // A capture that was only ever WAITING has no side effects behind it, and
+            // `queuedRecoveryPolicy` defaults to `requeue`: it goes back on the fleet queue and is
+            // still owed a run, rather than being killed for having outlived the process.
             let recovered = runtime
                 .catalog
                 .job("cap-startup-recovery")
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(recovered.state, crate::model::JobState::Interrupted);
+            assert_eq!(recovered.state, crate::model::JobState::Queued);
+            assert!(recovered.terminal_result.is_none());
             assert_eq!(
-                recovered.error_code.as_deref(),
-                Some(crate::ErrorCode::ProcessInterrupted.as_str())
+                runtime.scheduler.pending(),
+                1,
+                "a requeued capture must be back in the fleet queue, not merely left QUEUED in the \
+                 catalog with nothing to drive it"
             );
-            assert!(recovered.terminal_result.is_some());
-            assert!(runtime.catalog.recovery_jobs().await.unwrap().is_empty());
 
             let replay = runtime
                 .catalog
