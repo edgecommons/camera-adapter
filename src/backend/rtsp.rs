@@ -1749,6 +1749,20 @@ impl Drop for GstreamerDecoder {
     }
 }
 
+/// Whether decoding this access unit can still serve somebody.
+///
+/// `interest_at` is the instant of the most recent capture request (a capture accepts only a frame
+/// with `ingested_at >= ready_at`, and `ready_at` *is* the interest instant), and `delivered_at` is
+/// the ingest instant of the newest frame the worker has published, or `None` if it has published
+/// none. A frame decoded when nobody is waiting cannot satisfy the next capture either -- that
+/// capture will demand a frame ingested after *it* arrived -- so the decode is pure waste.
+///
+/// Kept outside `cfg(feature = "rtsp")` on purpose: this is the predicate that decides whether the
+/// component burns a decode permit, and it should be provable without GStreamer installed.
+fn capture_is_waiting(interest_at: Instant, delivered_at: Option<Instant>) -> bool {
+    delivered_at.is_none_or(|delivered| interest_at > delivered)
+}
+
 #[cfg(feature = "rtsp")]
 async fn create_decoder_bounded(
     codec: RtspCodec,
@@ -3108,6 +3122,11 @@ async fn run_rtsp_worker(
     )
     .await?;
     let mut assembler = AccessUnitAssembler::new(&track, maximum_frame_bytes)?;
+    // The ingest instant of the newest frame this worker has published, or `None` while it has
+    // published nothing. A capture accepts a frame only when `ingested_at >= ready_at` and
+    // `ready_at` is exactly the interest instant, so this is all that is needed to answer "is
+    // anybody still waiting for a frame?" -- see `capture` above.
+    let mut delivered_at: Option<Instant> = None;
     let run_result = async {
         loop {
             let operation_deadline = match session_policy {
@@ -3150,6 +3169,25 @@ async fn run_rtsp_worker(
             if unit.dimensions.is_none() {
                 continue;
             }
+            // Decode only while a capture is actually waiting.
+            //
+            // A warm worker holds the RTSP session open for 30 s after the last capture, and it
+            // used to decode every assembled access unit for that whole window -- 25 frames a
+            // second, per camera, each one taking a permit from the component-wide decode gate.
+            // None of those frames can ever satisfy a capture: `capture` requires
+            // `ingested_at >= ready_at`, so a frame decoded before the next request arrives is
+            // discarded on sight. It was pure waste, and it was waste that crowded real captures
+            // out of the gate; a dozen warm cameras could starve the capture path outright.
+            //
+            // Skipping the decode leaves the GStreamer decoder without the intervening reference
+            // frames, so on the next capture it emits nothing until the stream's next IDR --
+            // `push_and_pull` already reports that as `Ok(None)` and the loop simply waits. A warm
+            // capture therefore costs up to one GOP rather than one frame. That is the deliberate
+            // trade: warm sessions keep the expensive things (the RTSP session, the negotiated
+            // track, the built pipeline) and stop paying to decode pictures nobody asked for.
+            if !capture_is_waiting(*interest.borrow(), delivered_at) {
+                continue;
+            }
             let ingested_at = Instant::now();
             let Some(frame) = decode_bounded(
                 Arc::clone(&decoder),
@@ -3178,6 +3216,7 @@ async fn run_rtsp_worker(
                     incomplete_units: assembler.incomplete_units,
                 }),
             });
+            delivered_at = Some(ingested_at);
         }
     }
     .await;
@@ -3262,6 +3301,37 @@ mod tests {
         Arc::new(Semaphore::new(
             crate::config::LimitsConfig::default().max_concurrent_captures,
         ))
+    }
+
+    /// A warm worker must stop decoding once the capture that asked for a frame has been served.
+    ///
+    /// It used to decode every access unit for the whole 30 s warm window -- 25 frames a second per
+    /// camera, every one of them taking a permit from the component-wide decode gate, and every one
+    /// of them discarded, because the next capture will only accept a frame ingested after that
+    /// capture arrived. A dozen warm cameras could starve the capture path with frames nobody had
+    /// asked for.
+    #[test]
+    fn a_warm_worker_decodes_only_while_a_capture_is_waiting() {
+        let requested_at = Instant::now();
+
+        assert!(
+            capture_is_waiting(requested_at, None),
+            "a worker that has published nothing owes its caller a frame"
+        );
+        assert!(
+            !capture_is_waiting(requested_at, Some(requested_at + Duration::from_millis(1))),
+            "the capture has been served; every further decode is waste"
+        );
+
+        let asked_again_at = requested_at + Duration::from_secs(5);
+
+        assert!(
+            capture_is_waiting(
+                asked_again_at,
+                Some(requested_at + Duration::from_millis(1))
+            ),
+            "a fresh capture must resume decoding"
+        );
     }
 
     #[derive(Debug)]

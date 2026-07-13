@@ -6431,7 +6431,10 @@ mod tests {
             }
             let runtime = Arc::new(CameraRuntime {
                 config: RwLock::new(config),
-                backend_context: BackendRuntimeContext::new(None, &crate::config::LimitsConfig::default()),
+                backend_context: BackendRuntimeContext::new(
+                    None,
+                    &crate::config::LimitsConfig::default(),
+                ),
                 catalog,
                 admission,
                 storage,
@@ -8513,10 +8516,7 @@ mod tests {
                 )
                 .unwrap();
             let page = runtime
-                .discover(DiscoverRequest {
-                    cursor,
-                    ..request
-                })
+                .discover(DiscoverRequest { cursor, ..request })
                 .await
                 .unwrap();
             assert_eq!(
@@ -10128,7 +10128,10 @@ mod tests {
                     events,
                     outbox_events: core.events(),
                     readiness: readiness.clone(),
-                    backend_context: BackendRuntimeContext::new(None, &crate::config::LimitsConfig::default()),
+                    backend_context: BackendRuntimeContext::new(
+                        None,
+                        &crate::config::LimitsConfig::default(),
+                    ),
                     messaging: core.messaging().unwrap(),
                 },
             )
@@ -10773,7 +10776,10 @@ mod tests {
                     events,
                     outbox_events: core.events(),
                     readiness,
-                    backend_context: BackendRuntimeContext::new(None, &crate::config::LimitsConfig::default()),
+                    backend_context: BackendRuntimeContext::new(
+                        None,
+                        &crate::config::LimitsConfig::default(),
+                    ),
                     messaging: core
                         .messaging()
                         .expect("capacity Core must expose messaging"),
@@ -11131,7 +11137,10 @@ mod tests {
                     events,
                     outbox_events: core.events(),
                     readiness: RuntimeReadiness::noop(),
-                    backend_context: BackendRuntimeContext::new(None, &crate::config::LimitsConfig::default()),
+                    backend_context: BackendRuntimeContext::new(
+                        None,
+                        &crate::config::LimitsConfig::default(),
+                    ),
                     messaging: core
                         .messaging()
                         .expect("capacity smoke Core must expose messaging"),

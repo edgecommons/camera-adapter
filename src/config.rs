@@ -1041,8 +1041,8 @@ fn validate_global(global: &GlobalConfig) -> Result<()> {
     // other 28 took a semaphore permit and then parked inside the byte budget until their deadline
     // expired. A fleet firing on one cron minute lost most of its captures to CAPTURE_TIMEOUT, and
     // every timeout wrote a durable row. The system was never 32-wide; it only said so.
-    let required_in_flight = (limits.max_concurrent_captures as u64)
-        .saturating_mul(limits.max_frame_bytes_per_camera);
+    let required_in_flight =
+        (limits.max_concurrent_captures as u64).saturating_mul(limits.max_frame_bytes_per_camera);
     if limits.max_in_flight_bytes < required_in_flight {
         let admits = limits.max_in_flight_bytes / limits.max_frame_bytes_per_camera.max(1);
         return config_error(
