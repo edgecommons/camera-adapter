@@ -122,6 +122,21 @@ jobs:
             url."https://x-access-token:${EDGECOMMONS_READ_TOKEN}@github.com/edgecommons/edgecommons".insteadOf \
             "https://github.com/edgecommons/edgecommons"
 
+      # The lockfile guard. `--locked` is gone (see the note below), but the committed lockfile must
+      # still be the one a FRESH CLONE resolves -- and it silently is not, over and over, because a
+      # local patched build rewrites it. This step is the loud failure that discipline could not
+      # provide: it ran twice in one afternoon.
+      - name: The committed lockfile must be the one CI resolves, not a patched one
+        run: |
+          if ! grep -A3 '^name = "edgecommons"' Cargo.lock | grep -q '^source = "git+'; then
+            echo "::error::Cargo.lock records edgecommons as a PATH dependency, not the pinned git rev."
+            echo "A local build with the gitignored .cargo/config.toml [patch] active rewrote it."
+            echo "Regenerate it without the patch:"
+            echo "    mv .cargo/config.toml /tmp/ && cargo generate-lockfile && mv /tmp/config.toml .cargo/"
+            exit 1
+          fi
+          echo "Cargo.lock resolves edgecommons from the pinned git rev."
+
       # NOTE: no `--locked`. `Cargo.lock` cannot be trusted here, and it is worth saying why rather
       # than leaving the next person to rediscover it. Local dev builds against the sibling core
       # checkout through a gitignored `.cargo/config.toml` `[patch]`, and a patched build REWRITES the
