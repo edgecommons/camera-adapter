@@ -812,19 +812,19 @@ pub struct AdmissionController {
 
 /// A bounded point-in-time view of the internal admission controls.
 ///
-/// This is crate-visible only because the Linux capacity harness records its
-/// evidence from the real runtime rather than reconstructing permit use from
-/// terminal job timing. It deliberately contains no camera identifiers,
+/// These are the numbers that say whether the component is coping: how much acquisition,
+/// conversion and persistence capacity is left, how much frame memory is unreserved, how many bytes
+/// are outstanding against the output filesystem. It deliberately contains no camera identifiers,
 /// payload bytes, or paths.
-#[cfg(all(
-    test,
-    target_os = "linux",
-    feature = "standalone",
-    feature = "onvif",
-    feature = "capacity-harness"
-))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AdmissionSnapshot {
+///
+/// It used to be compiled only into a test build --
+/// `cfg(all(test, target_os = "linux", standalone, onvif, capacity-harness))` -- so the one
+/// consumer was the capacity harness and an operator could never see any of it. The observability
+/// had been built for the test rather than for the person holding the pager. It is now a production
+/// surface, and it is what `sb/queue-status` and the emitted metrics both read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmissionSnapshot {
     /// Unused global acquisition permits.
     pub available_acquisitions: usize,
     /// Unused named resource-group acquisition permits.
@@ -989,15 +989,9 @@ impl AdmissionController {
         self.disk.outstanding()
     }
 
-    /// Returns a compact snapshot for the capacity-validation harness.
-    #[cfg(all(
-        test,
-        target_os = "linux",
-        feature = "standalone",
-        feature = "onvif",
-        feature = "capacity-harness"
-    ))]
-    pub(crate) fn snapshot(&self) -> AdmissionSnapshot {
+    /// Returns a compact, allocation-light snapshot of live admission capacity.
+    #[must_use]
+    pub fn snapshot(&self) -> AdmissionSnapshot {
         AdmissionSnapshot {
             available_acquisitions: self.available_acquisitions(),
             available_resource_group_acquisitions: self

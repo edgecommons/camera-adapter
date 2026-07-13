@@ -291,6 +291,65 @@ impl CancelRequest {
     }
 }
 
+/// `sb/queue-status` request.
+///
+/// Read-only, so it carries no `requestId`: there is nothing to make idempotent.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QueueStatusRequest {
+    /// Optional camera target. Absent means the whole fleet.
+    pub instance: Option<String>,
+}
+
+impl QueueStatusRequest {
+    /// Validates the optional camera token.
+    pub fn validate(&self) -> Result<()> {
+        validate_optional_token(self.instance.as_deref(), "instance")
+    }
+}
+
+/// `sb/queue-clear` request -- the break-glass drain.
+///
+/// This cancels durable work an operator has already been promised, so it is deliberately harder to
+/// fire by accident than the read-only sibling above: it is ledgered on `requestId` like every other
+/// mutating verb, and it will not run fleet-wide unless the caller says so in as many words.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QueueClearRequest {
+    /// Durable component-scoped operation key.
+    pub request_id: String,
+    /// Optional camera target. Absent clears every camera, and then `allCameras` must be true.
+    pub instance: Option<String>,
+    /// Explicit fleet-wide consent. Required when no `instance` is given.
+    #[serde(default)]
+    pub all_cameras: bool,
+    /// Whether to cancel captures that have already started, not only the backlog.
+    ///
+    /// Default false: draining the backlog is the common emergency and it destroys nothing that has
+    /// begun. Cancelling in-flight work as well is a strictly bigger hammer and must be asked for.
+    #[serde(default)]
+    pub include_in_flight: bool,
+    /// Optional operator-safe reason, recorded on every cancelled capture.
+    pub reason: Option<String>,
+}
+
+impl QueueClearRequest {
+    /// Validates the key, the target, and the fleet-wide guard.
+    pub fn validate(&self) -> Result<()> {
+        validate_request_id(&self.request_id)?;
+        validate_optional_token(self.instance.as_deref(), "instance")?;
+        if self.instance.is_none() && !self.all_cameras {
+            return invalid(
+                "clearing every camera's queue requires allCameras=true; name an instance to clear one camera",
+            );
+        }
+        if self.instance.is_some() && self.all_cameras {
+            return invalid("allCameras must not be set when an instance is named");
+        }
+        validate_reason(self.reason.as_deref())
+    }
+}
+
 /// `sb/reconnect` request.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1024,5 +1083,60 @@ mod tests {
             let request: PtzPresetsRequest = parse_closed(body).unwrap();
             assert!(request.validate().is_ok());
         }
+    }
+
+    /// The break-glass drain must be hard to fire by accident.
+    ///
+    /// `sb/queue-clear` cancels durable work the operator has already been promised. A body that
+    /// merely omits `instance` would otherwise mean "cancel everything, everywhere", which is not a
+    /// thing anyone should be able to do by leaving a field out.
+    #[test]
+    fn queue_clear_will_not_drain_the_fleet_unless_asked_in_as_many_words() {
+        let one_camera: QueueClearRequest =
+            parse_closed(serde_json::json!({"requestId": "r-1", "instance": "camera-a"})).unwrap();
+        assert!(one_camera.validate().is_ok());
+        assert!(
+            !one_camera.include_in_flight,
+            "draining the backlog must not also destroy captures that have already started"
+        );
+
+        let fleet: QueueClearRequest =
+            parse_closed(serde_json::json!({"requestId": "r-2", "allCameras": true})).unwrap();
+        assert!(fleet.validate().is_ok());
+
+        let bare: QueueClearRequest =
+            parse_closed(serde_json::json!({"requestId": "r-3"})).unwrap();
+        assert_eq!(
+            bare.validate().unwrap_err().code(),
+            ErrorCode::InvalidRequest,
+            "omitting the camera must not silently mean the whole fleet"
+        );
+
+        let contradictory: QueueClearRequest = parse_closed(
+            serde_json::json!({"requestId": "r-4", "instance": "camera-a", "allCameras": true}),
+        )
+        .unwrap();
+        assert_eq!(
+            contradictory.validate().unwrap_err().code(),
+            ErrorCode::InvalidRequest,
+            "naming a camera and asking for the whole fleet is a contradiction, not a preference"
+        );
+    }
+
+    /// The read-only sibling carries no requestId, because there is nothing to make idempotent.
+    #[test]
+    fn queue_status_takes_an_optional_camera_and_nothing_else() {
+        let fleet: QueueStatusRequest = parse_closed(serde_json::json!({})).unwrap();
+        assert!(fleet.validate().is_ok());
+        assert_eq!(fleet.instance, None);
+
+        let one: QueueStatusRequest =
+            parse_closed(serde_json::json!({"instance": "camera-a"})).unwrap();
+        assert!(one.validate().is_ok());
+
+        assert!(
+            parse_closed::<QueueStatusRequest>(serde_json::json!({"requestId": "r-1"})).is_err(),
+            "the schema is closed: a field that does nothing must be rejected, not ignored"
+        );
     }
 }

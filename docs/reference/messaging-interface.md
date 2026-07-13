@@ -21,6 +21,8 @@ caller-owned bounded `requestId` for durable idempotency.
 | `sb/capture-group-submit` | same group body | Immediate group acceptance. |
 | `sb/capture-status` | one lookup mode: capture ID, group ID, `(instance,requestId)`, group request ID, or paged state list | Job/group status. |
 | `sb/capture-cancel` | `requestId`, exactly one capture or group ID, optional reason | Durable cancellation outcome. |
+| `sb/queue-status` | optional `instance` | Live admission capacity, per-camera queue depth, and durable backlog. |
+| `sb/queue-clear` | `requestId`, `instance` or `allCameras: true`, optional `includeInFlight`, optional reason | Cancels the durable backlog and reports what it cancelled. |
 | `sb/reconnect` | `instance`, `requestId`, optional reason | Requests reconnect. |
 | `sb/ptz` | `operation` plus normalized vector/axes as appropriate | Bounded PTZ result or status. |
 | `sb/ptz-presets` | `operation: list|goto|set|remove` | Paged presets or durable operation. |
@@ -33,6 +35,28 @@ durations, optional output path/checksum/size, metadata, and a stable failure su
 
 The outbox preserves one encoded terminal envelope through retry. Consumers must tolerate at-least-once
 delivery by deduplicating its stable event ID.
+
+## Queue depth and the break-glass drain
+
+`sb/queue-status` answers whether the component is coping and, if it is not, where the work is stuck. It
+is read-only and takes an optional `instance` to narrow the answer to one camera. The reply reports live
+admission capacity (`admission`: unused acquisition/encoder/writer permits, unreserved frame memory,
+outstanding disk bytes) alongside the configured ceilings (`limits`) those numbers should be read against;
+per-camera dispatcher depth (`cameras[]` with `queued` and `capacity`, plus the `dispatchQueued` total),
+which is what a camera answers `QUEUE_FULL` against; and the durable backlog (`durable`, counted by state
+token, split into `durableBacklog` for captures promised but not started and `durableInFlight` for captures
+already doing physical work). The durable counts are the only ones that survive a restart.
+
+`sb/queue-clear` cancels the durable backlog. It targets one camera by `instance`, or the whole fleet when
+`allCameras` is `true` — omitting `instance` without `allCameras` is rejected, so a fleet-wide drain cannot
+result from a missing field. By default it cancels only captures that have not started; `includeInFlight:
+true` also cancels captures already acquiring, encoding, or persisting. Each capture is cancelled through
+the same path as `sb/capture-cancel`, so it reaches the same terminal state, publishes the same terminal
+application message, and releases the same admission capacity. The reply reports `cancelled`,
+`alreadyTerminal` (captures that finished on their own before the drain reached them), and `failed[]` —
+a drain reports what it could not cancel rather than claiming a clean sweep. Like every mutating verb it is
+ledgered on `requestId`, so a retry returns the original outcome instead of cancelling a second wave of
+work.
 
 ## Capture lifecycle diagnostics
 

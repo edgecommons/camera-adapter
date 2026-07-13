@@ -129,6 +129,21 @@ impl SchedulePlan {
         (self.instance.clone(), self.schedule_id.clone())
     }
 
+    /// Whether an overlap observation can change this plan's decision at all.
+    ///
+    /// [`Self::evaluate`] consults `has_nonterminal_overlap` in exactly one place: after it has
+    /// already decided that an occurrence is due, and only under [`OverlapPolicy::Skip`]. An overlap
+    /// observation can therefore only ever turn an `Admit` into a `SkippedOverlap` -- it can never
+    /// make a not-due schedule due, nor change a misfire.
+    ///
+    /// That matters because answering the question costs a catalog round-trip, and the poll loop
+    /// used to pay it every 200 ms per schedule whether or not anything was due: at 256 cameras,
+    /// ~1,280 reads/second against the same two connections that carry the capture write path.
+    #[must_use]
+    pub fn skips_on_overlap(&self) -> bool {
+        self.overlap_policy == OverlapPolicy::Skip
+    }
+
     /// Returns the first accepted-DST occurrence strictly after `after`.
     pub fn next_after(&self, after: DateTime<Utc>) -> Result<ScheduleOccurrence> {
         let mut cursor = after.with_timezone(&self.timezone);
@@ -277,6 +292,65 @@ mod tests {
             overlap_policy: OverlapPolicy::Skip,
             jitter_seconds: 0,
         }
+    }
+
+    /// The poll loop is allowed to skip the overlap query, so prove the query cannot matter.
+    ///
+    /// `run_schedule` used to open every 200 ms tick with a `jobs_page(.., 1_000)` catalog read --
+    /// ~1,280 reads/second at 256 cameras, through the same two connections as the capture path's
+    /// fsync-per-write transactions -- before anything had established that an occurrence was even
+    /// due. It now evaluates first and asks only when the answer can still change the outcome.
+    ///
+    /// That is only sound if an overlap observation cannot alter any decision other than `Admit`.
+    /// This is the test that says so.
+    #[test]
+    fn an_overlap_observation_can_only_ever_suppress_an_admit() {
+        let plan = SchedulePlan::compile("camera-a", &config("0 0 3 * * *", "UTC")).unwrap();
+        let grace = Duration::from_secs(60);
+
+        // Nothing is due: the catalog cannot be consulted into relevance.
+        let quiet = Utc.with_ymd_and_hms(2026, 7, 13, 3, 0, 30).unwrap();
+        let last_consumed = Utc.with_ymd_and_hms(2026, 7, 13, 3, 0, 0).unwrap();
+        assert_eq!(
+            plan.evaluate(last_consumed, quiet, grace, false).unwrap(),
+            ScheduleDecision::NotDue
+        );
+        assert_eq!(
+            plan.evaluate(last_consumed, quiet, grace, true).unwrap(),
+            ScheduleDecision::NotDue,
+            "an overlap must never make a not-due schedule due -- this is what makes eliding the \
+             read exact rather than merely cheap"
+        );
+
+        // Due: and here, and only here, the observation earns its round-trip.
+        let due = Utc.with_ymd_and_hms(2026, 7, 14, 3, 0, 30).unwrap();
+        assert!(matches!(
+            plan.evaluate(last_consumed, due, grace, false).unwrap(),
+            ScheduleDecision::Admit { .. }
+        ));
+        assert!(matches!(
+            plan.evaluate(last_consumed, due, grace, true).unwrap(),
+            ScheduleDecision::SkippedOverlap { .. }
+        ));
+        assert!(plan.skips_on_overlap());
+    }
+
+    /// A schedule that does not skip on overlap must never pay for the query at all.
+    #[test]
+    fn a_queueing_schedule_never_needs_the_overlap_query() {
+        let mut schedule = config("0 0 3 * * *", "UTC");
+        schedule.overlap_policy = OverlapPolicy::Queue;
+        let plan = SchedulePlan::compile("camera-a", &schedule).unwrap();
+        let grace = Duration::from_secs(60);
+        let last_consumed = Utc.with_ymd_and_hms(2026, 7, 13, 3, 0, 0).unwrap();
+        let due = Utc.with_ymd_and_hms(2026, 7, 14, 3, 0, 30).unwrap();
+
+        assert!(!plan.skips_on_overlap());
+        assert_eq!(
+            plan.evaluate(last_consumed, due, grace, true).unwrap(),
+            plan.evaluate(last_consumed, due, grace, false).unwrap(),
+            "with overlapPolicy=queue the observation is inert, so asking for it is pure contention"
+        );
     }
 
     #[test]

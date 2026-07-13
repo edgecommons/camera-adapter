@@ -68,7 +68,8 @@ async fn main() -> anyhow::Result<()> {
     );
     let credential_service = gg.credentials();
     credential_service_available.store(credential_service.is_some(), Ordering::Release);
-    let backend_context = BackendRuntimeContext::new(credential_service);
+    let backend_context =
+        BackendRuntimeContext::new(credential_service, &loaded.config.global.limits);
     backend_context.validate_config(&loaded.config)?;
 
     // State/catalog/output startup gates run before any camera connection. The complete runtime
@@ -103,10 +104,30 @@ async fn main() -> anyhow::Result<()> {
             readiness: readiness.clone(),
             backend_context,
             messaging: gg.messaging()?,
+            metrics: gg.metrics(),
         },
     )
     .await?;
     router.install(runtime.clone())?;
+
+    // Publish each camera's reachability in the `main` state keepalive's `instances[]`.
+    //
+    // Camera presence was pull-only: it lived in the registry and could be learned only by asking.
+    // A consumer that wanted to know a camera had dropped had to poll for it. This is the surface
+    // EdgeCommons provides so a multi-instance adapter can report every connection's health without
+    // minting a UNS instance per camera, and nothing was registered against it.
+    //
+    // Weak, so the provider held by the heartbeat can never be the thing keeping the runtime alive
+    // through shutdown.
+    {
+        let runtime = Arc::downgrade(&runtime);
+        gg.set_instance_connectivity_provider(Some(Arc::new(move || {
+            runtime
+                .upgrade()
+                .map(|runtime| runtime.camera_connectivity())
+                .unwrap_or_default()
+        })));
+    }
     let app_factory = {
         let gg = Arc::clone(&gg);
         Arc::new(move |instance: &str, config| {

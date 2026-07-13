@@ -239,8 +239,195 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// The component's metric surface.
+///
+/// The camera adapter emitted no metrics at all: there was not one call site for `metrics()`,
+/// `MetricBuilder`, or `MetricService` anywhere in the crate. Every number an operator would want --
+/// how much work is queued, how much is in flight, how much succeeded, how much failed -- existed
+/// somewhere inside the process and left no trace outside it. A capture that failed was a log line.
+///
+/// Two metrics, and the split is deliberate:
+///
+/// * `camera_captures` is COUNTED as it happens, on the job hooks the runtime already fires. It
+///   answers "what has this component done", and it must not be sampled: a capture that succeeded
+///   and a capture that failed between two samples both have to be seen.
+/// * `camera_queue` is SAMPLED on a timer. It answers "what is this component holding right now",
+///   which is a level, not an event -- there is nothing to miss between samples.
+///
+/// Deliberately free of per-camera dimensions. A 256-camera fleet would otherwise mint 256 metric
+/// streams per measure, which is how a metrics bill and a Prometheus server both die. Per-camera
+/// state is answered by `sb/queue-status` and by the per-instance connectivity the heartbeat
+/// publishes.
+pub struct CaptureMetrics {
+    metrics: Arc<dyn edgecommons::metrics::MetricService>,
+}
+
+/// Counted as captures move: emitted at the moment, never sampled.
+pub const CAPTURE_METRIC: &str = "camera_captures";
+/// Sampled levels: what the component is holding right now.
+pub const QUEUE_METRIC: &str = "camera_queue";
+
+impl CaptureMetrics {
+    /// Defines both metrics against the component's metric service.
+    #[must_use]
+    pub fn new(metrics: Arc<dyn edgecommons::metrics::MetricService>) -> Self {
+        metrics.define_metric(
+            edgecommons::metrics::MetricBuilder::create(CAPTURE_METRIC)
+                .add_measure("queued", "Count", 60)
+                .add_measure("started", "Count", 60)
+                .add_measure("succeeded", "Count", 60)
+                .add_measure("failed", "Count", 60)
+                .add_measure("cancelled", "Count", 60)
+                .add_measure("interrupted", "Count", 60)
+                .build(),
+        );
+        metrics.define_metric(
+            edgecommons::metrics::MetricBuilder::create(QUEUE_METRIC)
+                .add_measure("dispatchQueued", "Count", 60)
+                .add_measure("durableBacklog", "Count", 60)
+                .add_measure("durableInFlight", "Count", 60)
+                .add_measure("availableAcquisitions", "Count", 60)
+                .add_measure("availableEncoders", "Count", 60)
+                .add_measure("availableWriters", "Count", 60)
+                .add_measure("availableMemoryBytes", "Bytes", 60)
+                .add_measure("outstandingDiskBytes", "Bytes", 60)
+                .add_measure("camerasOnline", "Count", 60)
+                .add_measure("camerasConfigured", "Count", 60)
+                .build(),
+        );
+        Self { metrics }
+    }
+
+    /// Counts one capture event. Best effort: a metric target that is unhappy must never be able to
+    /// fail a capture, so this reports and moves on.
+    pub async fn count(&self, measure: &'static str) {
+        let mut values = std::collections::HashMap::with_capacity(1);
+        values.insert(measure.to_owned(), 1.0);
+        if let Err(error) = self.metrics.emit_metric(CAPTURE_METRIC, values).await {
+            tracing::warn!(measure, error = %error, "camera capture metric could not be emitted");
+        }
+    }
+
+    /// Emits one sample of what the component is currently holding.
+    pub async fn sample_queue(&self, values: std::collections::HashMap<String, f64>) {
+        if let Err(error) = self.metrics.emit_metric(QUEUE_METRIC, values).await {
+            tracing::warn!(error = %error, "camera queue metric could not be emitted");
+        }
+    }
+}
+
+/// The `camera_captures` measure a terminal state counts against.
+#[must_use]
+pub const fn terminal_measure(state: crate::model::JobState) -> Option<&'static str> {
+    match state {
+        crate::model::JobState::Succeeded => Some("succeeded"),
+        crate::model::JobState::Failed => Some("failed"),
+        crate::model::JobState::Cancelled => Some("cancelled"),
+        crate::model::JobState::Interrupted => Some("interrupted"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Every terminal state a capture can reach must be counted, and nothing else may be.
+    ///
+    /// The counters are what an operator watches, so a terminal that maps to no measure is a capture
+    /// that ended and was never counted -- invisible in exactly the way the whole component was
+    /// before it emitted anything at all.
+    #[test]
+    fn every_terminal_state_counts_against_exactly_one_measure() {
+        use crate::model::JobState;
+
+        assert_eq!(terminal_measure(JobState::Succeeded), Some("succeeded"));
+        assert_eq!(terminal_measure(JobState::Failed), Some("failed"));
+        assert_eq!(terminal_measure(JobState::Cancelled), Some("cancelled"));
+        assert_eq!(terminal_measure(JobState::Interrupted), Some("interrupted"));
+
+        for state in [
+            JobState::Accepted,
+            JobState::Queued,
+            JobState::Acquiring,
+            JobState::Encoding,
+            JobState::Persisting,
+        ] {
+            assert!(
+                !state.is_terminal(),
+                "a state that counts against nothing must be one the capture can still leave"
+            );
+            assert_eq!(
+                terminal_measure(state),
+                None,
+                "a capture still in flight has not ended, and must not be counted as though it had"
+            );
+        }
+    }
+
+    /// A metric target that is unhappy must never be able to fail a capture.
+    #[tokio::test]
+    async fn a_failing_metric_target_is_reported_and_survived() {
+        use edgecommons::metrics::MetricService;
+
+        struct Broken;
+
+        #[async_trait::async_trait]
+        impl edgecommons::metrics::MetricService for Broken {
+            fn define_metric(&self, _metric: edgecommons::metrics::Metric) {}
+            fn is_metric_defined(&self, _name: &str) -> bool {
+                true
+            }
+            async fn emit_metric(
+                &self,
+                _name: &str,
+                _values: std::collections::HashMap<String, f64>,
+            ) -> edgecommons::Result<()> {
+                Err(edgecommons::EdgeCommonsError::Metrics(
+                    "metric target is unavailable".to_owned(),
+                ))
+            }
+            async fn emit_metric_now(
+                &self,
+                _name: &str,
+                _values: std::collections::HashMap<String, f64>,
+            ) -> edgecommons::Result<()> {
+                Err(edgecommons::EdgeCommonsError::Metrics(
+                    "metric target is unavailable".to_owned(),
+                ))
+            }
+            async fn flush_metrics(&self) -> edgecommons::Result<()> {
+                Ok(())
+            }
+            async fn shutdown(&self) {}
+        }
+
+        let broken = Arc::new(Broken);
+        let metrics = CaptureMetrics::new(Arc::clone(&broken) as Arc<dyn MetricService>);
+
+        // Neither call may panic or propagate: a capture that succeeded must not be reported as
+        // failed because the metrics backend was down.
+        metrics.count("succeeded").await;
+        metrics
+            .sample_queue(std::collections::HashMap::from([(
+                "durableBacklog".to_owned(),
+                1.0,
+            )]))
+            .await;
+
+        // `CaptureMetrics` defines both metrics through this same service, so a target that refuses
+        // to emit must still have accepted the definitions -- otherwise the failure being survived
+        // here would be the wrong one.
+        assert!(broken.is_metric_defined(CAPTURE_METRIC));
+        assert!(
+            broken
+                .emit_metric_now(CAPTURE_METRIC, std::collections::HashMap::new())
+                .await
+                .is_err(),
+            "the immediate path must fail the same way the buffered one does"
+        );
+        assert!(broken.flush_metrics().await.is_ok());
+        broken.shutdown().await;
+    }
+
     use super::*;
 
     fn ready() -> ReadinessSnapshot {

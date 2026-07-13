@@ -1925,6 +1925,9 @@ struct OnvifProtocolClient {
     authentications: BTreeMap<(String, String, u16), SessionAuthentication>,
     max_soap_bytes: u64,
     max_xml_depth: usize,
+    /// Shared RTSP decode-stage bound, handed to each camera's capture controller.
+    #[cfg(feature = "rtsp")]
+    decode_gate: Arc<Semaphore>,
 }
 
 impl OnvifProtocolClient {
@@ -2508,6 +2511,13 @@ pub struct OnvifBackendDependencies {
     pub nonce_source: Arc<dyn OnvifNonceSource>,
     /// Shared HTTP/XML security limits.
     pub security: SecurityConfig,
+    /// Component-wide bound on concurrent blocking GStreamer operations.
+    ///
+    /// One semaphore is shared by every camera, so it must be injected rather than built per
+    /// factory: a factory is constructed per camera and per reconnect, and a per-factory semaphore
+    /// would be no bound at all. Sized from `limits.maxConcurrentCaptures` so the RTSP decode stage
+    /// is exactly as wide as the concurrency the component advertises.
+    pub decode_gate: Arc<Semaphore>,
 }
 
 #[cfg(test)]
@@ -2521,6 +2531,9 @@ impl Default for OnvifBackendDependencies {
             clock: Arc::new(SystemOnvifClock),
             nonce_source: Arc::new(SystemNonceSource),
             security: SecurityConfig::default(),
+            decode_gate: Arc::new(Semaphore::new(
+                crate::config::LimitsConfig::default().max_concurrent_captures,
+            )),
         }
     }
 }
@@ -2545,10 +2558,20 @@ impl OnvifBackendFactory {
             .map(<[String]>::to_vec)
     }
 
+    /// Resolves a secret reference through the SAME bounded path a session uses.
+    ///
+    /// It used to call `provider.resolve_login()` straight, which production never does: production
+    /// goes through [`resolve_login_bounded`], which adds the deadline and cancellation guards. So
+    /// the accessor re-implemented the production path minus exactly the part that can fail, and the
+    /// test that leaned on it proved the credential wiring worked while proving nothing about the
+    /// code that actually runs. It now delegates, and takes the bounds as arguments so a caller can
+    /// exercise them.
     #[cfg(test)]
-    pub(crate) async fn resolve_login_for_test(
+    pub(crate) async fn resolve_login_bounded_for_test(
         &self,
         reference: &SecretRef,
+        deadline: Instant,
+        cancellation: &CancellationToken,
     ) -> Result<Arc<OnvifCredentials>> {
         let provider =
             self.dependencies
@@ -2558,7 +2581,7 @@ impl OnvifBackendFactory {
                     path: "component.credentials".to_owned(),
                     message: "ONVIF secret references require EdgeCommons credentials".to_owned(),
                 })?;
-        provider.resolve_login(reference).await
+        resolve_login_bounded(provider, reference, deadline, cancellation).await
     }
 
     #[cfg(test)]
@@ -2991,6 +3014,8 @@ impl CameraBackendFactory for OnvifBackendFactory {
             authentications: BTreeMap::new(),
             max_soap_bytes: config.max_soap_bytes,
             max_xml_depth: config.max_xml_depth,
+            #[cfg(feature = "rtsp")]
+            decode_gate: Arc::clone(&self.dependencies.decode_gate),
         };
 
         let get_services = format!(
@@ -3092,6 +3117,7 @@ impl CameraBackendFactory for OnvifBackendFactory {
                         session_policy: config.rtsp_session_policy,
                         maximum_frame_bytes: config.max_snapshot_bytes,
                         clock: Arc::clone(&client.clock),
+                        decode_gate: Arc::clone(&client.decode_gate),
                     },
                     deadline,
                     &request.cancellation,
@@ -4530,6 +4556,10 @@ mod tests {
                 authentications: BTreeMap::new(),
                 max_soap_bytes: config.max_soap_bytes,
                 max_xml_depth: config.max_xml_depth,
+                #[cfg(feature = "rtsp")]
+                decode_gate: Arc::new(Semaphore::new(
+                    crate::config::LimitsConfig::default().max_concurrent_captures,
+                )),
             },
             pinned,
         )
@@ -4779,6 +4809,7 @@ mod tests {
             clock: Arc::new(FixedClock),
             nonce_source: Arc::new(FixedNonce),
             security: SecurityConfig::default(),
+            ..Default::default()
         });
         let candidates = factory
             .discover(DiscoveryRequest {
@@ -6472,6 +6503,7 @@ mod tests {
             clock: Arc::new(FixedClock),
             nonce_source: Arc::new(FixedNonce),
             security: SecurityConfig::default(),
+            ..Default::default()
         });
 
         factory
@@ -6515,6 +6547,7 @@ mod tests {
             clock: Arc::new(FixedClock),
             nonce_source: Arc::new(FixedNonce),
             security: SecurityConfig::default(),
+            ..Default::default()
         });
 
         let error = factory
@@ -6561,6 +6594,7 @@ mod tests {
             clock: Arc::new(FixedClock),
             nonce_source: Arc::new(FixedNonce),
             security: SecurityConfig::default(),
+            ..Default::default()
         });
         let cancellation = CancellationToken::new();
         assert!(
@@ -6588,6 +6622,7 @@ mod tests {
             clock: Arc::new(FixedClock),
             nonce_source: Arc::new(FixedNonce),
             security: SecurityConfig::default(),
+            ..Default::default()
         });
         assert!(
             hostile_factory
@@ -6642,6 +6677,7 @@ mod tests {
             clock: Arc::new(FixedClock),
             nonce_source: Arc::new(FixedNonce),
             security: SecurityConfig::default(),
+            ..Default::default()
         });
         let config = test_config(Some("http://camera.test/onvif/device_service"));
         let mut session = factory

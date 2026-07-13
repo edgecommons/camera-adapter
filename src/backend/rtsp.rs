@@ -78,8 +78,6 @@ const MAX_RTSP_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RTSP_SESSION_ID_BYTES: usize = 1024;
 const MAX_INTERLEAVED_PACKET_BYTES: usize = u16::MAX as usize;
 #[cfg(feature = "rtsp")]
-const MAX_BLOCKING_GSTREAMER_OPERATIONS: usize = 4;
-#[cfg(feature = "rtsp")]
 // A fresh RTSP reader can attach just after an IDR. Keep enough timestamp
 // accounting for a normal ten-frame GOP while retaining a strict 16-frame
 // (and therefore `16 * maximumFrameBytes`) bound.
@@ -1746,15 +1744,50 @@ fn remember_terminal_decoder_pts(recently_terminal_pts: &mut VecDeque<u64>, outp
 
 #[cfg(feature = "rtsp")]
 impl Drop for GstreamerDecoder {
+    /// Tears the pipeline down off the reactor.
+    ///
+    /// D3. `set_state(Null)` is a blocking GStreamer call: it joins the decoder's streaming threads
+    /// and waits for the state change to complete, which on a stalled or slow decoder is not
+    /// instantaneous. Every other GStreamer touch in this file is correctly on `spawn_blocking` --
+    /// pipeline creation, every decode, the TLS setup. The teardown was the one that was not, and a
+    /// decoder is dropped on a Tokio worker thread: at the end of a warm session, on every OnDemand
+    /// capture, and on every reconnect. So the one GStreamer call nobody thought about was the one
+    /// that ran on the reactor, and a camera whose pipeline was slow to stop blocked a worker that
+    /// other cameras' futures were waiting on.
+    ///
+    /// The pipeline is moved onto the blocking pool. `Drop` cannot await, so this is deliberately
+    /// fire-and-forget: the handle is dropped, and the pipeline is freed when the blocking task
+    /// finishes.
+    ///
+    /// Outside a Tokio runtime -- a plain test, or teardown after the runtime is gone -- there is no
+    /// blocking pool to move to and no reactor left to protect, so it runs inline.
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            let _ = self.pipeline.set_state(gst::State::Null);
+            return;
+        };
+        // `Pipeline` is a refcounted GObject handle; cloning it is a refcount bump, not a copy of the
+        // pipeline, so the blocking task owns a handle that keeps the pipeline alive until it has
+        // finished stopping it.
+        let pipeline = self.pipeline.clone();
+        handle.spawn_blocking(move || {
+            let _ = pipeline.set_state(gst::State::Null);
+        });
     }
 }
 
-#[cfg(feature = "rtsp")]
-fn gstreamer_operation_limiter() -> &'static Arc<Semaphore> {
-    static LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    LIMITER.get_or_init(|| Arc::new(Semaphore::new(MAX_BLOCKING_GSTREAMER_OPERATIONS)))
+/// Whether decoding this access unit can still serve somebody.
+///
+/// `interest_at` is the instant of the most recent capture request (a capture accepts only a frame
+/// with `ingested_at >= ready_at`, and `ready_at` *is* the interest instant), and `delivered_at` is
+/// the ingest instant of the newest frame the worker has published, or `None` if it has published
+/// none. A frame decoded when nobody is waiting cannot satisfy the next capture either -- that
+/// capture will demand a frame ingested after *it* arrived -- so the decode is pure waste.
+///
+/// Kept outside `cfg(feature = "rtsp")` on purpose: this is the predicate that decides whether the
+/// component burns a decode permit, and it should be provable without GStreamer installed.
+fn capture_is_waiting(interest_at: Instant, delivered_at: Option<Instant>) -> bool {
+    delivered_at.is_none_or(|delivered| interest_at > delivered)
 }
 
 #[cfg(feature = "rtsp")]
@@ -1762,9 +1795,10 @@ async fn create_decoder_bounded(
     codec: RtspCodec,
     maximum_bytes: u64,
     deadline: Instant,
+    decode_gate: &Arc<Semaphore>,
     cancellation: &CancellationToken,
 ) -> Result<Arc<Mutex<GstreamerDecoder>>> {
-    let permit = Arc::clone(gstreamer_operation_limiter()).acquire_owned();
+    let permit = Arc::clone(decode_gate).acquire_owned();
     tokio::pin!(permit);
     let permit = tokio::select! {
         biased;
@@ -1786,6 +1820,7 @@ async fn create_decoder_bounded(
 }
 
 #[cfg(feature = "rtsp")]
+#[allow(clippy::too_many_arguments)]
 async fn decode_bounded(
     decoder: Arc<Mutex<GstreamerDecoder>>,
     unit: EncodedAccessUnit,
@@ -1793,9 +1828,10 @@ async fn decode_bounded(
     maximum_decompression_ratio: u32,
     ingested_at: Instant,
     deadline: Instant,
+    decode_gate: &Arc<Semaphore>,
     cancellation: &CancellationToken,
 ) -> Result<Option<DecodedRtspFrame>> {
-    let permit = Arc::clone(gstreamer_operation_limiter()).acquire_owned();
+    let permit = Arc::clone(decode_gate).acquire_owned();
     tokio::pin!(permit);
     let permit = tokio::select! {
         biased;
@@ -2750,6 +2786,7 @@ pub(crate) struct RtspCaptureController {
     maximum_decompression_ratio: u32,
     source_host: String,
     clock: Arc<dyn OnvifClock>,
+    decode_gate: Arc<Semaphore>,
     worker: Option<RtspWorkerHandle>,
 }
 
@@ -2788,6 +2825,13 @@ pub(crate) struct RtspControllerConfig {
     pub(crate) session_policy: RtspSessionPolicy,
     pub(crate) maximum_frame_bytes: u64,
     pub(crate) clock: Arc<dyn OnvifClock>,
+    /// Component-wide bound on concurrent blocking GStreamer operations, shared by every camera.
+    ///
+    /// Every decoder creation and every access-unit decode takes a permit, so this is the real
+    /// width of the RTSP decode stage. It is sized from `limits.maxConcurrentCaptures` and injected
+    /// rather than being a process-global, so a camera can never be silently narrower than the
+    /// concurrency the component advertises.
+    pub(crate) decode_gate: Arc<Semaphore>,
 }
 
 #[cfg(feature = "rtsp")]
@@ -2843,6 +2887,7 @@ impl RtspCaptureController {
             maximum_decompression_ratio: config.security.max_decompression_ratio,
             source_host,
             clock: config.clock,
+            decode_gate: config.decode_gate,
             worker: None,
         })
     }
@@ -3019,6 +3064,7 @@ impl RtspCaptureController {
         let session_policy = self.session_policy;
         let maximum_frame_bytes = self.maximum_frame_bytes;
         let maximum_decompression_ratio = self.maximum_decompression_ratio;
+        let decode_gate = Arc::clone(&self.decode_gate);
         let join = tokio::spawn(async move {
             let result = run_rtsp_worker(
                 policy,
@@ -3027,6 +3073,7 @@ impl RtspCaptureController {
                 session_policy,
                 maximum_frame_bytes,
                 maximum_decompression_ratio,
+                decode_gate,
                 startup_deadline,
                 interest_rx,
                 worker_cancellation,
@@ -3078,6 +3125,7 @@ async fn run_rtsp_worker(
     session_policy: RtspSessionPolicy,
     maximum_frame_bytes: u64,
     maximum_decompression_ratio: u32,
+    decode_gate: Arc<Semaphore>,
     startup_deadline: Instant,
     mut interest: watch::Receiver<Instant>,
     cancellation: CancellationToken,
@@ -3096,10 +3144,16 @@ async fn run_rtsp_worker(
         track.codec,
         maximum_frame_bytes,
         startup_deadline,
+        &decode_gate,
         &cancellation,
     )
     .await?;
     let mut assembler = AccessUnitAssembler::new(&track, maximum_frame_bytes)?;
+    // The ingest instant of the newest frame this worker has published, or `None` while it has
+    // published nothing. A capture accepts a frame only when `ingested_at >= ready_at` and
+    // `ready_at` is exactly the interest instant, so this is all that is needed to answer "is
+    // anybody still waiting for a frame?" -- see `capture` above.
+    let mut delivered_at: Option<Instant> = None;
     let run_result = async {
         loop {
             let operation_deadline = match session_policy {
@@ -3142,6 +3196,25 @@ async fn run_rtsp_worker(
             if unit.dimensions.is_none() {
                 continue;
             }
+            // Decode only while a capture is actually waiting.
+            //
+            // A warm worker holds the RTSP session open for 30 s after the last capture, and it
+            // used to decode every assembled access unit for that whole window -- 25 frames a
+            // second, per camera, each one taking a permit from the component-wide decode gate.
+            // None of those frames can ever satisfy a capture: `capture` requires
+            // `ingested_at >= ready_at`, so a frame decoded before the next request arrives is
+            // discarded on sight. It was pure waste, and it was waste that crowded real captures
+            // out of the gate; a dozen warm cameras could starve the capture path outright.
+            //
+            // Skipping the decode leaves the GStreamer decoder without the intervening reference
+            // frames, so on the next capture it emits nothing until the stream's next IDR --
+            // `push_and_pull` already reports that as `Ok(None)` and the loop simply waits. A warm
+            // capture therefore costs up to one GOP rather than one frame. That is the deliberate
+            // trade: warm sessions keep the expensive things (the RTSP session, the negotiated
+            // track, the built pipeline) and stop paying to decode pictures nobody asked for.
+            if !capture_is_waiting(*interest.borrow(), delivered_at) {
+                continue;
+            }
             let ingested_at = Instant::now();
             let Some(frame) = decode_bounded(
                 Arc::clone(&decoder),
@@ -3150,6 +3223,7 @@ async fn run_rtsp_worker(
                 maximum_decompression_ratio,
                 ingested_at,
                 operation_deadline,
+                &decode_gate,
                 &cancellation,
             )
             .await?
@@ -3169,6 +3243,7 @@ async fn run_rtsp_worker(
                     incomplete_units: assembler.incomplete_units,
                 }),
             });
+            delivered_at = Some(ingested_at);
         }
     }
     .await;
@@ -3242,6 +3317,49 @@ mod tests {
 
     #[cfg(feature = "rtsp")]
     use crate::backend::onvif::{SystemNonceSource, SystemOnvifClock, SystemResolver};
+
+    /// The shared decode gate, sized exactly as production sizes it.
+    ///
+    /// Production builds this once per component in `BackendRuntimeContext::new` from
+    /// `limits.maxConcurrentCaptures`; a test that invented its own width would not be testing the
+    /// bound the component actually runs with.
+    #[cfg(feature = "rtsp")]
+    fn test_decode_gate() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(
+            crate::config::LimitsConfig::default().max_concurrent_captures,
+        ))
+    }
+
+    /// A warm worker must stop decoding once the capture that asked for a frame has been served.
+    ///
+    /// It used to decode every access unit for the whole 30 s warm window -- 25 frames a second per
+    /// camera, every one of them taking a permit from the component-wide decode gate, and every one
+    /// of them discarded, because the next capture will only accept a frame ingested after that
+    /// capture arrived. A dozen warm cameras could starve the capture path with frames nobody had
+    /// asked for.
+    #[test]
+    fn a_warm_worker_decodes_only_while_a_capture_is_waiting() {
+        let requested_at = Instant::now();
+
+        assert!(
+            capture_is_waiting(requested_at, None),
+            "a worker that has published nothing owes its caller a frame"
+        );
+        assert!(
+            !capture_is_waiting(requested_at, Some(requested_at + Duration::from_millis(1))),
+            "the capture has been served; every further decode is waste"
+        );
+
+        let asked_again_at = requested_at + Duration::from_secs(5);
+
+        assert!(
+            capture_is_waiting(
+                asked_again_at,
+                Some(requested_at + Duration::from_millis(1))
+            ),
+            "a fresh capture must resume decoding"
+        );
+    }
 
     #[derive(Debug)]
     struct SequenceResolver(Mutex<VecDeque<Vec<IpAddr>>>);
@@ -3320,6 +3438,7 @@ mod tests {
                 session_policy: RtspSessionPolicy::OnDemand,
                 maximum_frame_bytes: 1_048_576,
                 clock: Arc::new(SystemOnvifClock),
+                decode_gate: test_decode_gate(),
             },
             Instant::now() + Duration::from_secs(10),
             &CancellationToken::new(),
@@ -3382,6 +3501,7 @@ mod tests {
                 session_policy: RtspSessionPolicy::Warm,
                 maximum_frame_bytes: 1_048_576,
                 clock: Arc::new(SystemOnvifClock),
+                decode_gate: test_decode_gate(),
             },
             Instant::now() + Duration::from_secs(10),
             &CancellationToken::new(),
@@ -4227,6 +4347,7 @@ mod tests {
                 RtspCodec::H264,
                 1024,
                 Instant::now() + Duration::from_secs(1),
+                &test_decode_gate(),
                 &cancelled,
             )
             .await
@@ -4239,6 +4360,7 @@ mod tests {
                 RtspCodec::H264,
                 1024,
                 Instant::now() - Duration::from_millis(1),
+                &test_decode_gate(),
                 &CancellationToken::new(),
             )
             .await
@@ -4246,6 +4368,36 @@ mod tests {
             .code(),
             ErrorCode::CaptureTimeout
         );
+    }
+
+    /// The decoder must take a permit from the gate it was HANDED, not from a global of its own.
+    ///
+    /// This is the assertion the old process-global made impossible to write: a test could not hand
+    /// `create_decoder_bounded` a gate and observe that it honored it, so nothing noticed that every
+    /// camera in the component was queueing behind the same four permits. An exhausted gate must
+    /// hold the caller in decoder admission until its deadline -- and it must be *this* gate.
+    #[cfg(feature = "rtsp")]
+    #[tokio::test]
+    async fn decoder_admission_waits_on_the_injected_gate_not_a_process_global() {
+        let gate = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&gate)
+            .acquire_owned()
+            .await
+            .expect("hold the only permit");
+
+        let error = create_decoder_bounded(
+            RtspCodec::H264,
+            1024,
+            Instant::now() + Duration::from_millis(50),
+            &gate,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("an exhausted decode gate must not admit a decoder");
+
+        assert_eq!(error.code(), ErrorCode::CaptureTimeout);
+        drop(held);
+        assert_eq!(gate.available_permits(), 1, "the permit must be returned");
     }
 
     #[cfg(feature = "rtsp")]
