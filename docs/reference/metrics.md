@@ -20,7 +20,7 @@ than events, so there is nothing to miss between samples.
 
 | Measure | Unit | Meaning |
 |---|---|---|
-| `dispatchQueued` | Count | Descriptors waiting in the supervisor dispatchers across all cameras. |
+| `dispatchQueued` | Count | Captures waiting in the fleet queue, across all cameras. |
 | `durableBacklog` | Count | Captures durably accepted but not started (`ACCEPTED` + `QUEUED`). |
 | `durableInFlight` | Count | Captures acquiring, encoding, or persisting. |
 | `availableAcquisitions` | Count | Unused global acquisition permits. |
