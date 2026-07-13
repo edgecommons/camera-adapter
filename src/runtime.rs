@@ -674,6 +674,13 @@ pub struct CameraRuntime {
     /// Per-supervisor shutdown tokens.  A child token also observes process shutdown, while a
     /// reload can retire one connecting/backing-off supervisor without stopping the whole runtime.
     supervisor_cancellations: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    /// The armed stop timer for each camera in continuous motion.
+    ///
+    /// DESIGN §15.5: a continuous move arms a mandatory stop deadline, and the deadline -- not the
+    /// requester -- is what stops the camera. Holding the token here is what lets a later stop, a
+    /// superseding move, or a retiring supervisor disarm it, so a timer armed for one move can never
+    /// stop a different one.
+    motion_stops: Arc<RwLock<HashMap<String, CancellationToken>>>,
     /// Completion signals paired with [`Self::supervisor_cancellations`].  A replacement waits
     /// for the old loop to retire before publishing a new actor for the same camera ID.
     supervisor_finished: Arc<RwLock<HashMap<String, CancellationToken>>>,
@@ -1287,6 +1294,7 @@ impl CameraRuntime {
             metrics,
             actors: Arc::new(RwLock::new(HashMap::new())),
             supervisor_cancellations: Arc::new(RwLock::new(HashMap::new())),
+            motion_stops: Arc::new(RwLock::new(HashMap::new())),
             supervisor_finished: Arc::new(RwLock::new(HashMap::new())),
             session_cancellations: Arc::new(RwLock::new(HashMap::new())),
             scheduler_cancellations: RwLock::new(HashMap::new()),
@@ -2688,8 +2696,113 @@ impl CameraRuntime {
         }
     }
 
+    /// Arms the mandatory stop for a camera that has just been told to move (DESIGN §15.5).
+    ///
+    /// Returns the deadline the caller is promised, or `None` if the timer could not be armed --
+    /// and `None` is never reported as a stop deadline, because advertising one that nothing will
+    /// honour is worse than admitting there is none.
+    ///
+    /// The stop goes down the SAFETY lane, not the ordinary one. That is the whole point of the
+    /// lane: it is non-evictable, it is popped before any other work, and it pre-empts a running
+    /// capture. An ordinary control would queue behind exactly the work that is keeping the camera
+    /// busy while it moves.
+    fn arm_motion_stop(
+        &self,
+        instance: &str,
+        timeout: Duration,
+        axes: (bool, bool, bool),
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        let (pan, tilt, zoom) = axes;
+        if !pan && !tilt && !zoom {
+            // A zero velocity is not motion, so there is nothing to stop.
+            return None;
+        }
+        let token = CancellationToken::new();
+        let previous = self
+            .motion_stops
+            .write()
+            .ok()?
+            .insert(instance.to_owned(), token.clone());
+        // A superseding move retires the timer the previous one armed, or the old deadline would
+        // stop the NEW motion early.
+        if let Some(previous) = previous {
+            previous.cancel();
+        }
+
+        // The CURRENT actor is looked up when the timer fires, not captured now: a reconnect replaces
+        // the actor, and a stop pushed at a handle the camera no longer answers is not a stop.
+        let actors = Arc::clone(&self.actors);
+        let stops = Arc::clone(&self.motion_stops);
+        let instance = instance.to_owned();
+        let deadline = tokio::time::Instant::now() + timeout;
+        let ptz_ms = self
+            .config_snapshot()
+            .map_or(10_000, |config| config.global.timeouts.ptz_ms);
+        let shutting_down = self.cancellation.clone();
+        self.spawn_task(async move {
+            tokio::select! {
+                () = token.cancelled() => return,
+                // The component is stopping, and the actor's own teardown delivers a stop to a
+                // camera that is still moving (DESIGN §20.2). Sitting here until the deadline would
+                // hold shutdown open for as long as the move was allowed to last.
+                () = shutting_down.cancelled() => return,
+                () = tokio::time::sleep_until(deadline) => {}
+            }
+            // The component shutting down does not excuse a moving camera; the actor's own teardown
+            // delivers a stop in that case, and this one is harmless if it loses the race.
+            let actor = actors
+                .read()
+                .ok()
+                .and_then(|actors| actors.get(&instance).cloned());
+            let Some(actor) = actor else {
+                tracing::warn!(
+                    instance = %instance,
+                    "a continuous move reached its mandatory stop deadline but its camera is gone"
+                );
+                return;
+            };
+            let stop = crate::admission::SafetyStop {
+                pan,
+                tilt,
+                zoom,
+                deadline: tokio::time::Instant::now() + Duration::from_millis(ptz_ms),
+            };
+            match actor.safety_stop(stop) {
+                Ok(()) => tracing::info!(
+                    instance = %instance,
+                    "continuous motion reached its mandatory stop deadline; a safety stop was queued"
+                ),
+                Err(error) => tracing::error!(
+                    instance = %instance,
+                    error = %error,
+                    "a moving camera could not be sent its mandatory stop"
+                ),
+            }
+            if let Ok(mut stops) = stops.write() {
+                stops.remove(&instance);
+            }
+        })
+        .ok()?;
+        Some(chrono::Utc::now() + chrono::Duration::from_std(timeout).ok()?)
+    }
+
+    /// Retires a camera's armed stop: its motion has been ended by something else.
+    fn disarm_motion_stop(&self, instance: &str) {
+        let token = self
+            .motion_stops
+            .write()
+            .ok()
+            .and_then(|mut stops| stops.remove(instance));
+        if let Some(token) = token {
+            token.cancel();
+        }
+    }
+
     async fn perform_ptz(&self, request: PtzCommandRequest) -> Result<serde_json::Value> {
         let config = self.config_snapshot()?;
+        // The schema ceiling only -- the widest value `ptz.maximumContinuousMoveMs` accepts. The
+        // CAMERA's own bound is enforced below, once the target is resolved; validating against a
+        // constant is what let a camera bounded to ten seconds accept a sixty-second move.
         request.validate(60_000)?;
         let (instance, request_id, operation, physical, arguments) = match request {
             PtzCommandRequest::Continuous {
@@ -2812,6 +2925,31 @@ impl CameraRuntime {
                 "PTZ is disabled by configuration",
             ));
         }
+        // The safety bound belongs to the CAMERA. `validate` above only enforces the schema ceiling
+        // (60 s, the widest value the field accepts), so on its own it would let an operator command
+        // a minute of motion on a camera configured to move for ten seconds -- and the reply would
+        // then advertise a stop deadline nothing was going to honour.
+        let motion_timeout = match physical.as_ref() {
+            Some(crate::model::PtzRequest::Continuous { timeout, .. }) => {
+                let requested = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+                if requested > camera.ptz.maximum_continuous_move_ms {
+                    return Err(crate::CameraError::rejected(
+                        crate::ErrorCode::PtzRangeError,
+                        "continuous timeoutMs exceeds this camera's ptz.maximumContinuousMoveMs",
+                    ));
+                }
+                Some(*timeout)
+            }
+            _ => None,
+        };
+        let stopped_axes = match physical.as_ref() {
+            Some(crate::model::PtzRequest::Continuous { velocity, .. }) => Some((
+                velocity.pan != 0.0,
+                velocity.tilt != 0.0,
+                velocity.zoom != 0.0,
+            )),
+            _ => None,
+        };
         let actor = self.actor(&instance)?;
         let physical = physical.ok_or_else(|| {
             crate::CameraError::rejected(
@@ -2864,10 +3002,33 @@ impl CameraRuntime {
                 }
                 crate::catalog::BeginCommandOutcome::Started(_) => {}
             }
+            // Any PTZ command that is not itself a continuous move ends the motion the last one
+            // started, so its timer must not survive to stop a move it was never armed for.
+            if motion_timeout.is_none() {
+                self.disarm_motion_stop(&instance);
+            }
             let result = actor.ptz(physical, deadline, &self.cancellation).await;
             let response = match result {
                 Ok(crate::model::PtzResult::Commanded) => {
-                    serde_json::json!({ "operation": operation, "state": "COMMANDED", "acceptedAt": chrono::Utc::now(), "stopDeadline": if operation == "continuous" { serde_json::json!(chrono::Utc::now() + chrono::Duration::milliseconds(i64::try_from(camera.ptz.maximum_continuous_move_ms).unwrap_or(i64::MAX))) } else { serde_json::Value::Null } })
+                    // DESIGN §15.5: the move is now armed to stop itself. The camera is told the
+                    // timeout too, but a camera that ignores it -- and many do -- must not be the
+                    // only thing between a commanded motion and a stop, and neither must the
+                    // requester, who may never come back.
+                    let stop_deadline = match (motion_timeout, stopped_axes) {
+                        (Some(timeout), Some(axes)) => {
+                            self.arm_motion_stop(&instance, timeout, axes)
+                        }
+                        _ => None,
+                    };
+                    serde_json::json!({
+                        "operation": operation,
+                        "state": "COMMANDED",
+                        "acceptedAt": chrono::Utc::now(),
+                        "stopDeadline": match stop_deadline {
+                            Some(at) => serde_json::json!(at),
+                            None => serde_json::Value::Null,
+                        },
+                    })
                 }
                 Ok(crate::model::PtzResult::PresetToken(token)) => {
                     serde_json::json!({ "operation": operation, "token": token })
@@ -7460,6 +7621,7 @@ mod tests {
                 metrics: Arc::new(crate::observability::CaptureMetrics::new(metrics)),
                 actors: Arc::new(RwLock::new(HashMap::new())),
                 supervisor_cancellations: Arc::new(RwLock::new(HashMap::new())),
+                motion_stops: Arc::new(RwLock::new(HashMap::new())),
                 supervisor_finished: Arc::new(RwLock::new(HashMap::new())),
                 session_cancellations: Arc::new(RwLock::new(HashMap::new())),
                 scheduler_cancellations: RwLock::new(HashMap::new()),
@@ -14497,6 +14659,174 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
+        }
+
+        fn ptz_camera(directory: &TempDir, max_move_ms: u64) -> AdapterConfig {
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            for camera in &mut configuration.instances {
+                camera.ptz.enabled = true;
+                camera.ptz.maximum_continuous_move_ms = max_move_ms;
+                if let crate::config::BackendConfig::Sim(sim) = &mut camera.backend {
+                    sim.ptz.supported = true;
+                    sim.ptz.status_supported = true;
+                }
+            }
+            configuration
+        }
+
+        async fn camera_is_moving(runtime: &CameraRuntime) -> bool {
+            match runtime
+                .actor("camera-a")
+                .unwrap()
+                .ptz(
+                    crate::model::PtzRequest::Status,
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                    &CancellationToken::new(),
+                )
+                .await
+            {
+                Ok(crate::model::PtzResult::Status(status)) => status.moving == Some(true),
+                other => panic!("the camera must answer a PTZ status: {other:?}"),
+            }
+        }
+
+        /// A continuous move is stopped by its deadline, even if the requester never comes back.
+        ///
+        /// DESIGN §15.5 is a sequence diagram with a Stop timer in it: the move arms a mandatory stop
+        /// deadline, and the DEADLINE stops the camera -- not the requester, who may have crashed, and
+        /// not the camera itself, which is told the timeout but may ignore it, as many do. The timer
+        /// was never built. `maximumContinuousMoveMs` existed only to decorate the reply with a
+        /// `stopDeadline` that nothing was going to honour, and the safety lane the stop belongs in
+        /// had no producer at all.
+        ///
+        /// So: command a move, then walk away. Nobody sends a stop. The camera must stop anyway.
+        #[tokio::test]
+        async fn a_continuous_move_is_stopped_by_its_deadline_with_nobody_asking() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(ptz_camera(&directory, 10_000), &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let request: PtzCommandRequest = crate::commands::parse_closed(json!({
+                "operation": "continuous",
+                "instance": "camera-a",
+                "requestId": "estop-timer",
+                "velocity": { "pan": 0.5, "tilt": 0.0, "zoom": 0.0 },
+                "timeoutMs": 300
+            }))
+            .unwrap();
+            let reply = runtime.perform_ptz(request).await.unwrap();
+            assert_eq!(reply["state"], "COMMANDED");
+            assert!(
+                !reply["stopDeadline"].is_null(),
+                "a move that is armed to stop must say when"
+            );
+            assert!(
+                camera_is_moving(&runtime).await,
+                "the camera must actually be moving before the deadline"
+            );
+
+            // The requester disappears. Nothing else asks for a stop.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if !camera_is_moving(&runtime).await {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the camera is still moving long past its mandatory stop deadline"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            runtime.shutdown().await;
+        }
+
+        /// An explicit stop retires the timer, so it cannot stop a LATER move.
+        ///
+        /// Arm, stop, move again: the first move's timer must not fire into the second move and cut
+        /// it short. A safety timer that stops the wrong motion is its own hazard.
+        #[tokio::test]
+        async fn a_stopped_move_does_not_leave_a_timer_that_stops_the_next_one() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(ptz_camera(&directory, 10_000), &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let first: PtzCommandRequest = crate::commands::parse_closed(json!({
+                "operation": "continuous",
+                "instance": "camera-a",
+                "requestId": "first-move",
+                "velocity": { "pan": 0.5, "tilt": 0.0, "zoom": 0.0 },
+                "timeoutMs": 300
+            }))
+            .unwrap();
+            runtime.perform_ptz(first).await.unwrap();
+
+            let stop: PtzCommandRequest = crate::commands::parse_closed(json!({
+                "operation": "stop",
+                "instance": "camera-a",
+                "requestId": "explicit-stop",
+                "axes": ["pan", "tilt", "zoom"]
+            }))
+            .unwrap();
+            runtime.perform_ptz(stop).await.unwrap();
+
+            // A new move, well inside the first one's now-retired deadline.
+            let second: PtzCommandRequest = crate::commands::parse_closed(json!({
+                "operation": "continuous",
+                "instance": "camera-a",
+                "requestId": "second-move",
+                "velocity": { "pan": 0.5, "tilt": 0.0, "zoom": 0.0 },
+                "timeoutMs": 5_000
+            }))
+            .unwrap();
+            runtime.perform_ptz(second).await.unwrap();
+
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert!(
+                camera_is_moving(&runtime).await,
+                "the first move's timer must not stop the second move"
+            );
+            runtime.shutdown().await;
+        }
+
+        /// The safety bound belongs to the camera, not to a constant in the code.
+        ///
+        /// The PTZ command was validated against a hardcoded 60 000 ms -- the widest value the field
+        /// accepts -- so a camera configured to move for one second would happily accept a command to
+        /// move for a minute, and then advertise a `stopDeadline` one second out that nothing honoured.
+        #[tokio::test]
+        async fn a_continuous_move_cannot_outlast_this_cameras_configured_bound() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(ptz_camera(&directory, 1_000), &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let too_long: PtzCommandRequest = crate::commands::parse_closed(json!({
+                "operation": "continuous",
+                "instance": "camera-a",
+                "requestId": "over-the-bound",
+                "velocity": { "pan": 0.5, "tilt": 0.0, "zoom": 0.0 },
+                // Well inside the schema ceiling of 60 s, and six times this camera's bound.
+                "timeoutMs": 6_000
+            }))
+            .unwrap();
+            let error = runtime
+                .perform_ptz(too_long)
+                .await
+                .expect_err("a camera bounded to one second must not accept a six-second move");
+            assert_eq!(error.code(), crate::ErrorCode::PtzRangeError);
+            assert!(
+                !camera_is_moving(&runtime).await,
+                "a rejected move must not have moved the camera"
+            );
+            runtime.shutdown().await;
         }
 
         /// G2: a cron fires ONE synchronised group across several cameras.

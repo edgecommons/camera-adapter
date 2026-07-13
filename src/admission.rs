@@ -479,6 +479,13 @@ struct ControlState<T> {
 pub struct ControlLanes<T> {
     state: Mutex<ControlState<T>>,
     ordinary_capacity: usize,
+    /// Raised the moment a safety stop enters the lane.
+    ///
+    /// The actor polls this lane between pieces of work, which is enough for everything except the
+    /// one thing the lane exists for: a capture holds the camera session for as long as it runs, and
+    /// an emergency stop cannot wait that long. This signal is what lets the actor find out about a
+    /// stop while it is still busy, rather than after.
+    safety: Notify,
 }
 
 impl<T> ControlLanes<T> {
@@ -496,6 +503,7 @@ impl<T> ControlLanes<T> {
             ));
         }
         Ok(Self {
+            safety: Notify::new(),
             state: Mutex::new(ControlState {
                 safety_stop: None,
                 ordinary: VecDeque::with_capacity(ordinary_capacity),
@@ -533,7 +541,27 @@ impl<T> ControlLanes<T> {
             Some(existing) => existing.merge(stop),
             None => state.safety_stop = Some(stop),
         }
+        drop(state);
+        self.safety.notify_waiters();
         Ok(())
+    }
+
+    /// Resolves as soon as a safety stop is waiting in the lane.
+    ///
+    /// The actor races this against the capture it is running, because a stop that is only noticed
+    /// when the capture ends is a stop that arrives up to `jobTerminalMs` late -- at a camera that
+    /// is physically moving. Enabled before the check, because `notify_waiters` only reaches waiters
+    /// that have already registered, and a stop that lands in that gap would be waited on forever.
+    pub async fn safety_stop_arrived(&self) {
+        loop {
+            let notified = self.safety.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.has_safety_stop() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Pops safety work first, then ordinary work. Actors call this before polling capture work.

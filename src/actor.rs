@@ -207,9 +207,49 @@ impl CameraActor {
                     let Some(queued) = queued else { break; };
                     let descriptor = queued.payload.into_descriptor();
                     let panic_descriptor = descriptor.clone();
-                    let result = AssertUnwindSafe(
-                        self.engine.execute(self.session.as_mut(), descriptor)
-                    ).catch_unwind().await;
+                    let capture_id = descriptor.capture_id().to_owned();
+                    // The capture owns the camera session for as long as it runs, so an emergency
+                    // stop cannot be delivered alongside it -- it can only be delivered INSTEAD of
+                    // it. Racing the two is therefore the whole of the fix: the lane is watched
+                    // while the capture runs, and a stop pre-empts it rather than queueing behind
+                    // it for up to `jobTerminalMs`. A capture is worth strictly less than a camera
+                    // that has been told to stop moving and has not.
+                    let controls = Arc::clone(&self.shared.controls);
+                    // Scoped so the capture future -- and with it the exclusive borrow of the camera
+                    // session -- is released before the result is handled.
+                    let result = {
+                    let engine = &self.engine;
+                    let capture = AssertUnwindSafe(
+                        engine.execute(self.session.as_mut(), descriptor)
+                    ).catch_unwind();
+                    tokio::pin!(capture);
+                    let mut pre_empted = false;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            finished = &mut capture => break finished,
+                            () = controls.safety_stop_arrived(), if !pre_empted => {
+                                pre_empted = true;
+                                // Cancelling releases the session at the capture's next await point
+                                // and durably terminalizes it as CANCELLED, with a reason an operator
+                                // can read. The stop itself is delivered at the top of the loop, which
+                                // pops the safety lane before anything else -- so it goes out the
+                                // moment the capture lets go, not when it would have finished.
+                                tracing::warn!(
+                                    instance = %self.shared.instance,
+                                    capture = %capture_id,
+                                    "an emergency stop pre-empted a running capture"
+                                );
+                                let _ = engine
+                                    .cancel_active(
+                                        &capture_id,
+                                        "capture was pre-empted by an emergency stop",
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                    };
                     match result {
                         Ok(Ok(_)) => {}
                         // The durable store failed, not the camera. Fail this capture and keep
@@ -1278,6 +1318,92 @@ mod tests {
         assert!(partials(Path::new(&harness.output.root_directory)).is_empty());
         shutdown.cancel();
         actor_task.await.unwrap().unwrap();
+    }
+
+    /// An emergency stop pre-empts the capture that is holding the camera.
+    ///
+    /// The capture owns the session for as long as it runs, so the stop cannot be delivered
+    /// alongside it -- only instead of it. Before this, the actor polled the safety lane between
+    /// pieces of work and nowhere else, so a stop pushed during a capture was not seen until the
+    /// capture finished: up to `jobTerminalMs`, at a camera that is physically moving. The lane was
+    /// documented as "independent" and "non-evictable", and it was neither of any use.
+    ///
+    /// The capture here takes two seconds. The stop must not take two seconds.
+    #[tokio::test]
+    async fn a_safety_stop_pre_empts_the_capture_that_is_holding_the_camera() {
+        let harness = harness(sim(2_000, false, true), 2, 2, false, false).await;
+        let shutdown = CancellationToken::new();
+        let handle = harness.handle.clone();
+        let catalog = harness.catalog.clone();
+        let actor_task = tokio::spawn(harness.actor.run(shutdown.clone()));
+
+        harness
+            .engine
+            .accept_and_queue(
+                &handle,
+                submission(&harness.output, "cap-pre-empted", OutputEncoding::Raw),
+            )
+            .await
+            .unwrap();
+
+        // Let the capture take the camera.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let started = std::time::Instant::now();
+        handle
+            .safety_stop(SafetyStop {
+                pan: true,
+                tilt: true,
+                zoom: true,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            })
+            .expect("the safety lane always accepts a stop");
+
+        // The stop reaches the camera when the capture lets go of it -- which must be at once, not
+        // when the capture would have finished.
+        let status = tokio::time::timeout(Duration::from_millis(1_200), async {
+            loop {
+                if let Ok(PtzResult::Status(status)) = handle
+                    .ptz(
+                        PtzRequest::Status,
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        &CancellationToken::new(),
+                    )
+                    .await
+                {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an emergency stop must not wait out the capture that is holding the camera");
+        assert_eq!(
+            status.moving,
+            Some(false),
+            "the camera must have been stopped"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "the stop took {:?}; the capture it pre-empted was two seconds long",
+            started.elapsed()
+        );
+
+        // And the capture it pre-empted is durably retired, with a reason, rather than left running
+        // against a camera that has been told to stop.
+        let record = terminal(&catalog, "cap-pre-empted").await;
+        assert_eq!(record.state, JobState::Cancelled);
+        assert!(
+            record
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("emergency stop")),
+            "an operator must be able to see why the capture died: {:?}",
+            record.error_message
+        );
+
+        shutdown.cancel();
+        let _ = actor_task.await;
     }
 
     #[tokio::test]

@@ -133,4 +133,15 @@ longer, and every member still runs. A member waits at most its profile's `queue
 `limits.maxQueueWaitMs`.
 
 `ptz` defaults to disabled. Its policy bounds continuous movement and disables preset mutation by default.
+
+A continuous move is stopped by its own deadline. `sb/ptz continuous` requires a `timeoutMs`, which may
+not exceed the camera's `ptz.maximumContinuousMoveMs`, and the adapter arms a stop for that instant
+before it replies -- the reply's `stopDeadline` is that instant. The camera is told the timeout as well,
+but the adapter does not rely on it: the move stops on time whether or not the camera honours its own
+timeout, and whether or not the requester is still there. An explicit stop, or any other PTZ command,
+retires the armed stop.
+
+The stop takes the camera's safety lane, which is served before queued controls and before captures: a
+capture in progress is cancelled to let it through, because a camera that has been told to stop moving
+matters more than an image.
 Use the [sample configurations](../sample-configurations.md) for complete shapes.
