@@ -373,10 +373,16 @@ same retention window as capture status.
 - Capture commands map the ledger entry to their durable capture job. A group capture maps its single
   component-scoped ledger entry to every member job.
 - Reconnect, cancel, PTZ move/stop/home, and preset goto/set/remove create a ledger entry before calling
-  the backend and persist the result after it returns.
+  the backend and persist the result after it returns. Reconnect persists its result as soon as the
+  session cancellation is signalled: it performs no physical actuation, and the new session is the
+  supervisor's own reconnect loop.
 - A crash after physical actuation but before result commit marks the ledger entry `OUTCOME_UNKNOWN`.
   A retry returns `PREVIOUS_OUTCOME_UNKNOWN` and does not automatically repeat potentially hazardous PTZ
   or preset work. Startup still sends best-effort PTZ stop for continuous motion.
+- Reconnect is excluded from that fence. It is idempotent and safe to redo, and a restart re-establishes
+  every session by definition, so startup settles an interrupted reconnect ledger as `SUCCEEDED` before
+  the fence runs. An unsettled reconnect row would be immortal: no retention statement deletes an
+  `IN_PROGRESS` or `OUTCOME_UNKNOWN` operation.
 - Read-only `sb/list`, `sb/discover`, `sb/status`, PTZ status, and preset list do not require `requestId`
   and are not recorded.
 
@@ -1799,6 +1805,13 @@ bytes are never stored in SQLite.
 Terminal jobs and their idempotency mappings share `resultRetentionHours` and `maxResultRecords`; an
 idempotency key is never removed earlier than the status record it resolves. Count-based pruning removes
 only the oldest terminal records and never removes a non-terminal job or undelivered outbox message.
+
+The runtime owns an hourly retention sweep on its cancellable task set. Each sweep reclaims delivered
+outbox messages past `outboxRetentionHours`, then terminal jobs, terminal groups, and completed command
+ledgers past `resultRetentionHours`, then enforces `maxResultRecords`. Delivered messages are reclaimed
+first because a terminal job or group is eligible only once its own retained messages are gone. The
+sweep is issued in bounded batches with a pause between them, so a large backlog never saturates the
+two-worker catalog pool that also carries the capture path, and it logs the counts it reclaimed.
 
 At startup:
 

@@ -34,6 +34,12 @@ const MAX_WORKERS: usize = 16;
 const DEFAULT_QUEUE_CAPACITY: usize = 128;
 const BUSY_TIMEOUT_MS: i64 = 5_000;
 
+/// Ledger verb of the reconnect command.
+///
+/// Reconnect is the one mutating verb that performs no physical actuation: it asks the runtime to
+/// drop and re-establish a session, which is idempotent and safe to redo.
+pub const RECONNECT_VERB: &str = "sb/reconnect";
+
 type Work = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
 
 /// Bounded catalog runtime configuration.
@@ -1170,6 +1176,29 @@ impl Catalog {
                 error_message.as_deref(),
                 updated_at_ms,
             )
+        })
+        .await
+    }
+
+    /// Settles every reconnect ledger left unresolved by a crash, so recovery never fences one as
+    /// hazardous.
+    ///
+    /// A restart re-establishes every camera session by definition, which is exactly what the
+    /// reconnect request asked for; the operation performs no physical actuation that could have
+    /// half-happened. Settling the row keeps it reclaimable by
+    /// [`Self::prune_completed_command_ledgers`] — an `IN_PROGRESS` or `OUTCOME_UNKNOWN` row
+    /// matches no DELETE in this catalog and would live forever — and stops a retried reconnect
+    /// from answering `PREVIOUS_OUTCOME_UNKNOWN` permanently.  `OUTCOME_UNKNOWN` rows written by
+    /// an earlier build are settled here too.
+    pub async fn settle_interrupted_reconnects(&self, updated_at_ms: i64) -> Result<u64> {
+        self.execute(move |connection| {
+            let changed = connection.execute(
+                "UPDATE command_ledger SET operation_state='SUCCEEDED',updated_at_ms=?1 \
+                 WHERE verb=?2 AND capture_id IS NULL AND group_id IS NULL \
+                 AND operation_state IN ('IN_PROGRESS','OUTCOME_UNKNOWN')",
+                params![updated_at_ms, RECONNECT_VERB],
+            )?;
+            Ok(changed as u64)
         })
         .await
     }
@@ -3074,8 +3103,11 @@ fn enforce_result_record_limit_blocking(
         [],
         |row| row.get(0),
     )?;
+    // Below the cap the excess is negative, and SQLite reads a negative LIMIT as *no* limit: the
+    // selection below would then match every eligible terminal record and delete the entire
+    // retained result set.  Nothing may be reclaimed until the count is actually exceeded.
     let excess = terminal_count.saturating_sub(max_result_records);
-    if excess == 0 {
+    if excess <= 0 {
         transaction.commit()?;
         return Ok(0);
     }
@@ -4227,6 +4259,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_reconnect_ledgers_are_settled_and_become_reclaimable() {
+        let directory = TempDir::new().unwrap();
+        let catalog = open(&directory).await;
+        let interrupted = LedgerKey::new("camera-a", RECONNECT_VERB, "reconnect-crash").unwrap();
+        let fenced = LedgerKey::new("camera-b", RECONNECT_VERB, "reconnect-legacy").unwrap();
+        let request = json!({"requestId":"reconnect","instance":"camera-a"});
+        let hash = canonical_request_hash(&request, false).unwrap();
+        for key in [interrupted.clone(), fenced.clone()] {
+            catalog
+                .begin_command(key, hash, request.clone(), 1_000)
+                .await
+                .unwrap();
+        }
+        // A state database written by an earlier build already carries a fenced reconnect row.
+        assert_eq!(
+            catalog
+                .mark_hazardous_commands_outcome_unknown(1_500)
+                .await
+                .unwrap(),
+            2
+        );
+
+        assert_eq!(
+            catalog.settle_interrupted_reconnects(2_000).await.unwrap(),
+            2
+        );
+        for key in [interrupted, fenced] {
+            let BeginCommandOutcome::Existing(settled) = catalog
+                .begin_command(key, hash, request.clone(), 2_100)
+                .await
+                .unwrap()
+            else {
+                panic!("a settled reconnect must remain the same durable operation");
+            };
+            assert_eq!(
+                settled.state,
+                LedgerState::Succeeded,
+                "a settled reconnect must never answer PREVIOUS_OUTCOME_UNKNOWN"
+            );
+        }
+        // The whole point: an IN_PROGRESS/OUTCOME_UNKNOWN row matches no DELETE in this catalog.
+        assert_eq!(
+            catalog
+                .prune_completed_command_ledgers(3_000, 10)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            catalog.settle_interrupted_reconnects(4_000).await.unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn in_progress_command_retains_exact_acceptance_reply_for_idempotent_retries() {
         let directory = TempDir::new().unwrap();
         let catalog = open(&directory).await;
@@ -4727,6 +4814,47 @@ mod tests {
         assert!(catalog.job("oldest").await.unwrap().is_none());
         assert!(catalog.job("middle").await.unwrap().is_none());
         assert!(catalog.job("newest").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn count_retention_below_the_maximum_reclaims_nothing() {
+        let directory = TempDir::new().unwrap();
+        let catalog = open(&directory).await;
+        for (capture, sequence) in [("kept-a", 95), ("kept-b", 96)] {
+            catalog
+                .accept_job(direct_job(capture, capture))
+                .await
+                .unwrap();
+            catalog.queue_job(capture, 2_000).await.unwrap();
+            catalog
+                .commit_terminal(capture, terminal_write(capture, JobState::Failed, sequence))
+                .await
+                .unwrap();
+        }
+        for record in catalog.pending_outbox(i64::MAX, 10).await.unwrap() {
+            catalog
+                .mark_outbox_delivered(record.id, 40_000)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            catalog.prune_delivered_outbox(i64::MAX, 10).await.unwrap(),
+            2
+        );
+
+        // A negative excess must never be handed to SQLite as a LIMIT: it reads a negative limit
+        // as unbounded, which would delete every retained terminal record instead of none.
+        assert_eq!(
+            catalog
+                .enforce_result_record_limit(100_000, 10)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(catalog.job("kept-a").await.unwrap().is_some());
+        assert!(catalog.job("kept-b").await.unwrap().is_some());
+        assert_eq!(catalog.enforce_result_record_limit(2, 10).await.unwrap(), 0);
+        assert!(catalog.job("kept-a").await.unwrap().is_some());
     }
 
     #[cfg(not(windows))]

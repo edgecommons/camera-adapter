@@ -75,6 +75,15 @@ const SCHEDULER_MISFIRE_GRACE: Duration = Duration::from_secs(5);
 // cannot delay a durable acceptance, physical acquisition, or consume unbounded task memory.
 const MAX_LIFECYCLE_EVENT_PUBLISHES: usize = 64;
 const LIFECYCLE_EVENT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
+// Retention windows are configured in hours, so an hourly reclaim is ample and never needs to
+// poll.  The catalog runs a two-worker pool that also carries the capture hot path: a sweep is
+// therefore issued in small batches, paced between them, so a large backlog is reclaimed over
+// several bounded round trips instead of saturating the pool and failing live camera sessions.
+const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(3_600);
+const RETENTION_BATCH: usize = 500;
+const RETENTION_MAX_BATCHES: usize = 40;
+const RETENTION_BATCH_PAUSE: Duration = Duration::from_millis(50);
+const MILLIS_PER_HOUR: i64 = 3_600_000;
 
 type ReadySetter = dyn Fn(bool) + Send + Sync;
 
@@ -1236,6 +1245,7 @@ impl CameraRuntime {
         runtime.start_supervisors()?;
         runtime.start_schedulers()?;
         runtime.start_periodic_discovery()?;
+        runtime.start_retention()?;
         Ok(runtime)
     }
 
@@ -2191,8 +2201,11 @@ impl CameraRuntime {
             .registry
             .resolve_actuation_instance(body.instance.as_deref())?;
         let canonical = serde_json::json!({ "instance": instance, "requestId": body.request_id, "reason": body.reason });
-        let key =
-            crate::catalog::LedgerKey::new(instance.clone(), "sb/reconnect", body.request_id)?;
+        let key = crate::catalog::LedgerKey::new(
+            instance.clone(),
+            crate::catalog::RECONNECT_VERB,
+            body.request_id,
+        )?;
         match self
             .catalog
             .begin_command(
@@ -2228,7 +2241,7 @@ impl CameraRuntime {
                 });
                 self.catalog
                     .record_command_acceptance(
-                        key,
+                        key.clone(),
                         operation.clone(),
                         chrono::Utc::now().timestamp_millis(),
                     )
@@ -2238,8 +2251,23 @@ impl CameraRuntime {
                         cancellation.cancel();
                     }
                 }
-                // The ledger remains IN_PROGRESS until the next status/recovery observes the
-                // new session. This prevents an ambiguous retry from recreating physical work.
+                // Signalling the session cancellation completes this operation: reconnect is a
+                // bounded, idempotent request to re-establish a session and performs no physical
+                // actuation that could half-happen, so nothing hazardous is left in flight. The
+                // ledger is therefore settled here rather than left IN_PROGRESS forever — such a
+                // row is fenced to OUTCOME_UNKNOWN on the next start, which no retention DELETE
+                // can ever match, and which would make every retry answer
+                // PREVIOUS_OUTCOME_UNKNOWN for the life of the state database.
+                self.catalog
+                    .complete_command(
+                        key,
+                        crate::catalog::LedgerState::Succeeded,
+                        operation.clone(),
+                        None,
+                        None,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
                 Ok(operation)
             }
         }
@@ -3422,6 +3450,96 @@ impl CameraRuntime {
         })
     }
 
+    /// Starts the periodic retention sweep on the runtime's own task/shutdown machinery.
+    fn start_retention(self: &Arc<Self>) -> Result<()> {
+        let runtime = Arc::clone(self);
+        let cancellation = self.cancellation.clone();
+        self.spawn_task(async move {
+            runtime
+                .run_retention(cancellation, RETENTION_SWEEP_INTERVAL, RETENTION_BATCH)
+                .await;
+        })
+    }
+
+    /// Sweeps retained durable state on `interval` until the runtime is cancelled.
+    ///
+    /// The interval and batch size are parameters rather than constants read inside the loop, so
+    /// the loop is directly drivable.  A failed sweep is never fatal: retention is a background
+    /// reclaim, and the next interval retries it.
+    async fn run_retention(
+        self: Arc<Self>,
+        cancellation: CancellationToken,
+        interval: Duration,
+        batch: usize,
+    ) {
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                () = tokio::time::sleep(interval) => {}
+            }
+            match self
+                .retention_sweep(chrono::Utc::now().timestamp_millis(), batch, &cancellation)
+                .await
+            {
+                Ok(sweep) if sweep.reclaimed() > 0 => tracing::info!(
+                    delivered_outbox = sweep.delivered_outbox,
+                    terminal_jobs = sweep.terminal_jobs,
+                    terminal_groups = sweep.terminal_groups,
+                    command_ledgers = sweep.command_ledgers,
+                    over_limit_jobs = sweep.over_limit_jobs,
+                    "camera retention reclaimed durable state"
+                ),
+                Ok(_) => {
+                    tracing::debug!("camera retention found no durable state past its windows");
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "camera retention sweep failed; retrying on the next interval");
+                }
+            }
+        }
+    }
+
+    /// Runs one full retention pass and reports what it reclaimed.
+    ///
+    /// Delivered outbox rows are reclaimed first because a terminal job or group only becomes
+    /// eligible once its own retained messages are gone.
+    async fn retention_sweep(
+        &self,
+        now_ms: i64,
+        batch: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<RetentionSweep> {
+        let config = self.config_snapshot()?;
+        let state = &config.global.state;
+        let outbox_before_ms =
+            now_ms.saturating_sub(i64::from(state.outbox_retention_hours) * MILLIS_PER_HOUR);
+        let terminal_before_ms =
+            now_ms.saturating_sub(i64::from(state.result_retention_hours) * MILLIS_PER_HOUR);
+        let catalog = &self.catalog;
+        Ok(RetentionSweep {
+            delivered_outbox: prune_in_batches(cancellation, batch, |limit| {
+                catalog.prune_delivered_outbox(outbox_before_ms, limit)
+            })
+            .await?,
+            terminal_jobs: prune_in_batches(cancellation, batch, |limit| {
+                catalog.prune_terminal_jobs(terminal_before_ms, limit)
+            })
+            .await?,
+            terminal_groups: prune_in_batches(cancellation, batch, |limit| {
+                catalog.prune_terminal_groups(terminal_before_ms, limit)
+            })
+            .await?,
+            command_ledgers: prune_in_batches(cancellation, batch, |limit| {
+                catalog.prune_completed_command_ledgers(terminal_before_ms, limit)
+            })
+            .await?,
+            over_limit_jobs: prune_in_batches(cancellation, batch, |limit| {
+                catalog.enforce_result_record_limit(state.max_result_records, limit)
+            })
+            .await?,
+        })
+    }
+
     fn start_outbox(
         self: &Arc<Self>,
         messaging: Arc<dyn edgecommons::messaging::MessagingService>,
@@ -4117,9 +4235,23 @@ impl CameraRuntime {
     }
 
     async fn recover_install_owned(&self) -> Result<()> {
-        // Generic PTZ/reconnect/preset commands may have crossed a physical side-effect boundary
-        // before the process died. They are never replayed automatically; exact retries receive
-        // the durable PREVIOUS_OUTCOME_UNKNOWN result instead.
+        // A restart re-establishes every session, which is exactly what a reconnect asked for, so
+        // an interrupted reconnect is settled rather than fenced. This must run before the
+        // hazardous fence below: an OUTCOME_UNKNOWN reconnect row is unreclaimable by every
+        // retention statement in the catalog and answers PREVIOUS_OUTCOME_UNKNOWN forever.
+        let settled = self
+            .catalog
+            .settle_interrupted_reconnects(chrono::Utc::now().timestamp_millis())
+            .await?;
+        if settled > 0 {
+            tracing::info!(
+                settled,
+                "settled reconnect commands interrupted by the previous run"
+            );
+        }
+        // Generic PTZ/preset commands may have crossed a physical side-effect boundary before the
+        // process died. They are never replayed automatically; exact retries receive the durable
+        // PREVIOUS_OUTCOME_UNKNOWN result instead.
         self.catalog
             .mark_hazardous_commands_outcome_unknown(chrono::Utc::now().timestamp_millis())
             .await?;
@@ -4301,8 +4433,25 @@ impl CameraRuntime {
                         tokio::select! {
                             joined = &mut actor_task => break joined.map_err(|error| crate::CameraError::Backend { backend: "actor", message: format!("actor task failed: {error}") }).and_then(|result| result),
                             _ = cancellation.cancelled() => {
-                                actor_task.abort();
-                                let _ = actor_task.await;
+                                // The actor holds a child of this token and is already winding
+                                // down, so it must be awaited, not dropped: its teardown is what
+                                // delivers the shutdown safety stop and closes the session. The
+                                // budget is the smaller of the two deadlines that already bound
+                                // this path — the shutdown grace and the reload drain timeout —
+                                // so a hung backend can defeat neither.
+                                let grace = Duration::from_millis(
+                                    global_config
+                                        .timeouts
+                                        .shutdown_grace_ms
+                                        .min(global_config.timeouts.reload_drain_timeout_ms),
+                                );
+                                if !join_actor_within_grace(&mut actor_task, grace).await {
+                                    tracing::warn!(
+                                        instance = %camera.id,
+                                        grace_ms = grace.as_millis(),
+                                        "camera actor did not complete its shutdown teardown within the grace budget; aborting"
+                                    );
+                                }
                                 break Ok(());
                             }
                             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
@@ -5178,6 +5327,77 @@ fn create_state_directory(directory: &std::path::Path) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Durable rows reclaimed by one retention sweep, reported so an operator can tell the subsystem
+/// is alive and how much state it is holding back.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RetentionSweep {
+    delivered_outbox: u64,
+    terminal_jobs: u64,
+    terminal_groups: u64,
+    command_ledgers: u64,
+    over_limit_jobs: u64,
+}
+
+impl RetentionSweep {
+    fn reclaimed(self) -> u64 {
+        self.delivered_outbox
+            .saturating_add(self.terminal_jobs)
+            .saturating_add(self.terminal_groups)
+            .saturating_add(self.command_ledgers)
+            .saturating_add(self.over_limit_jobs)
+    }
+}
+
+/// Repeats one bounded catalog prune until it stops reclaiming rows.
+///
+/// The batch size and the pause between batches keep a large backlog off the capture hot path:
+/// the shared two-worker catalog pool must never be saturated by a reclaim, because the actor
+/// treats any catalog error as a fatal session failure.  Cancellation is observed between
+/// batches so shutdown is never delayed by a sweep in flight.
+async fn prune_in_batches<F, Fut>(
+    cancellation: &CancellationToken,
+    batch: usize,
+    mut prune: F,
+) -> Result<u64>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<u64>>,
+{
+    let mut reclaimed = 0_u64;
+    for round in 0..RETENTION_MAX_BATCHES {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if round > 0 {
+            tokio::time::sleep(RETENTION_BATCH_PAUSE).await;
+        }
+        let removed = prune(batch).await?;
+        reclaimed = reclaimed.saturating_add(removed);
+        if removed < batch as u64 {
+            break;
+        }
+    }
+    Ok(reclaimed)
+}
+
+/// Awaits the graceful teardown a cancelled actor is already running, and aborts only when the
+/// grace expires.  Returns `true` when the actor stopped itself within the budget.
+///
+/// The actor owns a child of the supervisor's cancellation token, so by the time the supervisor
+/// observes cancellation the actor is winding down: it delivers its queued shutdown safety stop
+/// (on a fresh token, so a tripped component token cannot suppress it), drains queued captures,
+/// and closes the protocol session.  Aborting immediately drops that future at its first await
+/// point — deterministically, since the actor task has not been polled yet — which leaves a
+/// panning camera moving after exit and leaks every RTSP/ONVIF session server-side.
+async fn join_actor_within_grace(actor_task: &mut JoinHandle<Result<()>>, grace: Duration) -> bool {
+    if tokio::time::timeout(grace, &mut *actor_task).await.is_ok() {
+        return true;
+    }
+    actor_task.abort();
+    let _ = actor_task.await;
+    false
 }
 
 /// Runtime command implementation installed only after every startup gate has passed.
@@ -11077,6 +11297,646 @@ mod tests {
                     "omittedFromThisSmoke": ["24-hour execution", "10,000-job completion target", "broker-outage recovery", "encoder/writer saturation", "Core ping timing", "physical cameras"]
                 }),
             );
+        }
+
+        fn retention_job(capture_id: &str, request_id: &str) -> crate::catalog::NewJob {
+            let canonical_request = json!({ "requestId": request_id, "profile": "main" });
+            crate::catalog::NewJob {
+                capture_id: capture_id.to_owned(),
+                instance: "camera-a".to_owned(),
+                ledger_key: Some(
+                    crate::catalog::LedgerKey::new("camera-a", "sb/capture", request_id).unwrap(),
+                ),
+                request_hash: crate::idempotency::canonical_request_hash(&canonical_request, false)
+                    .unwrap(),
+                canonical_request,
+                effective_profile: json!({ "name": "main", "encoding": "jpeg" }),
+                deadlines: crate::catalog::JobDeadlines {
+                    terminal_at_ms: 10_000,
+                    queue_at_ms: Some(2_000),
+                    capture_at_ms: 4_000,
+                    encode_at_ms: 7_000,
+                    persist_at_ms: 9_000,
+                },
+                trigger: json!({ "type": "command", "requestId": request_id }),
+                origin_correlation_id: Some(format!("corr-{capture_id}")),
+                intended_output: json!({ "relativePath": format!("{capture_id}.jpg") }),
+                accepted_at_ms: 1_000,
+                group_id: None,
+            }
+        }
+
+        fn retention_terminal(
+            capture_id: &str,
+            instance: &str,
+            sequence: u8,
+        ) -> crate::catalog::TerminalWrite {
+            retention_terminal_for(capture_id, instance, None, sequence)
+        }
+
+        fn retention_terminal_for(
+            capture_id: &str,
+            instance: &str,
+            group_id: Option<&str>,
+            sequence: u8,
+        ) -> crate::catalog::TerminalWrite {
+            let event_key = format!("retention-event-{sequence}");
+            let mut body = json!({
+                "schemaVersion": 1,
+                "eventId": event_key.clone(),
+                "captureId": capture_id,
+                "cameraId": instance,
+                "correlationId": format!("corr-{capture_id}"),
+            });
+            if let Some(group_id) = group_id {
+                body["captureGroupId"] = json!(group_id);
+            }
+            let message = MessageBuilder::new("ImageCaptureFailed", "1.0")
+                .correlation_id(format!("corr-{capture_id}"))
+                .payload(body)
+                .build();
+            crate::catalog::TerminalWrite {
+                state: crate::model::JobState::Failed,
+                result: json!({ "state": "FAILED" }),
+                error_code: Some("PROCESS_INTERRUPTED".to_owned()),
+                error_message: Some("bounded failure".to_owned()),
+                // Deliberately ancient: every sweep below uses the real clock, so these records
+                // are far outside both configured retention windows.
+                terminal_at_ms: 20_000 + i64::from(sequence),
+                outbox: crate::catalog::NewOutboxMessage::from_message(
+                    event_key,
+                    "terminal",
+                    "ecv1/test/camera-adapter/main/app/image/failed",
+                    &message,
+                    20_000,
+                    20_000,
+                )
+                .unwrap(),
+            }
+        }
+
+        /// Seeds two terminal direct jobs, one terminal group with a terminal member, and one
+        /// completed standalone command ledger, then marks every terminal message delivered.
+        async fn seed_retained_state(catalog: &Catalog) {
+            for (capture, sequence) in [("retention-a", 1_u8), ("retention-b", 2)] {
+                catalog
+                    .accept_job(retention_job(capture, capture))
+                    .await
+                    .unwrap();
+                catalog.queue_job(capture, 2_000).await.unwrap();
+                catalog
+                    .commit_terminal(capture, retention_terminal(capture, "camera-a", sequence))
+                    .await
+                    .unwrap();
+            }
+
+            // A capture group spans distinct camera instances by construction.
+            let group_request = json!({ "requestId": "retention-group" });
+            let members = [
+                ("retention-member-a", "camera-a"),
+                ("retention-member-b", "camera-b"),
+            ]
+            .into_iter()
+            .map(|(capture, instance)| {
+                let mut member = retention_job(capture, capture);
+                member.instance = instance.to_owned();
+                member.ledger_key = None;
+                member.group_id = Some("retention-group-1".to_owned());
+                member
+            })
+            .collect::<Vec<_>>();
+            catalog
+                .accept_group(crate::catalog::NewGroup {
+                    group_id: "retention-group-1".to_owned(),
+                    ledger_key: crate::catalog::LedgerKey::new(
+                        "main",
+                        "sb/capture-group",
+                        "retention-group",
+                    )
+                    .unwrap(),
+                    request_hash: crate::idempotency::canonical_request_hash(&group_request, false)
+                        .unwrap(),
+                    canonical_request: group_request,
+                    origin_correlation_id: None,
+                    accepted_at_ms: 1_000,
+                    members,
+                })
+                .await
+                .unwrap();
+            for (capture, instance, sequence) in [
+                ("retention-member-a", "camera-a", 3_u8),
+                ("retention-member-b", "camera-b", 4),
+            ] {
+                catalog.queue_job(capture, 2_000).await.unwrap();
+                catalog
+                    .commit_terminal(
+                        capture,
+                        retention_terminal_for(
+                            capture,
+                            instance,
+                            Some("retention-group-1"),
+                            sequence,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+            }
+            catalog
+                .complete_group(
+                    "retention-group-1",
+                    crate::model::JobState::Failed,
+                    json!({ "succeeded": 0, "failed": 2 }),
+                    Some("BACKEND_ERROR".to_owned()),
+                    Some("members failed".to_owned()),
+                    30_000,
+                )
+                .await
+                .unwrap();
+
+            let ptz_request = json!({ "instance": "camera-a", "requestId": "retention-ptz" });
+            let ptz_key =
+                crate::catalog::LedgerKey::new("camera-a", "sb/ptz/absolute", "retention-ptz")
+                    .unwrap();
+            catalog
+                .begin_command(
+                    ptz_key.clone(),
+                    crate::idempotency::canonical_request_hash(&ptz_request, false).unwrap(),
+                    ptz_request,
+                    1_000,
+                )
+                .await
+                .unwrap();
+            catalog
+                .complete_command(
+                    ptz_key,
+                    crate::catalog::LedgerState::Succeeded,
+                    json!({ "state": "COMMANDED" }),
+                    None,
+                    None,
+                    2_000,
+                )
+                .await
+                .unwrap();
+
+            for record in catalog.pending_outbox(i64::MAX, 100).await.unwrap() {
+                catalog
+                    .mark_outbox_delivered(record.id, 35_000)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Every one of these records used to accumulate forever: the whole retention subsystem was
+        // built, unit-tested, and then never called, so the state database grew until the
+        // free-space floor rejected every capture.
+        #[tokio::test]
+        async fn retention_sweep_reclaims_state_past_its_windows_and_reports_the_counts() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+            let catalog = runtime.catalog.clone();
+            seed_retained_state(&catalog).await;
+
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let sweep = runtime
+                .retention_sweep(now_ms, RETENTION_BATCH, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(sweep.delivered_outbox, 4);
+            assert_eq!(sweep.terminal_jobs, 2);
+            assert_eq!(sweep.terminal_groups, 1);
+            assert_eq!(sweep.command_ledgers, 1);
+            assert_eq!(
+                sweep.over_limit_jobs, 0,
+                "a record count far below maxResultRecords must reclaim nothing"
+            );
+            assert_eq!(sweep.reclaimed(), 8);
+
+            assert!(catalog.job("retention-a").await.unwrap().is_none());
+            assert!(catalog.job("retention-b").await.unwrap().is_none());
+            assert!(catalog.job("retention-member-a").await.unwrap().is_none());
+            assert!(catalog.job("retention-member-b").await.unwrap().is_none());
+            assert!(catalog.group("retention-group-1").await.unwrap().is_none());
+            assert_eq!(
+                runtime
+                    .retention_sweep(now_ms, RETENTION_BATCH, &CancellationToken::new())
+                    .await
+                    .unwrap(),
+                RetentionSweep::default(),
+                "a second sweep must find nothing left to reclaim"
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn retention_sweep_enforces_the_configured_result_record_maximum() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            configuration.global.state.max_result_records = 1;
+            let runtime = runtime(configuration, &directory).await;
+            let catalog = runtime.catalog.clone();
+            // Keep both jobs inside the time window so only the count limit can reclaim them.
+            for (capture, sequence) in [("count-a", 11_u8), ("count-b", 12)] {
+                catalog
+                    .accept_job(retention_job(capture, capture))
+                    .await
+                    .unwrap();
+                catalog.queue_job(capture, 2_000).await.unwrap();
+                catalog
+                    .commit_terminal(capture, retention_terminal(capture, "camera-a", sequence))
+                    .await
+                    .unwrap();
+            }
+            for record in catalog.pending_outbox(i64::MAX, 100).await.unwrap() {
+                catalog
+                    .mark_outbox_delivered(record.id, 35_000)
+                    .await
+                    .unwrap();
+            }
+            let future_ms = chrono::Utc::now().timestamp_millis();
+            let sweep = runtime
+                .retention_sweep(future_ms, RETENTION_BATCH, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(sweep.over_limit_jobs + sweep.terminal_jobs, 2);
+            assert!(catalog.job("count-a").await.unwrap().is_none());
+            assert!(catalog.job("count-b").await.unwrap().is_none());
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn retention_sweep_yields_to_cancellation_before_touching_the_catalog() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+            let catalog = runtime.catalog.clone();
+            seed_retained_state(&catalog).await;
+
+            let cancellation = CancellationToken::new();
+            cancellation.cancel();
+            let sweep = runtime
+                .retention_sweep(
+                    chrono::Utc::now().timestamp_millis(),
+                    RETENTION_BATCH,
+                    &cancellation,
+                )
+                .await
+                .unwrap();
+            assert_eq!(sweep, RetentionSweep::default());
+            assert!(
+                catalog.job("retention-a").await.unwrap().is_some(),
+                "a cancelled sweep must not keep issuing catalog work"
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn retention_sweep_reclaims_a_backlog_in_bounded_paced_batches() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+            let catalog = runtime.catalog.clone();
+            seed_retained_state(&catalog).await;
+
+            // One row per catalog round trip: the sweep must keep going until the backlog is gone
+            // rather than reclaim a single batch and wait an hour, and it must never issue the
+            // whole backlog at once against the two-worker pool that carries the capture path.
+            let sweep = runtime
+                .retention_sweep(
+                    chrono::Utc::now().timestamp_millis(),
+                    1,
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(sweep.delivered_outbox, 4);
+            assert_eq!(sweep.terminal_jobs, 2);
+            assert_eq!(sweep.reclaimed(), 8);
+            assert!(catalog.job("retention-b").await.unwrap().is_none());
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn a_failing_retention_sweep_never_stops_the_periodic_task() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+            let catalog = runtime.catalog.clone();
+            seed_retained_state(&catalog).await;
+
+            // A zero batch is rejected by every prune, so every sweep fails. Retention is a
+            // background reclaim: a failing sweep must be logged and retried, never propagated.
+            let cancellation = CancellationToken::new();
+            let sweeper = tokio::spawn(Arc::clone(&runtime).run_retention(
+                cancellation.clone(),
+                Duration::from_millis(5),
+                0,
+            ));
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert!(
+                !sweeper.is_finished(),
+                "a failing sweep must not terminate the retention task"
+            );
+            assert!(catalog.job("retention-a").await.unwrap().is_some());
+            cancellation.cancel();
+            tokio::time::timeout(Duration::from_secs(5), sweeper)
+                .await
+                .expect("the retention task must still observe cancellation")
+                .expect("the retention task must not panic");
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn periodic_retention_reclaims_on_its_interval_and_stops_with_the_runtime() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+            let catalog = runtime.catalog.clone();
+            seed_retained_state(&catalog).await;
+
+            let cancellation = CancellationToken::new();
+            let sweeper = tokio::spawn(Arc::clone(&runtime).run_retention(
+                cancellation.clone(),
+                Duration::from_millis(20),
+                RETENTION_BATCH,
+            ));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while catalog.job("retention-a").await.unwrap().is_some() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the periodic sweep never reclaimed a record past its retention window"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // Keep sweeping once the backlog is gone: an idle sweep must be a no-op, not an error
+            // and not a reason for the task to stop.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!sweeper.is_finished());
+
+            cancellation.cancel();
+            tokio::time::timeout(Duration::from_secs(5), sweeper)
+                .await
+                .expect("a cancelled retention task must stop within the shutdown grace")
+                .expect("the retention task must not panic");
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn start_retention_registers_a_cancellable_runtime_task() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+            let before = runtime.tasks.lock().unwrap().len();
+            runtime.start_retention().unwrap();
+            assert_eq!(runtime.tasks.lock().unwrap().len(), before + 1);
+            // The task parks on the hourly interval; shutdown must still join it immediately.
+            tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
+                .await
+                .expect("the retention task must observe runtime cancellation");
+        }
+
+        // D6: `sb/reconnect` began a ledger row and never completed it.  The row was fenced to
+        // OUTCOME_UNKNOWN on the next start, which no DELETE in the catalog can match, so the row
+        // was immortal and every retry answered PREVIOUS_OUTCOME_UNKNOWN forever.
+        #[tokio::test]
+        async fn reconnect_settles_its_ledger_and_the_row_is_reclaimable() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+            let accepted = runtime
+                .reconnect(ReconnectRequest {
+                    instance: Some("camera-a".to_string()),
+                    request_id: "reconnect-settled".to_string(),
+                    reason: None,
+                })
+                .await
+                .unwrap();
+
+            let key = crate::catalog::LedgerKey::new(
+                "camera-a",
+                crate::catalog::RECONNECT_VERB,
+                "reconnect-settled",
+            )
+            .unwrap();
+            let canonical =
+                json!({ "instance": "camera-a", "requestId": "reconnect-settled", "reason": null });
+            let hash = crate::idempotency::canonical_request_hash(&canonical, false).unwrap();
+            let crate::catalog::BeginCommandOutcome::Existing(record) = runtime
+                .catalog
+                .begin_command(key, hash, canonical, chrono::Utc::now().timestamp_millis())
+                .await
+                .unwrap()
+            else {
+                panic!("the reconnect must have created exactly one durable ledger row");
+            };
+            assert_eq!(record.state, crate::catalog::LedgerState::Succeeded);
+            assert_eq!(record.reply, Some(accepted));
+
+            // Past the result-retention window the settled row is reclaimed like any other
+            // completed command; an IN_PROGRESS or OUTCOME_UNKNOWN row never would be.
+            let future_ms = chrono::Utc::now().timestamp_millis() + 30 * 24 * MILLIS_PER_HOUR;
+            let sweep = runtime
+                .retention_sweep(future_ms, RETENTION_BATCH, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(sweep.command_ledgers, 1);
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn startup_settles_an_interrupted_reconnect_instead_of_fencing_it_forever() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+            let key = crate::catalog::LedgerKey::new(
+                "camera-a",
+                crate::catalog::RECONNECT_VERB,
+                "reconnect-crash",
+            )
+            .unwrap();
+            let canonical =
+                json!({ "instance": "camera-a", "requestId": "reconnect-crash", "reason": null });
+            let hash = crate::idempotency::canonical_request_hash(&canonical, false).unwrap();
+            let reply =
+                json!({ "operationId": "op_prior", "instance": "camera-a", "state": "ACCEPTED" });
+            // Exactly the durable state a crash between acceptance and completion leaves behind.
+            runtime
+                .catalog
+                .begin_command(key.clone(), hash, canonical, 1_000)
+                .await
+                .unwrap();
+            runtime
+                .catalog
+                .record_command_acceptance(key, reply.clone(), 1_001)
+                .await
+                .unwrap();
+
+            runtime.recover_install_owned().await.unwrap();
+
+            // The retry must return the retained acceptance, not PREVIOUS_OUTCOME_UNKNOWN.
+            let retried = runtime
+                .reconnect(ReconnectRequest {
+                    instance: Some("camera-a".to_string()),
+                    request_id: "reconnect-crash".to_string(),
+                    reason: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(retried, reply);
+            let future_ms = chrono::Utc::now().timestamp_millis() + 30 * 24 * MILLIS_PER_HOUR;
+            let sweep = runtime
+                .retention_sweep(future_ms, RETENTION_BATCH, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(
+                sweep.command_ledgers, 1,
+                "a reconnect row interrupted by a crash must remain reclaimable"
+            );
+            runtime.shutdown().await;
+        }
+
+        struct TeardownSession {
+            capabilities: crate::model::CameraCapabilities,
+            stops: Arc<Mutex<Vec<crate::model::PtzRequest>>>,
+            closes: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl crate::backend::CameraSession for TeardownSession {
+            fn capabilities(&self) -> &crate::model::CameraCapabilities {
+                &self.capabilities
+            }
+
+            async fn status(&mut self) -> Result<crate::backend::CameraStatus> {
+                unreachable!("the shutdown teardown test never reads status")
+            }
+
+            async fn capture(
+                &mut self,
+                _request: crate::backend::CaptureRequest,
+            ) -> Result<crate::model::CaptureFrame> {
+                unreachable!("the shutdown teardown test never captures")
+            }
+
+            async fn ptz(
+                &mut self,
+                request: crate::model::PtzRequest,
+            ) -> Result<crate::model::PtzResult> {
+                self.stops.lock().unwrap().push(request);
+                Ok(crate::model::PtzResult::Commanded)
+            }
+
+            async fn close(&mut self) -> Result<()> {
+                self.closes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        // B4: the supervisor used to `abort()` the actor on cancellation. The actor holds a CHILD
+        // of that token, so it was already running its teardown; the abort dropped that future at
+        // its first await point, which meant a SIGTERM during a pan left the camera panning and no
+        // session was ever closed.
+        #[tokio::test]
+        async fn cancelled_actor_runs_its_safety_stop_and_session_close_within_the_grace() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+            let stops = Arc::new(Mutex::new(Vec::new()));
+            let closes = Arc::new(AtomicUsize::new(0));
+            let session = TeardownSession {
+                capabilities: crate::model::CameraCapabilities {
+                    capture_modes: vec![crate::model::CaptureMode::Simulated],
+                    pixel_formats: vec![crate::model::PixelFormat::Rgb8],
+                    software_trigger: false,
+                    snapshot_uri: false,
+                    rtsp: false,
+                    ptz: true,
+                    ptz_status: true,
+                    presets: false,
+                    preset_mutation: false,
+                    vendor: None,
+                    model: None,
+                    firmware: None,
+                    serial: None,
+                    warnings: Vec::new(),
+                },
+                stops: Arc::clone(&stops),
+                closes: Arc::clone(&closes),
+            };
+            let (actor, handle) = CameraActor::new(
+                "camera-a",
+                Box::new(session),
+                runtime.engine("camera-a").unwrap(),
+                2,
+                2,
+            )
+            .unwrap();
+            handle
+                .safety_stop(crate::admission::SafetyStop {
+                    pan: true,
+                    tilt: true,
+                    zoom: false,
+                    deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                })
+                .unwrap();
+
+            // Reproduce the supervisor's exact shutdown ordering: the component token is tripped
+            // before the actor task has ever been polled.
+            let actor_cancellation = runtime.cancellation.child_token();
+            runtime.cancellation.cancel();
+            let mut actor_task = tokio::spawn(actor.run(actor_cancellation));
+
+            assert!(
+                join_actor_within_grace(&mut actor_task, Duration::from_secs(10)).await,
+                "the actor must complete its own teardown inside the grace budget"
+            );
+            let observed = stops.lock().unwrap().clone();
+            assert_eq!(
+                observed,
+                vec![crate::model::PtzRequest::Stop {
+                    pan: true,
+                    tilt: true,
+                    zoom: false
+                }],
+                "the queued shutdown safety stop must reach the transport"
+            );
+            assert_eq!(
+                closes.load(Ordering::SeqCst),
+                1,
+                "the protocol session must be closed instead of leaked server-side"
+            );
+        }
+
+        // The grace is an upper bound, not a new way to hang: a backend that will not finish its
+        // teardown must still be abandoned inside the budget the configuration already grants.
+        #[tokio::test]
+        async fn a_supervisor_never_waits_for_an_actor_past_the_configured_grace() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            configuration.global.timeouts.shutdown_grace_ms = 0;
+            configuration.global.timeouts.reload_drain_timeout_ms = 0;
+            let runtime = runtime(configuration, &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let finished = runtime
+                .supervisor_finished
+                .read()
+                .unwrap()
+                .get("camera-a")
+                .cloned()
+                .expect("a live supervisor must publish its completion token");
+            runtime.cancellation.cancel();
+            tokio::time::timeout(Duration::from_secs(5), finished.cancelled())
+                .await
+                .expect("a zero grace must abort the actor rather than wait for its teardown");
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn hung_actor_is_aborted_once_the_shutdown_grace_expires() {
+            let mut actor_task: JoinHandle<Result<()>> =
+                tokio::spawn(async { std::future::pending::<Result<()>>().await });
+            let started = tokio::time::Instant::now();
+            assert!(
+                !join_actor_within_grace(&mut actor_task, Duration::from_millis(50)).await,
+                "a backend that ignores cancellation must not hold the shutdown grace open"
+            );
+            assert!(actor_task.is_finished());
+            assert!(started.elapsed() < Duration::from_secs(5));
         }
     }
 }
