@@ -1,0 +1,61 @@
+EdgeCommons Camera Adapter — Third-Party License Notices
+============================================================
+
+This NOTICE file records license information for optional, non-default
+native dependencies of this project, as required by the Business Source
+License 1.1 governing this repository's own code (see LICENSE). It is
+provided for informational purposes and does not modify the terms of
+LICENSE.
+
+No Eclipse (EPL/EDL) dual-licensed dependency is present in this repo's
+Cargo.toml — the EDL-1.0 election recorded in ../core/NOTICE and
+../opcua-adapter/NOTICE does not apply here.
+
+LGPL-licensed native libraries (optional features, off by default)
+--------------------------------------------------------------------
+
+The `genicam` and `rtsp` Cargo features are NOT enabled by default (this
+crate's default features are `standalone` + `onvif` only). When a build
+explicitly enables them, this crate dynamically links, at build/run time
+via pkg-config, the following LGPL-licensed system libraries. Their
+source is not vendored or statically linked into this repository or its
+build output:
+
+- Aravis (GenICam camera library) — LGPL-2.1-or-later
+  https://github.com/AravisProject/aravis
+  Enabled by: `genicam` feature, via the in-repo `aravis-scoped` FFI crate
+  (itself Apache-2.0), which binds to the system-installed library.
+
+- GLib — LGPL-2.1-or-later
+  https://gitlab.gnome.org/GNOME/glib
+  Pulled in transitively by Aravis (`genicam`) and GStreamer (`rtsp`).
+
+- GStreamer (core) — LGPL-2.1-or-later
+  https://gitlab.freedesktop.org/gstreamer/gstreamer
+  Enabled by: `rtsp` feature, via the `gstreamer`/`gstreamer-app` Rust
+  binding crates (themselves MIT/Apache-2.0), which bind to the
+  system-installed libraries.
+
+Dynamic linking against an LGPL library is the standard pattern that does
+not itself place the linking application under LGPL terms; it does
+require that the LGPL component remain separately replaceable/relinkable
+by the end user. Any build or deployment image using the `genicam` or
+`rtsp` features must continue to link Aravis/GLib/GStreamer dynamically —
+never statically bundle their source into this project's own binary.
+
+GStreamer plugin caveat
+------------------------
+
+GStreamer discovers plugins dynamically at runtime; which plugins are
+present is a property of the deployment host or container image, not of
+this crate's Cargo dependencies. Some commonly-used GStreamer plugins
+(e.g. in gst-plugins-ugly/gst-plugins-bad, and certain codec wrappers) are
+licensed under the GPL, not the LGPL — loading a GPL-licensed plugin into
+the same process carries a materially stronger copyleft obligation than
+the LGPL core alone. Any container image or deployment target that
+enables the `rtsp` feature must have its installed GStreamer plugin set
+audited for GPL-licensed plugins before being distributed under LICENSE.
+
+This is a factual/technical disclosure, not legal advice on LGPL linking
+obligations or GPL plugin exposure — have counsel review before enabling
+`genicam`/`rtsp` in any distributed build.
