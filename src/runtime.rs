@@ -2106,6 +2106,60 @@ impl CameraRuntime {
         }
     }
 
+    /// Builds one `camera_queue` sample.
+    ///
+    /// Separated from the timer loop that calls it because a loop that fires every 30 seconds cannot
+    /// be asserted on in a unit test, and "the numbers the operator sees are the numbers the
+    /// component holds" is exactly the part worth asserting.
+    async fn sample_queue_metric(&self) -> Result<std::collections::HashMap<String, f64>> {
+        let status = self.queue_status(None).await?;
+        let configured = status.cameras.len();
+        let online = self
+            .registry
+            .snapshots(configured.max(1))
+            .map(|snapshots| {
+                snapshots
+                    .into_iter()
+                    .filter(|snapshot| snapshot.state == CameraConnectionState::Online)
+                    .count()
+            })
+            .unwrap_or_default();
+        let mut values = std::collections::HashMap::new();
+        #[allow(clippy::cast_precision_loss)]
+        // Counts and byte budgets; f64 is the metric wire type.
+        {
+            let mut put = |name: &str, value: f64| {
+                values.insert(name.to_owned(), value);
+            };
+            put("dispatchQueued", status.dispatch_queued as f64);
+            put("durableBacklog", status.durable_backlog as f64);
+            put("durableInFlight", status.durable_in_flight as f64);
+            put(
+                "availableAcquisitions",
+                status.admission.available_acquisitions as f64,
+            );
+            put(
+                "availableEncoders",
+                status.admission.available_encoders as f64,
+            );
+            put(
+                "availableWriters",
+                status.admission.available_writers as f64,
+            );
+            put(
+                "availableMemoryBytes",
+                status.admission.available_memory_bytes as f64,
+            );
+            put(
+                "outstandingDiskBytes",
+                status.admission.outstanding_disk_bytes as f64,
+            );
+            put("camerasOnline", online as f64);
+            put("camerasConfigured", configured as f64);
+        }
+        Ok(values)
+    }
+
     /// Answers `sb/queue-status`.
     ///
     /// Read-only and cheap: the admission and dispatcher numbers are atomics, and the durable
@@ -2258,6 +2312,63 @@ impl CameraRuntime {
             dispatcher.discard_cancelled()?;
         }
         Ok(())
+    }
+
+    /// Answers `sb/queue-status` for the command layer.
+    async fn queue_status_command(
+        &self,
+        body: commands::QueueStatusRequest,
+    ) -> Result<serde_json::Value> {
+        body.validate()?;
+        Ok(serde_json::to_value(
+            self.queue_status(body.instance).await?,
+        )?)
+    }
+
+    /// Answers `sb/queue-clear` for the command layer.
+    async fn queue_clear_command(
+        &self,
+        body: commands::QueueClearRequest,
+    ) -> Result<serde_json::Value> {
+        body.validate()?;
+        let commands::QueueClearRequest {
+            request_id,
+            instance,
+            all_cameras: _,
+            include_in_flight,
+            reason,
+        } = body;
+        let canonical_reason = reason.clone();
+        let reason = reason.unwrap_or_else(|| "operator queue drain".to_string());
+        let canonical = serde_json::json!({
+            "requestId": &request_id,
+            "instance": &instance,
+            "includeInFlight": include_in_flight,
+            "reason": canonical_reason,
+        });
+        // Ledgered like every other mutating verb: a retried drain returns the original outcome
+        // instead of cancelling a second wave of work the operator never saw.
+        let key = crate::catalog::LedgerKey::new(
+            instance.clone().unwrap_or_else(|| "main".to_string()),
+            "sb/queue-clear",
+            request_id,
+        )?;
+        self.cancel_with_ledger(
+            key,
+            canonical,
+            serde_json::json!({
+                "cancelled": 0,
+                "alreadyTerminal": 0,
+                "failed": [],
+            }),
+            async {
+                let outcome = self
+                    .clear_queue(instance, include_in_flight, reason)
+                    .await?;
+                Ok(serde_json::to_value(outcome)?)
+            },
+        )
+        .await
     }
 
     async fn cancel_capture(&self, body: CancelRequest) -> Result<serde_json::Value> {
@@ -3713,57 +3824,13 @@ impl CameraRuntime {
                     () = cancellation.cancelled() => return,
                     () = tokio::time::sleep(METRIC_SAMPLE_INTERVAL) => {}
                 }
-                let status = match runtime.queue_status(None).await {
-                    Ok(status) => status,
+                let values = match runtime.sample_queue_metric().await {
+                    Ok(values) => values,
                     Err(error) => {
                         tracing::warn!(error = %error, "camera queue metrics could not be sampled");
                         continue;
                     }
                 };
-                let configured = status.cameras.len();
-                let online = runtime
-                    .registry
-                    .snapshots(configured.max(1))
-                    .map(|snapshots| {
-                        snapshots
-                            .into_iter()
-                            .filter(|snapshot| snapshot.state == CameraConnectionState::Online)
-                            .count()
-                    })
-                    .unwrap_or_default();
-                let mut values = std::collections::HashMap::new();
-                let mut put = |name: &str, value: f64| {
-                    values.insert(name.to_owned(), value);
-                };
-                #[allow(clippy::cast_precision_loss)]
-                // Counts and byte budgets; f64 is the metric wire type.
-                {
-                    put("dispatchQueued", status.dispatch_queued as f64);
-                    put("durableBacklog", status.durable_backlog as f64);
-                    put("durableInFlight", status.durable_in_flight as f64);
-                    put(
-                        "availableAcquisitions",
-                        status.admission.available_acquisitions as f64,
-                    );
-                    put(
-                        "availableEncoders",
-                        status.admission.available_encoders as f64,
-                    );
-                    put(
-                        "availableWriters",
-                        status.admission.available_writers as f64,
-                    );
-                    put(
-                        "availableMemoryBytes",
-                        status.admission.available_memory_bytes as f64,
-                    );
-                    put(
-                        "outstandingDiskBytes",
-                        status.admission.outstanding_disk_bytes as f64,
-                    );
-                    put("camerasOnline", online as f64);
-                    put("camerasConfigured", configured as f64);
-                }
                 runtime.metrics.sample_queue(values).await;
             }
         })
@@ -5291,51 +5358,12 @@ impl CameraCommandService for CameraRuntime {
                 "sb/queue-status" => {
                     let body: commands::QueueStatusRequest =
                         commands::parse_closed(request.body.clone())?;
-                    body.validate()?;
-                    let status = self.queue_status(body.instance).await?;
-                    Ok(serde_json::to_value(status)?)
+                    self.queue_status_command(body).await
                 }
                 "sb/queue-clear" => {
                     let body: commands::QueueClearRequest =
                         commands::parse_closed(request.body.clone())?;
-                    body.validate()?;
-                    let commands::QueueClearRequest {
-                        request_id,
-                        instance,
-                        all_cameras: _,
-                        include_in_flight,
-                        reason,
-                    } = body;
-                    let canonical_reason = reason.clone();
-                    let reason = reason.unwrap_or_else(|| "operator queue drain".to_string());
-                    let canonical = serde_json::json!({
-                        "requestId": &request_id,
-                        "instance": &instance,
-                        "includeInFlight": include_in_flight,
-                        "reason": canonical_reason,
-                    });
-                    // Ledgered like every other mutating verb: a retried drain returns the original
-                    // outcome instead of cancelling a second wave of work the operator never saw.
-                    let key = crate::catalog::LedgerKey::new(
-                        instance.clone().unwrap_or_else(|| "main".to_string()),
-                        "sb/queue-clear",
-                        request_id,
-                    )?;
-                    self.cancel_with_ledger(
-                        key,
-                        canonical,
-                        serde_json::json!({
-                            "cancelled": 0,
-                            "alreadyTerminal": 0,
-                            "failed": [],
-                        }),
-                        async {
-                            let outcome =
-                                self.clear_queue(instance, include_in_flight, reason).await?;
-                            Ok(serde_json::to_value(outcome)?)
-                        },
-                    )
-                    .await
+                    self.queue_clear_command(body).await
                 }
                 "sb/reconnect" => {
                     let body: ReconnectRequest = commands::parse_closed(request.body.clone())?;
@@ -12618,6 +12646,147 @@ mod tests {
                 closes.load(Ordering::SeqCst),
                 1,
                 "the protocol session must be closed instead of leaked server-side"
+            );
+        }
+
+        /// The two verbs, through the command layer that actually serves them.
+        ///
+        /// Also pins the ledger: a break-glass drain cancels durable work, so a retried request must
+        /// return the ORIGINAL outcome rather than reach for a second wave of work the operator never
+        /// saw.
+        #[tokio::test]
+        async fn the_queue_verbs_answer_and_the_drain_is_idempotent() {
+            let directory = TempDir::new().unwrap();
+            let (runtime, metrics) =
+                runtime_with_metrics(config(directory.path(), &["camera-a"], false), &directory)
+                    .await;
+
+            for index in 0..2 {
+                runtime
+                    .submit_capture(
+                        "camera-a".to_string(),
+                        format!("verb-backlog-{index}"),
+                        None,
+                        None,
+                        serde_json::Map::new(),
+                        format!("verb-correlation-{index}"),
+                        "sb/capture-submit",
+                        crate::admission::CapturePriority::Submitted,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let status = runtime
+                .queue_status_command(commands::QueueStatusRequest { instance: None })
+                .await
+                .expect("sb/queue-status must answer");
+            assert_eq!(status["durableBacklog"], serde_json::json!(2));
+            assert_eq!(status["dispatchQueued"], serde_json::json!(2));
+            assert_eq!(
+                status["cameras"][0]["instance"],
+                serde_json::json!("camera-a")
+            );
+
+            // The metric sample must report the same figures the operator was just shown.
+            let sampled = runtime.sample_queue_metric().await.unwrap();
+            assert_eq!(sampled.get("durableBacklog"), Some(&2.0));
+            assert_eq!(sampled.get("camerasConfigured"), Some(&1.0));
+            assert_eq!(
+                sampled.get("camerasOnline"),
+                Some(&0.0),
+                "no supervisor is running, so no camera is online"
+            );
+            runtime.metrics.sample_queue(sampled).await;
+            assert_eq!(
+                metrics.counts(crate::observability::QUEUE_METRIC, "durableBacklog"),
+                2.0,
+                "and the sample must actually reach the metric service"
+            );
+
+            let drain = commands::QueueClearRequest {
+                request_id: "drain-1".to_string(),
+                instance: Some("camera-a".to_string()),
+                all_cameras: false,
+                include_in_flight: false,
+                reason: Some("line stopped".to_string()),
+            };
+            let cleared = runtime
+                .queue_clear_command(drain.clone())
+                .await
+                .expect("sb/queue-clear must drain");
+            assert_eq!(cleared["cancelled"], serde_json::json!(2));
+
+            // Replayed: the ledger must return the first answer, not cancel a second wave.
+            let replayed = runtime
+                .queue_clear_command(drain)
+                .await
+                .expect("a retried drain must be idempotent");
+            assert_eq!(
+                replayed, cleared,
+                "a retried break-glass drain must return the original outcome"
+            );
+
+            let after = runtime
+                .queue_status_command(commands::QueueStatusRequest {
+                    instance: Some("camera-a".to_string()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(after["durableBacklog"], serde_json::json!(0));
+            assert_eq!(after["dispatchQueued"], serde_json::json!(0));
+        }
+
+        /// A superseded supervisor's state write is dropped on purpose -- and must say so.
+        ///
+        /// D5: every one of the eight supervisor call sites discarded this with `let _ =`, so the
+        /// generation fence rejecting a write and the registry lock being poisoned looked exactly
+        /// like a successful update.
+        #[tokio::test]
+        async fn a_superseded_generation_cannot_publish_camera_state() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+
+            runtime.publish_camera_state(
+                "camera-a",
+                7,
+                CameraConnectionState::Online,
+                None,
+                None,
+                chrono::Utc::now(),
+            );
+            assert_eq!(
+                runtime.registry.snapshot("camera-a").unwrap().state,
+                CameraConnectionState::Online
+            );
+
+            // An older generation must not be able to drag the camera backwards.
+            runtime.publish_camera_state(
+                "camera-a",
+                6,
+                CameraConnectionState::Backoff,
+                None,
+                Some(CameraStatusError {
+                    code: "BACKEND_ERROR".to_string(),
+                    message: "stale".to_string(),
+                    observed_at: chrono::Utc::now(),
+                }),
+                chrono::Utc::now(),
+            );
+            assert_eq!(
+                runtime.registry.snapshot("camera-a").unwrap().state,
+                CameraConnectionState::Online,
+                "the generation fence must drop a superseded supervisor's write"
+            );
+
+            // A camera that is not configured is likewise a no-op rather than a panic.
+            runtime.publish_camera_state(
+                "camera-gone",
+                9,
+                CameraConnectionState::Offline,
+                None,
+                None,
+                chrono::Utc::now(),
             );
         }
 

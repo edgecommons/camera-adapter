@@ -2423,6 +2423,59 @@ mod tests {
         );
     }
 
+    /// B6: a capture the durable store could not run is retired WITHOUT killing the camera session.
+    ///
+    /// The actor used to treat any error escaping `execute` as proof the protocol session was dead --
+    /// including a `SQLITE_BUSY` from a contended connection pool. It now fails just that capture and
+    /// keeps serving, which means nothing else is going to tear the actor down and clean up after it:
+    /// the runtime must be retired here, or its `active` entry and its terminal-deadline task outlive
+    /// the job they belong to.
+    #[tokio::test]
+    async fn a_capture_the_store_could_not_run_is_retired_without_killing_the_session() {
+        let (engine, _directory) = engine().await;
+        let now = Utc::now().timestamp_millis();
+        let dispatcher = RecordingDispatcher::default();
+        let accepted = engine
+            .accept_and_queue(&dispatcher, command_submission("cap-busy", now))
+            .await
+            .unwrap();
+        let AcceptJobOutcome::Inserted(queued) = accepted else {
+            panic!("expected an initial insert");
+        };
+        assert_eq!(queued.state, JobState::Queued);
+        let descriptor = dispatcher
+            .descriptors
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("the descriptor must have been committed");
+
+        let busy = CameraError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(5), // SQLITE_BUSY
+            Some("database is locked".to_owned()),
+        ));
+        assert!(
+            busy.is_durable_store_failure(),
+            "the premise of this test: a busy pool is the store, not the camera"
+        );
+
+        let record = engine
+            .fail_durable_store(&descriptor, &busy)
+            .await
+            .expect("retiring the capture must succeed");
+
+        assert_eq!(
+            record.state,
+            JobState::Failed,
+            "the capture the store could not run must reach a terminal state, not linger as QUEUED"
+        );
+        assert!(
+            !lock(&engine.active).contains_key(&queued.capture_id),
+            "and its runtime must be retired -- nothing else is coming to clean up after it now that              the actor survives"
+        );
+    }
+
     #[tokio::test]
     async fn command_acceptance_is_idempotent_and_active_cancellation_is_durable() {
         let (engine, _directory) = engine().await;

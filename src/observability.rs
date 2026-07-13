@@ -330,6 +330,87 @@ pub const fn terminal_measure(state: crate::model::JobState) -> Option<&'static 
 
 #[cfg(test)]
 mod tests {
+    /// Every terminal state a capture can reach must be counted, and nothing else may be.
+    ///
+    /// The counters are what an operator watches, so a terminal that maps to no measure is a capture
+    /// that ended and was never counted -- invisible in exactly the way the whole component was
+    /// before it emitted anything at all.
+    #[test]
+    fn every_terminal_state_counts_against_exactly_one_measure() {
+        use crate::model::JobState;
+
+        assert_eq!(terminal_measure(JobState::Succeeded), Some("succeeded"));
+        assert_eq!(terminal_measure(JobState::Failed), Some("failed"));
+        assert_eq!(terminal_measure(JobState::Cancelled), Some("cancelled"));
+        assert_eq!(terminal_measure(JobState::Interrupted), Some("interrupted"));
+
+        for state in [
+            JobState::Accepted,
+            JobState::Queued,
+            JobState::Acquiring,
+            JobState::Encoding,
+            JobState::Persisting,
+        ] {
+            assert!(
+                !state.is_terminal(),
+                "a state that counts against nothing must be one the capture can still leave"
+            );
+            assert_eq!(
+                terminal_measure(state),
+                None,
+                "a capture still in flight has not ended, and must not be counted as though it had"
+            );
+        }
+    }
+
+    /// A metric target that is unhappy must never be able to fail a capture.
+    #[tokio::test]
+    async fn a_failing_metric_target_is_reported_and_survived() {
+        struct Broken;
+
+        #[async_trait::async_trait]
+        impl edgecommons::metrics::MetricService for Broken {
+            fn define_metric(&self, _metric: edgecommons::metrics::Metric) {}
+            fn is_metric_defined(&self, _name: &str) -> bool {
+                true
+            }
+            async fn emit_metric(
+                &self,
+                _name: &str,
+                _values: std::collections::HashMap<String, f64>,
+            ) -> edgecommons::Result<()> {
+                Err(edgecommons::EdgeCommonsError::Metrics(
+                    "metric target is unavailable".to_owned(),
+                ))
+            }
+            async fn emit_metric_now(
+                &self,
+                _name: &str,
+                _values: std::collections::HashMap<String, f64>,
+            ) -> edgecommons::Result<()> {
+                Err(edgecommons::EdgeCommonsError::Metrics(
+                    "metric target is unavailable".to_owned(),
+                ))
+            }
+            async fn flush_metrics(&self) -> edgecommons::Result<()> {
+                Ok(())
+            }
+            async fn shutdown(&self) {}
+        }
+
+        let metrics = CaptureMetrics::new(Arc::new(Broken));
+
+        // Neither call may panic or propagate: a capture that succeeded must not be reported as
+        // failed because the metrics backend was down.
+        metrics.count("succeeded").await;
+        metrics
+            .sample_queue(std::collections::HashMap::from([(
+                "durableBacklog".to_owned(),
+                1.0,
+            )]))
+            .await;
+    }
+
     use super::*;
 
     fn ready() -> ReadinessSnapshot {
