@@ -191,8 +191,23 @@ impl Default for LimitsConfig {
                 .min(8),
             max_concurrent_writes: 8,
             max_concurrent_connects: 16,
-            max_in_flight_bytes: GIB,
-            max_frame_bytes_per_camera: 256 * MIB,
+            // These two are not independent knobs, and shipping them as if they were is what made
+            // "32 concurrent captures" a fiction. A capture reserves `max_frame_bytes_per_camera`
+            // — the DECLARED cap, not the frame's real size — so the budget must hold
+            // max_concurrent_captures x that cap, or the byte budget silently becomes the real
+            // concurrency limit. The old pair (1 GiB / 256 MiB) admitted exactly 4.
+            //
+            // 64 MiB is a generous per-frame ceiling for the machine-vision sensors this adapter
+            // targets: an 8 MP Mono8 frame is ~8 MB and a 20 MP RGB frame ~60 MB. The old 256 MiB
+            // was not a considered limit, just a number large enough never to reject anything —
+            // and it is precisely because it was so large that the budget could not cover 32 of it.
+            //
+            // The budget is ACCOUNTING, not an allocation: with real 8 MB frames, 32 in flight is
+            // ~256 MB of actual memory. Sizing it at 32 x the cap only guarantees the budget is
+            // never the thing that decides the width. Raise the cap and the validator now forces
+            // you to raise the budget with it (see validate_limits).
+            max_in_flight_bytes: 32 * 64 * MIB, // = 2 GiB = max_concurrent_captures x the cap below
+            max_frame_bytes_per_camera: 64 * MIB,
             max_metadata_bytes: 8 * 1024,
             max_queued_captures_per_camera: 4,
             max_queued_controls_per_camera: 32,
@@ -1016,10 +1031,34 @@ fn validate_global(global: &GlobalConfig) -> Result<()> {
         256,
         "limits.maxCamerasPerGroup",
     )?;
-    if limits.max_in_flight_bytes < limits.max_frame_bytes_per_camera {
+    // The byte budget must cover the concurrency the component ADVERTISES, not one frame of it.
+    //
+    // A capture reserves `maxFrameBytesPerCamera` — the DECLARED cap, not the frame's actual size —
+    // for its whole admission. So the number of captures that can hold a memory reservation at once
+    // is floor(maxInFlightBytes / maxFrameBytesPerCamera), and THAT, not maxConcurrentCaptures, is
+    // the real width of the system. The old check only demanded room for a single frame, which let
+    // the shipped defaults (1 GiB / 256 MiB) advertise 32-way concurrency while admitting 4: the
+    // other 28 took a semaphore permit and then parked inside the byte budget until their deadline
+    // expired. A fleet firing on one cron minute lost most of its captures to CAPTURE_TIMEOUT, and
+    // every timeout wrote a durable row. The system was never 32-wide; it only said so.
+    let required_in_flight = (limits.max_concurrent_captures as u64)
+        .saturating_mul(limits.max_frame_bytes_per_camera);
+    if limits.max_in_flight_bytes < required_in_flight {
+        let admits = limits.max_in_flight_bytes / limits.max_frame_bytes_per_camera.max(1);
         return config_error(
             "component.global.limits.maxInFlightBytes",
-            "must be at least maxFrameBytesPerCamera",
+            format!(
+                "must be at least maxConcurrentCaptures x maxFrameBytesPerCamera \
+                 ({} x {} = {} bytes); {} admits only {} concurrent capture(s), so a component \
+                 configured for {} would silently run {}-wide and time the rest out",
+                limits.max_concurrent_captures,
+                limits.max_frame_bytes_per_camera,
+                required_in_flight,
+                limits.max_in_flight_bytes,
+                admits,
+                limits.max_concurrent_captures,
+                admits,
+            ),
         );
     }
     for (name, group) in &limits.resource_groups {
@@ -2194,6 +2233,16 @@ mod tests {
             Box::new(|value| {
                 value["component"]["global"]["security"] = json!({"maxHeaderBytes": 1});
             }),
+            // The budget must cover the concurrency the component ADVERTISES. This is the exact
+            // shape of the shipped defaults before the fix — 32 x 256 MiB declared, 1 GiB budgeted —
+            // which admitted 4 captures while claiming 32.
+            Box::new(|value| {
+                value["component"]["global"]["limits"] = json!({
+                    "maxConcurrentCaptures": 32,
+                    "maxFrameBytesPerCamera": 268_435_456u64, // 256 MiB
+                    "maxInFlightBytes": 1_073_741_824u64      // 1 GiB -> admits 4, not 32
+                });
+            }),
         ];
 
         for mutate in cases {
@@ -2201,6 +2250,54 @@ mod tests {
             mutate(&mut value);
             assert!(AdapterConfig::from_core_initial(&core(value)).is_err());
         }
+    }
+
+    /// The byte budget IS the concurrency limit, and a config that hides that must not start.
+    ///
+    /// A capture reserves `maxFrameBytesPerCamera` — the DECLARED cap, not the frame's real size —
+    /// for the whole of its admission. So the true width of the system is
+    /// `floor(maxInFlightBytes / maxFrameBytesPerCamera)`, and if that is smaller than
+    /// `maxConcurrentCaptures` the component advertises a concurrency it cannot reach: the surplus
+    /// captures take a semaphore permit, park inside the byte budget, and die on their deadline.
+    /// Every one of those timeouts writes a durable row, so the failure also feeds the state DB.
+    ///
+    /// This is not a tuning nicety. It is why the shipped defaults claimed 32-way concurrency and
+    /// delivered 4, and why a soak run would have measured a 4-wide system and reported it as 32.
+    #[test]
+    fn a_byte_budget_that_cannot_cover_the_advertised_concurrency_is_rejected() {
+        let mut value = valid_config();
+        value["component"]["global"]["limits"] = json!({
+            "maxConcurrentCaptures": 8,
+            "maxFrameBytesPerCamera": 64 * 1024 * 1024u64, // 64 MiB
+            "maxInFlightBytes": 256 * 1024 * 1024u64       // room for 4 of them, not 8
+        });
+        let error = AdapterConfig::from_core_initial(&core(value))
+            .expect_err("a budget that admits 4 must not advertise 8");
+        let message = error.to_string();
+        // The error has to say what is actually wrong — an operator who is told only "invalid"
+        // will "fix" it by lowering something else and still get a 4-wide system.
+        assert!(
+            message.contains("maxConcurrentCaptures") && message.contains("4"),
+            "the error must name the real admitted width so the operator can act on it: {message}"
+        );
+    }
+
+    /// The shipped defaults must satisfy the rule they impose on everyone else.
+    ///
+    /// Guards against the fix being half-done: it would be no use rejecting an incoherent operator
+    /// config while the out-of-the-box one is itself incoherent — which is precisely what shipped.
+    #[test]
+    fn the_default_limits_can_actually_reach_their_own_advertised_concurrency() {
+        let limits = LimitsConfig::default();
+        let admits = limits.max_in_flight_bytes / limits.max_frame_bytes_per_camera;
+        assert!(
+            admits >= limits.max_concurrent_captures as u64,
+            "defaults advertise {} concurrent captures but the byte budget admits only {}",
+            limits.max_concurrent_captures,
+            admits
+        );
+        // And the default config must pass its own validator, or the component will not start.
+        assert!(AdapterConfig::from_core_initial(&core(valid_config())).is_ok());
     }
 
     #[test]
