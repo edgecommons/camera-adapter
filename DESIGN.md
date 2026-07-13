@@ -65,6 +65,8 @@ The design is successful when an implementation can demonstrate all of the follo
 - Multiple named capture profiles per camera.
 - Software-level multi-camera group capture (`sb/capture-group`), with per-camera jobs joined by a
   shared group identifier.
+- Cron-driven group capture (`global.captureGroupSchedules`), submitted through the same path as the
+  command and therefore carrying the same all-or-nothing acceptance and collated terminal result.
 - GenICam discovery, feature configuration, software trigger, buffer acquisition, and metadata.
 - ONVIF capability discovery, media profiles, snapshot URI capture, authentication, and PTZ.
 - RTSP frame extraction as an ONVIF backend capture mode and fallback.
@@ -115,6 +117,8 @@ The words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 | D-CAM-3 | Camera identity | One camera per `component.instances[]` entry | Matches the current southbound adapter convention and stamps published messages with the camera instance. |
 | D-CAM-4 | Output location | One absolute `rootDirectory`; each camera gets a subdirectory by default | Removes the unexplained storage identifier and prevents ordinary filename collisions. |
 | D-CAM-5 | Scheduled operation | `schedules[]` is optional per camera | Omitting schedules creates a command-only camera. |
+| D-CAM-5a | Scheduled group capture | Group schedules live in `global.captureGroupSchedules`, not under a camera | A schedule that crosses instances belongs to the component; no single camera owns it. One task drives each group schedule, and an occurrence is submitted through `submit_group` under a request id derived from the schedule and its intended fire time — so the occurrence is admitted exactly once even across a crash, and a scheduled group is indistinguishable from a commanded one. |
+| D-CAM-5b | Group overlap | `overlapPolicy` is evaluated against the group | A group is outstanding until every member is terminal. Evaluating overlap per member would let a schedule re-fire on the cameras that finished first, tearing a synchronised capture into halves a cycle apart. |
 | D-CAM-6 | Successful capture | Final file is installed and flushed before success is recorded | A success message must never point at a partial file. |
 | D-CAM-7 | Paths in metadata | Publish `absolutePath`, `relativePath`, and `fileUri` | Local consumers may not know the publisher's output root; relative paths remain portable. |
 | D-CAM-8 | Image bytes | Never publish image bytes on the bus | Files are the data plane; the bus carries control and metadata. |
@@ -727,17 +731,19 @@ without replacing camera sessions.
 | `limits.maxConcurrentEncodes` | CPU count capped at 8; 1–64 | CPU conversion permits. | live |
 | `limits.maxConcurrentWrites` | `8`; 1–64 | Simultaneous persistence writers. | live |
 | `limits.maxConcurrentConnects` | `16`; 1–256 | Reconnect-storm bound. | live |
-| `limits.maxInFlightBytes` | `1 GiB`; 64 MiB–host safe limit | Total raw/encoded frame reservation. | live for new admission |
-| `limits.maxFrameBytesPerCamera` | `256 MiB`; 1 MiB–2 GiB | Reservation and hard decoded-frame ceiling unless profile is lower. | live for new jobs |
+| `limits.maxInFlightBytes` | `2 GiB`; 64 MiB–host safe limit | Total raw/encoded frame reservation. At least `maxConcurrentCaptures` x `maxFrameBytesPerCamera`, because a capture reserves the declared ceiling and not its frame's real size. | live for new admission |
+| `limits.maxFrameBytesPerCamera` | `64 MiB`; 1 MiB–2 GiB | Reservation and hard decoded-frame ceiling unless profile is lower. | live for new jobs |
 | `limits.maxMetadataBytes` | `8192`; 0–65536 | Maximum encoded caller metadata object. | live for new jobs |
 | `limits.maxQueuedCapturesPerCamera` | `4`; 1–1000 | Descriptor queue; no frame bytes. | live; existing jobs are not dropped |
+| `limits.maxPendingCaptures` | `256`; >= `maxQueuedCapturesPerCamera` | Fleet-wide bound on the capture queue. | live; existing jobs are not dropped |
+| `limits.maxQueueWaitMs` | `300000`; 1000–3600000 | How long a capture may wait for a camera when its profile sets no `queueExpiryMs`. | live for new jobs |
 | `limits.maxDeferredWaitersPerCapture` | `8`; 1–64 | Idempotent direct-request waiters. | live |
 | `limits.maxCamerasPerGroup` | `32`; 2–256 | Group-capture fan-out bound. | live for new groups |
 | `limits.resourceGroups.<name>.maxConcurrentCaptures` | required per named group; 1–global max | Shared NIC/USB/storage admission. | live for new admission |
 | `timeouts.connectMs` | `10000`; 100–300000 | One connection attempt. | new/retried connection |
 | `timeouts.reconnectBackoffMinMs` | `1000`; 100–60000 | First reconnect delay before jitter. | next retry |
 | `timeouts.reconnectBackoffMaxMs` | `60000`; min–3600000 | Capped reconnect delay. | next retry |
-| `timeouts.jobTerminalMs` | `90000`; 1000–1800000 | Overall acceptance-to-terminal deadline including queue and every stage. | new jobs |
+| `timeouts.jobTerminalMs` | `90000`; 1000–1800000 | Deadline covering every stage, measured from the moment a camera takes the capture. The wait beforehand is bounded separately, by the profile's `queueExpiryMs` or `limits.maxQueueWaitMs`. | new jobs |
 | `timeouts.captureMs` | `30000`; 100–600000 | Default job acquisition deadline. | new jobs |
 | `timeouts.encodeMs` | `30000`; 100–600000 | Conversion deadline. | new jobs |
 | `timeouts.persistMs` | `30000`; 100–600000 | Persistence deadline. | new jobs |
@@ -782,7 +788,7 @@ individual work but never extend the overall job terminal deadline.
 | `captureMode` | no | backend default | `software-trigger`, `snapshot-uri`, or `rtsp-frame` as supported. |
 | `offlinePolicy` | no | direct `waitUntilDeadline`; schedule `failFast` | `failFast`, `waitUntilDeadline`, or `queue`. |
 | `queueExpiryMs` | when policy `queue` | 100–86400000 | Maximum offline queue residence. |
-| `timeoutMs` | no | global `jobTerminalMs`; 1000–1800000 | Overall acceptance-to-terminal deadline; stage caps still apply. |
+| `timeoutMs` | no | global `jobTerminalMs`; 1000–1800000 | Deadline covering every stage, measured from the moment a camera takes the capture; stage caps still apply. |
 | `maximumFrameBytes` | no | global per-camera maximum | Hard compressed/raw/decoded frame limit and reservation. |
 | `pixelFormat` | GenICam when fixed | camera negotiated default | Required source pixel format or explicit `auto`. |
 | `width`, `height`, `offsetX`, `offsetY` | no | camera/profile default | GenICam region; validated against increments/bounds. |

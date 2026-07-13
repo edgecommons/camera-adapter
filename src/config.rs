@@ -79,6 +79,52 @@ pub struct GlobalConfig {
     /// HTTP/XML/decompression safety limits.
     #[serde(default)]
     pub security: SecurityConfig,
+    /// Cron schedules that fire one synchronised capture across several cameras.
+    ///
+    /// A group schedule crosses instances, so it belongs to the component rather than to any one
+    /// camera -- which is why it lives here and not under `camera.schedules`.
+    #[serde(default)]
+    pub capture_group_schedules: Vec<CaptureGroupScheduleConfig>,
+}
+
+/// One cron schedule that captures several cameras as a single group.
+///
+/// An occurrence is submitted through the same path as the `sb/capture-group` command, so a
+/// scheduled group is indistinguishable from a commanded one: one durable group row, all-or-nothing
+/// acceptance, and one collated terminal notification.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureGroupScheduleConfig {
+    /// Stable schedule token, unique across group schedules.
+    pub id: String,
+    /// Whether future occurrences are admitted.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Required six-field expression including seconds.
+    pub cron: String,
+    /// IANA timezone identifier.
+    pub timezone: String,
+    /// The cameras captured together, in result order.
+    pub instances: Vec<String>,
+    /// Capture profile applied to every member without an override.
+    pub capture_profile: Option<String>,
+    /// Per-camera capture-profile overrides; every key must be a member.
+    #[serde(default)]
+    pub profile_overrides: BTreeMap<String, String>,
+    /// Missed-occurrence treatment.
+    #[serde(default)]
+    pub misfire_policy: MisfirePolicy,
+    /// Treatment when this schedule already has a nonterminal group.
+    ///
+    /// Evaluated against the group, not against individual members: a group is outstanding until
+    /// every one of its members is terminal.
+    #[serde(default)]
+    pub overlap_policy: OverlapPolicy,
+    /// Stable deterministic jitter bound.
+    #[serde(default)]
+    pub jitter_seconds: u32,
+    /// Optional per-member terminal deadline.
+    pub timeout_ms: Option<u64>,
 }
 
 /// Output path, atomic-file, and disk-pressure configuration.
@@ -877,7 +923,7 @@ impl AdapterConfig {
                 "at least one enabled valid camera instance is required",
             );
         }
-        validate_cross_instance(&instances, &global)?;
+        validate_cross_instance(&instances, &global, &seen)?;
         Ok(InitialConfigLoad {
             config: Self { global, instances },
             skipped,
@@ -911,7 +957,7 @@ impl AdapterConfig {
                 "at least one enabled valid camera instance is required",
             );
         }
-        validate_cross_instance(&instances, &global)?;
+        validate_cross_instance(&instances, &global, &seen)?;
         Ok(Self { global, instances })
     }
 }
@@ -1724,13 +1770,138 @@ const fn safe_deserialization_message() -> &'static str {
     "contains an unknown field or a value with an invalid type"
 }
 
-fn validate_cross_instance(instances: &[CameraConfig], global: &GlobalConfig) -> Result<()> {
+fn validate_cross_instance(
+    instances: &[CameraConfig],
+    global: &GlobalConfig,
+    declared: &HashSet<String>,
+) -> Result<()> {
     let enabled = instances.iter().filter(|camera| camera.enabled).count();
     if enabled > global.limits.max_connected_cameras {
         return config_error(
             "component.instances",
             "enabled camera count exceeds limits.maxConnectedCameras",
         );
+    }
+    validate_group_schedules(instances, global, declared)
+}
+
+/// Validates `global.captureGroupSchedules` against the cameras the component declares.
+///
+/// The rules deliberately mirror [`crate::commands::GroupCaptureRequest::validate`], because an
+/// occurrence is submitted down that exact path: a group schedule that could only ever be rejected
+/// at fire time is a schedule that silently never fires, and the place to say so is startup.
+///
+/// Membership is checked against the cameras the operator *declared*, not against the ones that
+/// survived validation. A camera that fails its own validation is skipped at startup by design, and
+/// a group schedule naming it must not escalate that into a component that refuses to start -- the
+/// occurrence simply fails to admit, and says why. A camera that was never declared at all is a
+/// typo, and that is worth refusing to start for.
+fn validate_group_schedules(
+    instances: &[CameraConfig],
+    global: &GlobalConfig,
+    declared: &HashSet<String>,
+) -> Result<()> {
+    if global.capture_group_schedules.len() > 100 {
+        return config_error(
+            "component.global.captureGroupSchedules",
+            "must contain at most 100 group schedules",
+        );
+    }
+    let by_id: BTreeMap<&str, &CameraConfig> = instances
+        .iter()
+        .map(|camera| (camera.id.as_str(), camera))
+        .collect();
+    let mut schedule_ids = HashSet::new();
+    for (index, schedule) in global.capture_group_schedules.iter().enumerate() {
+        let path = format!("component.global.captureGroupSchedules[{index}]");
+        check_token(&schedule.id, &format!("{path}.id"))?;
+        if !schedule_ids.insert(&schedule.id) {
+            return config_error(format!("{path}.id"), "group schedule id is duplicated");
+        }
+        if schedule.cron.split_whitespace().count() != 6 || Cron::from_str(&schedule.cron).is_err()
+        {
+            return config_error(
+                format!("{path}.cron"),
+                "must be a valid six-field cron expression including seconds",
+            );
+        }
+        if schedule.timezone.parse::<Tz>().is_err() {
+            return config_error(
+                format!("{path}.timezone"),
+                "must be an IANA timezone identifier",
+            );
+        }
+        // A group is two or more cameras captured together; the command path rejects a shorter list
+        // and the scheduler must not be able to configure one it could never submit.
+        if schedule.instances.len() < 2 {
+            return config_error(
+                format!("{path}.instances"),
+                "must name at least two cameras",
+            );
+        }
+        if schedule.instances.len() > global.limits.max_cameras_per_group {
+            return config_error(
+                format!("{path}.instances"),
+                "exceeds limits.maxCamerasPerGroup",
+            );
+        }
+        let mut members = HashSet::with_capacity(schedule.instances.len());
+        for instance in &schedule.instances {
+            check_token(instance, &format!("{path}.instances"))?;
+            if !members.insert(instance.as_str()) {
+                return config_error(
+                    format!("{path}.instances"),
+                    "must not name the same camera twice",
+                );
+            }
+            if !declared.contains(instance) {
+                return config_error(
+                    format!("{path}.instances"),
+                    "must name cameras declared in component.instances",
+                );
+            }
+        }
+        if let Some(profile) = schedule.capture_profile.as_deref() {
+            check_token(profile, &format!("{path}.captureProfile"))?;
+        }
+        for (instance, profile) in &schedule.profile_overrides {
+            if !members.contains(instance.as_str()) {
+                return config_error(
+                    format!("{path}.profileOverrides"),
+                    "keys must be a subset of instances",
+                );
+            }
+            check_token(profile, &format!("{path}.profileOverrides"))?;
+        }
+        // Profiles are resolved per camera at fire time. Check the ones we can see now: a camera
+        // that was skipped is absent from `by_id` and is checked when it comes back.
+        for instance in &schedule.instances {
+            let Some(camera) = by_id.get(instance.as_str()) else {
+                continue;
+            };
+            let selected = schedule
+                .profile_overrides
+                .get(instance)
+                .map(String::as_str)
+                .or(schedule.capture_profile.as_deref());
+            if let Some(selected) = selected {
+                if !camera.capture_profiles.contains_key(selected) {
+                    return config_error(
+                        format!("{path}.captureProfile"),
+                        format!("camera '{instance}' has no capture profile named '{selected}'"),
+                    );
+                }
+            }
+        }
+        range(
+            u64::from(schedule.jitter_seconds),
+            0,
+            3_600,
+            &format!("{path}.jitterSeconds"),
+        )?;
+        if let Some(timeout_ms) = schedule.timeout_ms {
+            range(timeout_ms, 1_000, 1_800_000, &format!("{path}.timeoutMs"))?;
+        }
     }
     Ok(())
 }
@@ -1960,6 +2131,227 @@ mod tests {
                 }]
             }
         })
+    }
+
+    /// A two-camera config with one valid group schedule, for the group-schedule cases below.
+    fn group_schedule_config() -> Value {
+        let mut value = valid_config();
+        value["component"]["instances"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id": "camera-b",
+                "backend": { "type": "sim" },
+                "defaultCaptureProfile": "main",
+                "captureProfiles": { "main": { "output": { "encoding": "png" } } }
+            }));
+        value["component"]["global"]["captureGroupSchedules"] = json!([{
+            "id": "line-a-sync",
+            "cron": "0 */5 * * * *",
+            "timezone": "America/New_York",
+            "instances": ["camera-a", "camera-b"],
+            "captureProfile": "main"
+        }]);
+        value
+    }
+
+    #[test]
+    fn a_valid_group_schedule_is_accepted_with_its_defaults() {
+        let config = AdapterConfig::from_core_reload(&core(group_schedule_config())).unwrap();
+        let schedules = &config.global.capture_group_schedules;
+        assert_eq!(schedules.len(), 1);
+        let schedule = &schedules[0];
+        assert_eq!(schedule.id, "line-a-sync");
+        assert!(schedule.enabled);
+        assert_eq!(schedule.instances, vec!["camera-a", "camera-b"]);
+        assert_eq!(schedule.capture_profile.as_deref(), Some("main"));
+        assert_eq!(schedule.misfire_policy, MisfirePolicy::Skip);
+        assert_eq!(schedule.overlap_policy, OverlapPolicy::Skip);
+        assert_eq!(schedule.jitter_seconds, 0);
+        assert_eq!(schedule.timeout_ms, None);
+    }
+
+    /// Every way a group schedule can be written such that it could only ever fail at fire time.
+    ///
+    /// The rules mirror `GroupCaptureRequest::validate`, because an occurrence is submitted down
+    /// that exact path. A group schedule the command path would reject is a schedule that silently
+    /// never fires -- so it is rejected here, at startup, where somebody is looking.
+    #[test]
+    fn group_schedule_validation_rejects_what_the_command_path_would_reject() {
+        let cases: Vec<(&str, ConfigMutation, &str)> = vec![
+            (
+                "a camera that is not declared anywhere",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["instances"] =
+                        json!(["camera-a", "camera-typo"]);
+                }),
+                "component.global.captureGroupSchedules[0].instances",
+            ),
+            (
+                "a group of one",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["instances"] =
+                        json!(["camera-a"]);
+                }),
+                "component.global.captureGroupSchedules[0].instances",
+            ),
+            (
+                "the same camera twice",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["instances"] =
+                        json!(["camera-a", "camera-a"]);
+                }),
+                "component.global.captureGroupSchedules[0].instances",
+            ),
+            (
+                "an override for a camera that is not a member",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["profileOverrides"] =
+                        json!({ "camera-c": "main" });
+                }),
+                "component.global.captureGroupSchedules[0].profileOverrides",
+            ),
+            (
+                "a capture profile no member camera has",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["captureProfile"] =
+                        json!("wide");
+                }),
+                "component.global.captureGroupSchedules[0].captureProfile",
+            ),
+            (
+                "a five-field cron",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["cron"] =
+                        json!("*/5 * * * *");
+                }),
+                "component.global.captureGroupSchedules[0].cron",
+            ),
+            (
+                "a timezone that is not IANA",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["timezone"] =
+                        json!("EST5EDT-ish");
+                }),
+                "component.global.captureGroupSchedules[0].timezone",
+            ),
+            (
+                "jitter beyond an hour",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["jitterSeconds"] =
+                        json!(3_601);
+                }),
+                "component.global.captureGroupSchedules[0].jitterSeconds",
+            ),
+            (
+                "a timeout the command path would refuse",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["timeoutMs"] =
+                        json!(999);
+                }),
+                "component.global.captureGroupSchedules[0].timeoutMs",
+            ),
+            (
+                "more cameras than a group may hold",
+                Box::new(|value| {
+                    value["component"]["global"]["limits"] = json!({ "maxCamerasPerGroup": 2 });
+                    value["component"]["instances"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({
+                            "id": "camera-c",
+                            "backend": { "type": "sim" },
+                            "defaultCaptureProfile": "main",
+                            "captureProfiles": { "main": { "output": { "encoding": "png" } } }
+                        }));
+                    value["component"]["global"]["captureGroupSchedules"][0]["instances"] =
+                        json!(["camera-a", "camera-b", "camera-c"]);
+                }),
+                "component.global.captureGroupSchedules[0].instances",
+            ),
+            (
+                "a capture profile name that is not a UNS token",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["captureProfile"] =
+                        json!("not a token");
+                }),
+                "component.global.captureGroupSchedules[0].captureProfile",
+            ),
+            (
+                "an override profile name that is not a UNS token",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["profileOverrides"] =
+                        json!({ "camera-b": "not a token" });
+                }),
+                "component.global.captureGroupSchedules[0].profileOverrides",
+            ),
+            (
+                "an id that is not a UNS token",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["id"] =
+                        json!("line a sync");
+                }),
+                "component.global.captureGroupSchedules[0].id",
+            ),
+            (
+                "more group schedules than the component admits",
+                Box::new(|value| {
+                    let one = value["component"]["global"]["captureGroupSchedules"][0].clone();
+                    let mut many = Vec::new();
+                    for index in 0..101 {
+                        let mut copy = one.clone();
+                        copy["id"] = json!(format!("line-{index}"));
+                        many.push(copy);
+                    }
+                    value["component"]["global"]["captureGroupSchedules"] = json!(many);
+                }),
+                "component.global.captureGroupSchedules",
+            ),
+            (
+                "two schedules sharing an id",
+                Box::new(|value| {
+                    let first = value["component"]["global"]["captureGroupSchedules"][0].clone();
+                    value["component"]["global"]["captureGroupSchedules"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(first);
+                }),
+                "component.global.captureGroupSchedules[1].id",
+            ),
+        ];
+        for (name, mutate, expected_path) in cases {
+            let mut value = group_schedule_config();
+            mutate(&mut value);
+            assert_eq!(
+                reload_error_path(value),
+                expected_path,
+                "group schedule with {name} must be rejected at {expected_path}"
+            );
+        }
+    }
+
+    /// A skipped camera must not escalate into a component that refuses to start.
+    ///
+    /// Startup deliberately tolerates a bad camera by skipping it. A group schedule naming that
+    /// camera is still a *declared* camera, so the config stands: the schedule simply fails to admit
+    /// its occurrences, and says so, until the camera is fixed. Only a camera that was never
+    /// declared -- a typo -- is a config error.
+    #[test]
+    fn a_group_schedule_naming_a_skipped_camera_does_not_stop_the_component() {
+        let mut value = group_schedule_config();
+        value["component"]["instances"][1]["captureProfiles"] = json!({});
+        let loaded = AdapterConfig::from_core_initial(&core(value)).unwrap();
+        assert_eq!(
+            loaded.skipped.len(),
+            1,
+            "the camera with no capture profiles is skipped"
+        );
+        assert_eq!(loaded.config.instances.len(), 1);
+        assert_eq!(
+            loaded.config.global.capture_group_schedules.len(),
+            1,
+            "the group schedule naming it survives -- it is declared, just not currently valid"
+        );
     }
 
     #[test]

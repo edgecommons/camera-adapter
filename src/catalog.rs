@@ -28,7 +28,7 @@ use crate::{CameraError, Result};
 
 const DATABASE_NAME: &str = "camera-adapter.sqlite3";
 const LOCK_NAME: &str = "camera-adapter.lock";
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const DEFAULT_WORKERS: usize = 2;
 const MAX_WORKERS: usize = 16;
 const DEFAULT_QUEUE_CAPACITY: usize = 128;
@@ -91,6 +91,15 @@ impl LedgerKey {
         validate_ledger_key(&key)?;
         Ok(key)
     }
+}
+
+/// A group schedule's durable recovery cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupScheduleCursor {
+    /// Latest unjittered intended-fire instant this schedule has consumed.
+    pub intended_fire_time_ms: i64,
+    /// The group admitted for the most recent admitted occurrence, if any.
+    pub last_group_id: Option<String>,
 }
 
 /// Absolute durable deadlines for one capture.
@@ -767,6 +776,71 @@ impl Catalog {
         require_nonempty("schedule_id", &schedule_id)?;
         self.execute(move |connection| {
             accept_scheduled_job_blocking(connection, &job, &schedule_id, intended_fire_time_ms)
+        })
+        .await
+    }
+
+    /// Returns one group schedule's recovery cursor: how far it has consumed, and its last group.
+    ///
+    /// This is a *hint*, not the authority. Exactly-once admission is owned by the command ledger:
+    /// a scheduled group is submitted under a request id derived from the schedule and the intended
+    /// fire time, so re-submitting an occurrence returns the group already accepted for it. A crash
+    /// between submitting and recording the cursor therefore costs a redundant submission, not a
+    /// duplicate group.
+    ///
+    /// What the cursor genuinely owns is the misfire window: without it, a restart cannot tell an
+    /// occurrence it missed from one that never came due.
+    pub async fn group_schedule_cursor(
+        &self,
+        schedule_id: impl Into<String>,
+    ) -> Result<Option<GroupScheduleCursor>> {
+        let schedule_id = schedule_id.into();
+        require_nonempty("schedule_id", &schedule_id)?;
+        self.execute(move |connection| {
+            connection
+                .query_row(
+                    "SELECT intended_fire_time_ms, last_group_id FROM group_schedule_cursors \
+                     WHERE schedule_id=?1",
+                    params![schedule_id],
+                    |row| {
+                        Ok(GroupScheduleCursor {
+                            intended_fire_time_ms: row.get(0)?,
+                            last_group_id: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(CameraError::from)
+        })
+        .await
+    }
+
+    /// Records a consumed group-schedule occurrence.
+    ///
+    /// `group_id` is `Some` only when the occurrence was admitted. A skipped occurrence still moves
+    /// the cursor -- it was consumed -- but must not forget the group it skipped *for*, or the very
+    /// next tick would see no overlap and admit the occurrence it just declined.
+    pub async fn record_group_schedule_occurrence(
+        &self,
+        schedule_id: impl Into<String>,
+        intended_fire_time_ms: i64,
+        group_id: Option<String>,
+        now_ms: i64,
+    ) -> Result<()> {
+        let schedule_id = schedule_id.into();
+        require_nonempty("schedule_id", &schedule_id)?;
+        self.execute(move |connection| {
+            connection.execute(
+                "INSERT INTO group_schedule_cursors\
+                 (schedule_id,intended_fire_time_ms,last_group_id,updated_at_ms) \
+                 VALUES(?1,?2,?3,?4) \
+                 ON CONFLICT(schedule_id) DO UPDATE SET \
+                   intended_fire_time_ms=excluded.intended_fire_time_ms, \
+                   last_group_id=COALESCE(excluded.last_group_id,last_group_id), \
+                   updated_at_ms=excluded.updated_at_ms",
+                params![schedule_id, intended_fire_time_ms, group_id, now_ms],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -1874,8 +1948,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         1 => {
             transaction.execute_batch(MIGRATION_V2)?;
             transaction.execute_batch(MIGRATION_V3)?;
+            transaction.execute_batch(MIGRATION_V4)?;
         }
-        2 => transaction.execute_batch(MIGRATION_V3)?,
+        2 => {
+            transaction.execute_batch(MIGRATION_V3)?;
+            transaction.execute_batch(MIGRATION_V4)?;
+        }
+        3 => transaction.execute_batch(MIGRATION_V4)?,
         _ => {
             return Err(CameraError::Catalog(format!(
                 "no monotonic migration from schema version {version}"
@@ -2040,6 +2119,13 @@ CREATE INDEX jobs_terminal_idx ON jobs(terminal_at_ms,capture_id) WHERE terminal
 CREATE INDEX waiters_capture_idx ON deferred_waiters(capture_id,expires_at_ms);
 CREATE INDEX outbox_pending_idx ON outbox(delivered_at_ms,available_at_ms,id);
 
+CREATE TABLE group_schedule_cursors (
+    schedule_id TEXT PRIMARY KEY,
+    intended_fire_time_ms INTEGER NOT NULL,
+    last_group_id TEXT,
+    updated_at_ms INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
+
 CREATE TABLE catalog_availability_probe (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
     generation INTEGER NOT NULL CHECK(generation>=0)
@@ -2065,6 +2151,15 @@ CREATE TABLE pending_success (
     available_at_ms INTEGER NOT NULL,
     FOREIGN KEY(capture_id) REFERENCES jobs(capture_id) ON DELETE CASCADE
 ) STRICT;
+"#;
+
+const MIGRATION_V4: &str = r#"
+CREATE TABLE group_schedule_cursors (
+    schedule_id TEXT PRIMARY KEY,
+    intended_fire_time_ms INTEGER NOT NULL,
+    last_group_id TEXT,
+    updated_at_ms INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;
 "#;
 
 const MIGRATION_V3: &str = r#"
@@ -4772,6 +4867,41 @@ mod tests {
         assert!(terminal.pending_success.is_none());
     }
 
+    /// Every supported starting version must reach the current one, with the tables it owes.
+    ///
+    /// The 1 -> N path was the only one covered, which is the path a brand-new migration arm is
+    /// least likely to break: a catalog already on 2 or 3 takes a different arm entirely, and an arm
+    /// that forgets to chain the newest migration ships a database missing a table nobody notices
+    /// until a schedule tries to write to it.
+    #[test]
+    fn every_supported_schema_version_migrates_to_the_current_one() {
+        for start in 1..SCHEMA_VERSION {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join(format!("v{start}.sqlite3"));
+            let mut connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch("CREATE TABLE jobs(capture_id TEXT PRIMARY KEY) STRICT;")
+                .unwrap();
+            connection
+                .pragma_update(None, "user_version", start)
+                .unwrap();
+            migrate(&mut connection).unwrap();
+            let version: i64 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION, "migrating from v{start}");
+            let cursors: String = connection
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type='table' \
+                     AND name='group_schedule_cursors'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|_| panic!("v{start} did not gain group_schedule_cursors"));
+            assert_eq!(cursors, "group_schedule_cursors");
+        }
+    }
+
     #[test]
     fn schema_v3_migration_is_monotonic_and_transactional() {
         let directory = TempDir::new().unwrap();
@@ -4786,7 +4916,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, SCHEMA_VERSION);
         let columns = connection
             .prepare("PRAGMA table_info(jobs)")
             .unwrap()

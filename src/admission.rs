@@ -341,18 +341,29 @@ impl<T: Send + 'static> CaptureAdmissionQueue<T> {
         admissible: impl Fn(&str) -> bool,
     ) -> Option<QueuedCapture<T>> {
         loop {
-            // Register for BOTH wakeups before looking, or an arrival between the look and the wait
-            // is lost and the scheduler sleeps on work it already has.
+            // Register for BOTH wakeups before looking -- and `enable()` is what actually registers.
+            //
+            // `notified()` only BUILDS the future; the waiter is not registered until it is first
+            // polled, and `notify_waiters()` wakes only waiters that are already registered. So
+            // merely constructing the futures early is not enough: a notification that lands between
+            // the look below and the `select!` that first polls them is dropped on the floor, and
+            // this task then sleeps forever on work it is already holding. That is a capture stuck
+            // QUEUED with nothing to drive it -- the exact shape of B5, reintroduced by its fix.
+            //
+            // `enable()` registers the waiter now, before the look, so that window does not exist.
             let arrived = self.inner.notify.notified();
             let capacity = changed.notified();
+            tokio::pin!(arrived, capacity);
+            arrived.as_mut().enable();
+            capacity.as_mut().enable();
             if let Some(entry) = self.inner.pop_best_admissible(Instant::now(), &admissible) {
                 return Some(entry);
             }
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return None,
-                () = arrived => {},
-                () = capacity => {},
+                () = arrived.as_mut() => {},
+                () = capacity.as_mut() => {},
             }
         }
     }
@@ -360,7 +371,11 @@ impl<T: Send + 'static> CaptureAdmissionQueue<T> {
     /// Waits for the best descriptor, or returns `None` when the consumer is cancelled.
     pub async fn next(&self, cancellation: &CancellationToken) -> Option<QueuedCapture<T>> {
         loop {
+            // Enabled before the look, for the same reason as `next_admissible` above: an unenabled
+            // `Notified` is not a registered waiter, and a push that lands in between is lost.
             let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(entry) = self.inner.pop_best(Instant::now()) {
                 return Some(entry);
             }
@@ -1300,6 +1315,43 @@ mod tests {
             Ok(_) => panic!("operation unexpectedly succeeded"),
             Err(error) => error,
         }
+    }
+
+    #[tokio::test]
+    async fn a_capacity_change_racing_the_look_still_wakes_the_consumer() {
+        let queue = CaptureAdmissionQueue::new(10, 10, Duration::from_secs(10)).unwrap();
+        let cancellation = CancellationToken::new();
+        queue
+            .try_enqueue(
+                "cam",
+                CapturePriority::Scheduled,
+                deadline(),
+                CancellationToken::new(),
+                "stranded",
+            )
+            .unwrap();
+
+        let changed = Arc::new(Notify::new());
+        let signal = Arc::clone(&changed);
+        let looked = std::sync::atomic::AtomicBool::new(false);
+        let admissible = move |_camera: &str| {
+            if looked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            // The camera becomes able to take work the moment after we were asked whether it could.
+            signal.notify_waiters();
+            false
+        };
+
+        let entry = tokio::time::timeout(
+            Duration::from_secs(5),
+            queue.next_admissible(&cancellation, &changed, admissible),
+        )
+        .await
+        .expect("a capacity change racing the look must not strand the queue")
+        .expect("the queue holds one capture and must hand it over");
+        assert_eq!(entry.camera_id, "cam");
+        assert_eq!(entry.payload, "stranded");
     }
 
     #[tokio::test(start_paused = true)]

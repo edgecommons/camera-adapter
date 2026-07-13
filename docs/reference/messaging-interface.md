@@ -87,6 +87,10 @@ body `correlationId`.
 
 The version-1 body always contains `schemaVersion`, `eventId`, `captureId`, `cameraId`, `correlationId`,
 `trigger`, `captureProfile`, `captureMode`, `timestamps`, `durationsMs`, `camera`, and caller `metadata`.
+
+A group fired by `global.captureGroupSchedules` reports exactly as a commanded group does: its members carry
+`trigger` `group-command` and the group produces one collated terminal result. Its `metadata` carries
+`scheduleId` and `intendedFireTime`, which identify the schedule and the occurrence that produced it.
 Successful messages additionally contain `image` (`absolutePath`, `relativePath`, `fileUri`, `contentType`,
 `encoding`, `bytes`, `sha256`, and optional `metadataSidecarRelativePath`) and normally `frame` facts.
 Failed messages contain `failure` (`code`, `stage`, `retriable`, `message`) and no `image`; cancelled

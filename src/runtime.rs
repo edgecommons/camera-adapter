@@ -80,6 +80,12 @@ const METRIC_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 /// configuration arrives with far more cameras than the design contemplates.
 const MAX_CONNECTIVITY_INSTANCES: usize = 512;
 const SCHEDULER_MISFIRE_GRACE: Duration = Duration::from_secs(5);
+
+/// How long the capture scheduler waits before retrying a capture the durable store could not admit.
+///
+/// Only reached when the catalog itself is failing. Without it, a store outage turns the scheduler
+/// into a spin: pop, fail, requeue, pop again, at whatever rate the CPU allows.
+const SCHEDULER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 // Lifecycle events are diagnostic-only. Keep their detached work bounded so a stalled broker
 // cannot delay a durable acceptance, physical acquisition, or consume unbounded task memory.
 const MAX_LIFECYCLE_EVENT_PUBLISHES: usize = 64;
@@ -3829,38 +3835,60 @@ impl CameraRuntime {
                 // The capture's clocks start NOW, not when it was accepted. Without this the whole
                 // queue is a way of making captures die tidily: a member that waited its turn would
                 // arrive at a free camera with its entire budget already spent.
+                // Everything from here to the hand-off can fail, and a descriptor dropped on any of
+                // those paths is a durable row left QUEUED with nothing left alive to drive it --
+                // B5, rebuilt. So the rule for this whole block is: a capture only leaves the queue
+                // when it is dispatched, or when it is provably no longer owed a run.
                 let timeouts = match runtime.config_snapshot() {
                     Ok(config) => config.global.timeouts.clone(),
                     Err(error) => {
                         tracing::error!(error = %error, "capture scheduler cannot read its configuration");
+                        runtime.return_to_queue(descriptor);
+                        tokio::time::sleep(SCHEDULER_RETRY_BACKOFF).await;
                         continue;
                     }
                 };
-                match runtime.engine(&instance) {
-                    Ok(engine) => {
-                        if let Err(error) = engine
-                            .rebase_onto_admission(&descriptor, &timeouts)
-                            .await
-                        {
-                            // The capture is already terminal or gone. Its own machinery has retired
-                            // it; dropping it here is correct and quiet.
-                            tracing::debug!(
-                                instance = %instance,
-                                capture = %descriptor.capture_id(),
-                                error = %error,
-                                "capture could not be rebased onto its admission and was not dispatched"
-                            );
-                            continue;
-                        }
-                    }
+                let engine = match runtime.engine(&instance) {
+                    Ok(engine) => engine,
                     Err(error) => {
+                        // The camera is gone -- a reload retired it. There is nothing to put this
+                        // back for, and requeueing would spin on it forever.
                         tracing::warn!(
                             instance = %instance,
+                            capture = %descriptor.capture_id(),
                             error = %error,
-                            "capture scheduler has no engine for this camera"
+                            "capture scheduler has no engine for this camera; the capture is dropped"
                         );
                         continue;
                     }
+                };
+                if let Err(error) = engine.rebase_onto_admission(&descriptor, &timeouts).await {
+                    if error.is_durable_store_failure() {
+                        // The STORE hiccuped -- it did not say this capture is finished. It is still
+                        // QUEUED and still owed a run, so it goes back on the queue. Dropping it here
+                        // is what stranded a real capture: under load the catalog returns SQLITE_BUSY,
+                        // the rebase fails transiently, and treating that as "already retired"
+                        // destroys a capture that nothing else will ever pick up. The back-off keeps a
+                        // sustained store outage from turning this into a spin.
+                        tracing::warn!(
+                            instance = %instance,
+                            capture = %descriptor.capture_id(),
+                            error = %error,
+                            "the catalog could not rebase this capture; it stays queued and will be retried"
+                        );
+                        runtime.return_to_queue(descriptor);
+                        tokio::time::sleep(SCHEDULER_RETRY_BACKOFF).await;
+                    } else {
+                        // The row is no longer QUEUED: already terminal, cancelled, or expired. Its
+                        // own machinery has retired it, and there is nothing to put back.
+                        tracing::debug!(
+                            instance = %instance,
+                            capture = %descriptor.capture_id(),
+                            error = %error,
+                            "capture was retired before it could be dispatched"
+                        );
+                    }
+                    continue;
                 }
 
                 // Held from here until the capture is terminal. The slot was taken BEFORE the pop,
@@ -3879,13 +3907,7 @@ impl CameraRuntime {
                         capture = %descriptor.capture_id(),
                         "camera went offline during dispatch; the capture stays queued"
                     );
-                    if let Err(error) = runtime.requeue(descriptor) {
-                        tracing::warn!(
-                            instance = %instance,
-                            error = %error,
-                            "a promised capture could not be returned to the queue"
-                        );
-                    }
+                    runtime.return_to_queue(descriptor);
                 }
             }
         })
@@ -3897,6 +3919,24 @@ impl CameraRuntime {
         let reservation = crate::jobs::CaptureDispatcher::reserve(&self.scheduler, &instance)?;
         reservation.commit(descriptor)?;
         Ok(())
+    }
+
+    /// Returns a capture to the queue, and says so loudly if it cannot.
+    ///
+    /// A capture that can be neither dispatched nor requeued is a durable row that will sit QUEUED
+    /// until its deadline retires it. That is recoverable -- the deadline task does terminalize it --
+    /// but it is never routine, and it must not be silent.
+    fn return_to_queue(&self, descriptor: crate::jobs::CaptureDescriptor) {
+        let instance = descriptor.instance().to_owned();
+        let capture = descriptor.capture_id().to_owned();
+        if let Err(error) = self.requeue(descriptor) {
+            tracing::error!(
+                instance = %instance,
+                capture = %capture,
+                error = %error,
+                "a capture could not be returned to the queue and will wait for its deadline"
+            );
+        }
     }
 
     fn start_storage_pressure_monitor(self: &Arc<Self>) -> Result<()> {
@@ -4173,7 +4213,8 @@ impl CameraRuntime {
     }
 
     fn start_schedulers(self: &Arc<Self>) -> Result<()> {
-        for camera in self.config_snapshot()?.instances {
+        let config = self.config_snapshot()?;
+        for camera in &config.instances {
             if !camera.enabled {
                 continue;
             }
@@ -4181,6 +4222,18 @@ impl CameraRuntime {
                 let plan = SchedulePlan::compile(camera.id.clone(), schedule)?;
                 self.start_schedule_plan(plan)?;
             }
+        }
+        // One task per group schedule -- not one per (camera, schedule) pair. A group fires once,
+        // as one thing; N member tasks racing the same cron would be N groups, or one group and
+        // N-1 duplicate submissions.
+        for schedule in config
+            .global
+            .capture_group_schedules
+            .iter()
+            .filter(|schedule| schedule.enabled)
+        {
+            let plan = SchedulePlan::compile_group(schedule)?;
+            self.start_schedule_plan(plan)?;
         }
         Ok(())
     }
@@ -4200,7 +4253,14 @@ impl CameraRuntime {
         }
         let runtime = Arc::clone(self);
         self.spawn_task(async move {
-            runtime.run_schedule(plan, cancellation).await;
+            match plan.scope() {
+                crate::scheduler::ScheduleScope::Camera(_) => {
+                    runtime.run_schedule(plan, cancellation).await;
+                }
+                crate::scheduler::ScheduleScope::Group(_) => {
+                    runtime.run_group_schedule(plan, cancellation).await;
+                }
+            }
         })
     }
 
@@ -4453,6 +4513,272 @@ impl CameraRuntime {
         }
     }
 
+    /// Runs one group schedule: fire a synchronised capture across several cameras on a cron.
+    ///
+    /// The occurrence is submitted through [`Self::submit_group`] -- the same path the
+    /// `sb/capture-group` command takes -- so a scheduled group is indistinguishable from a
+    /// commanded one: one durable group row, all-or-nothing acceptance, one collated terminal
+    /// notification. What makes that safe to do from a scheduler is that `submit_group` is already
+    /// idempotent on its request id, and this loop derives that id from the schedule and the
+    /// intended fire time. An occurrence is therefore admitted exactly once even if the component
+    /// crashes between submitting it and recording that it did.
+    ///
+    /// This shipped only once the fleet queue existed. On the old fire-all-and-hope dispatch, a
+    /// scheduled group larger than the effective capacity would have timed out its surplus members
+    /// on every tick, forever, writing a durable failure row each time.
+    async fn run_group_schedule(
+        self: Arc<Self>,
+        plan: SchedulePlan,
+        schedule_cancellation: CancellationToken,
+    ) {
+        let (_, schedule_id) = plan.key_parts();
+        let now = chrono::Utc::now();
+        let cursor = match self
+            .catalog
+            .group_schedule_cursor(schedule_id.clone())
+            .await
+        {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                tracing::error!(
+                    schedule_id = %schedule_id,
+                    error = %error,
+                    "group schedule could not load its durable recovery cursor"
+                );
+                return;
+            }
+        };
+        let mut last_consumed = cursor
+            .as_ref()
+            .and_then(|cursor| {
+                chrono::DateTime::from_timestamp_millis(cursor.intended_fire_time_ms)
+            })
+            .unwrap_or_else(|| now - chrono::Duration::seconds(1));
+        let mut last_group_id = cursor.and_then(|cursor| cursor.last_group_id);
+        loop {
+            if self.cancellation.is_cancelled() || schedule_cancellation.is_cancelled() {
+                return;
+            }
+            if self.reloading.load(Ordering::Acquire) {
+                tokio::select! {
+                    _ = self.cancellation.cancelled() => return,
+                    _ = schedule_cancellation.cancelled() => return,
+                    _ = tokio::time::sleep(SCHEDULER_POLL_INTERVAL) => continue,
+                }
+            }
+            let now = chrono::Utc::now();
+            // Decide first, and only ask about overlap when the answer can still change something
+            // -- the same rule the camera loop learned the hard way in B6. An overlap observation
+            // can only ever turn an `Admit` into a `SkippedOverlap`.
+            let mut decision = plan.evaluate(last_consumed, now, SCHEDULER_MISFIRE_GRACE, false);
+            let admitted = match &decision {
+                Ok(ScheduleDecision::Admit {
+                    occurrence,
+                    consumed,
+                }) if plan.skips_on_overlap() => Some((occurrence.clone(), *consumed)),
+                _ => None,
+            };
+            if let Some((occurrence, consumed)) = admitted {
+                // Evaluated against the GROUP, not its members: the previous occurrence is
+                // outstanding until every camera in it is terminal.
+                if self.group_schedule_overlaps(last_group_id.as_deref()).await {
+                    decision = Ok(ScheduleDecision::SkippedOverlap {
+                        occurrence,
+                        consumed,
+                    });
+                }
+            }
+            match decision {
+                Ok(ScheduleDecision::NotDue) => {}
+                Ok(ScheduleDecision::SkippedMisfire { latest, consumed }) => {
+                    last_consumed = latest.intended_fire_time;
+                    self.record_group_occurrence(&schedule_id, latest.intended_fire_time, None)
+                        .await;
+                    tracing::info!(
+                        schedule_id = %schedule_id,
+                        intended_fire_time = %latest.intended_fire_time,
+                        consumed,
+                        "group schedule skipped a misfire"
+                    );
+                }
+                Ok(ScheduleDecision::SkippedOverlap {
+                    occurrence,
+                    consumed,
+                }) => {
+                    last_consumed = occurrence.intended_fire_time;
+                    self.record_group_occurrence(&schedule_id, occurrence.intended_fire_time, None)
+                        .await;
+                    tracing::info!(
+                        schedule_id = %schedule_id,
+                        intended_fire_time = %occurrence.intended_fire_time,
+                        consumed,
+                        "group schedule skipped an occurrence whose previous group is still running"
+                    );
+                }
+                Ok(ScheduleDecision::Admit {
+                    occurrence,
+                    consumed,
+                }) => {
+                    last_consumed = occurrence.intended_fire_time;
+                    match self.submit_scheduled_group(&occurrence).await {
+                        Ok(group_id) => {
+                            last_group_id = Some(group_id.clone());
+                            self.record_group_occurrence(
+                                &schedule_id,
+                                occurrence.intended_fire_time,
+                                Some(group_id),
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            // The occurrence is consumed even when it could not be admitted, exactly
+                            // as a camera schedule consumes one: repeating it would violate the
+                            // one-occurrence guarantee. The next cron occurrence is evaluated
+                            // normally.
+                            self.record_group_occurrence(
+                                &schedule_id,
+                                occurrence.intended_fire_time,
+                                None,
+                            )
+                            .await;
+                            tracing::warn!(
+                                schedule_id = %schedule_id,
+                                intended_fire_time = %occurrence.intended_fire_time,
+                                consumed,
+                                error = %error,
+                                "group schedule occurrence was not admitted"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        schedule_id = %schedule_id,
+                        error = %error,
+                        "group schedule evaluation failed"
+                    );
+                }
+            }
+            tokio::select! {
+                _ = self.cancellation.cancelled() => return,
+                _ = schedule_cancellation.cancelled() => return,
+                _ = tokio::time::sleep(SCHEDULER_POLL_INTERVAL) => {}
+            }
+        }
+    }
+
+    /// Whether this schedule's previous group is still running.
+    ///
+    /// One primary-key lookup, and only when an occurrence is actually due. A group that has been
+    /// pruned by retention is long terminal, so a missing row is not an overlap.
+    async fn group_schedule_overlaps(&self, last_group_id: Option<&str>) -> bool {
+        let Some(group_id) = last_group_id else {
+            return false;
+        };
+        match self.catalog.group(group_id.to_owned()).await {
+            Ok(Some(group)) => !group.state.is_terminal(),
+            Ok(None) => false,
+            Err(error) => {
+                // Fail closed: a catalog we cannot read is not a licence to pile a second group on
+                // top of one that may still be running.
+                tracing::warn!(
+                    group_id = %group_id,
+                    error = %error,
+                    "group schedule could not evaluate overlap and skipped the occurrence"
+                );
+                true
+            }
+        }
+    }
+
+    async fn record_group_occurrence(
+        &self,
+        schedule_id: &str,
+        intended_fire_time: chrono::DateTime<chrono::Utc>,
+        group_id: Option<String>,
+    ) {
+        if let Err(error) = self
+            .catalog
+            .record_group_schedule_occurrence(
+                schedule_id.to_owned(),
+                intended_fire_time.timestamp_millis(),
+                group_id,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+        {
+            // The cursor is a recovery hint, not the authority -- the command ledger is. Losing this
+            // write costs a redundant submission after a restart, which the ledger absorbs.
+            tracing::warn!(
+                schedule_id = %schedule_id,
+                error = %error,
+                "group schedule could not record its recovery cursor"
+            );
+        }
+    }
+
+    /// Submits one group-schedule occurrence as an ordinary capture group.
+    async fn submit_scheduled_group(&self, occurrence: &ScheduleOccurrence) -> Result<String> {
+        let config = self.config_snapshot()?;
+        let schedule = config
+            .global
+            .capture_group_schedules
+            .iter()
+            .find(|schedule| schedule.id == occurrence.schedule_id && schedule.enabled)
+            .ok_or_else(|| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::InvalidRequest,
+                    "group schedule is no longer enabled",
+                )
+            })?;
+        // Derived, not random: this is what makes the occurrence exactly-once. The same occurrence
+        // always produces the same request id, and `submit_group` answers a repeat with the group it
+        // already accepted rather than a second one.
+        let request_id = format!(
+            "schedule:{}:{}",
+            schedule.id,
+            occurrence.intended_fire_time.timestamp_millis()
+        );
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "scheduleId".to_string(),
+            serde_json::Value::String(schedule.id.clone()),
+        );
+        metadata.insert(
+            "intendedFireTime".to_string(),
+            serde_json::Value::String(
+                occurrence
+                    .intended_fire_time
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            ),
+        );
+        let body = crate::commands::GroupCaptureRequest {
+            request_id,
+            instances: schedule.instances.clone(),
+            capture_profile: schedule.capture_profile.clone(),
+            profile_overrides: schedule.profile_overrides.clone(),
+            timeout_ms: schedule.timeout_ms,
+            metadata,
+        };
+        let correlation_id = format!("sched_{}", uuid::Uuid::now_v7());
+        let group = self
+            .submit_group(
+                body,
+                correlation_id,
+                crate::admission::CapturePriority::Scheduled,
+                None,
+            )
+            .await?;
+        tracing::info!(
+            schedule_id = %schedule.id,
+            group_id = %group.group_id,
+            members = schedule.instances.len(),
+            intended_fire_time = %occurrence.intended_fire_time,
+            "group schedule admitted a synchronised capture"
+        );
+        Ok(group.group_id)
+    }
+
     async fn has_schedule_overlap(&self, instance: &str, schedule_id: &str) -> Result<bool> {
         let states = vec![
             crate::model::JobState::Accepted,
@@ -4491,11 +4817,14 @@ impl CameraRuntime {
     }
 
     async fn emit_schedule_skipped(&self, occurrence: &ScheduleOccurrence) {
+        let Some(instance) = occurrence.scope.camera() else {
+            return;
+        };
         let event = self
             .events
             .read()
             .ok()
-            .and_then(|events| events.get(&occurrence.instance).cloned());
+            .and_then(|events| events.get(instance).cloned());
         if let Some(event) = event {
             let _ = event
                 .emit(
@@ -4513,8 +4842,14 @@ impl CameraRuntime {
     }
 
     async fn submit_scheduled(&self, occurrence: &ScheduleOccurrence) -> Result<()> {
+        let instance = occurrence.scope.camera().ok_or_else(|| {
+            crate::CameraError::Catalog(
+                "a group-schedule occurrence cannot be submitted as a single camera capture"
+                    .to_string(),
+            )
+        })?;
         let config = self.config_snapshot()?;
-        let camera = self.registry.camera_config(&occurrence.instance)?;
+        let camera = self.registry.camera_config(instance)?;
         if !camera.enabled {
             return Err(crate::CameraError::rejected(
                 crate::ErrorCode::CameraDisabled,
@@ -4546,7 +4881,7 @@ impl CameraRuntime {
             .unwrap_or(camera.ptz.capture_interlock)
             == crate::config::CaptureInterlock::Reject
         {
-            if let Ok(actor) = self.actor(&occurrence.instance) {
+            if let Ok(actor) = self.actor(instance) {
                 if matches!(
                     actor
                         .ptz(
@@ -4596,13 +4931,13 @@ impl CameraRuntime {
         let relative_path = crate::storage::render_output_path(
             &config.global.output,
             crate::storage::OutputPathVariables {
-                camera_id: &occurrence.instance,
+                camera_id: instance,
                 capture_id: &capture_id,
                 timestamp: chrono::Utc::now(),
             },
             profile.output.encoding,
         )?;
-        let snapshot = self.registry.snapshot(&occurrence.instance)?;
+        let snapshot = self.registry.snapshot(instance)?;
         let camera_summary = crate::messages::CameraSummary {
             backend: snapshot.backend,
             vendor: snapshot
@@ -4664,7 +4999,7 @@ impl CameraRuntime {
         let submission = crate::jobs::JobSubmission {
             job: crate::catalog::NewJob {
                 capture_id: capture_id.clone(),
-                instance: occurrence.instance.clone(),
+                instance: instance.to_owned(),
                 ledger_key: None,
                 request_hash: crate::idempotency::canonical_request_hash(&canonical, false)?,
                 canonical_request: canonical,
@@ -4681,7 +5016,7 @@ impl CameraRuntime {
             },
             spec: crate::jobs::CaptureJobSpec {
                 capture_id: capture_id.clone(),
-                instance: occurrence.instance.clone(),
+                instance: instance.to_owned(),
                 profile: profile_snapshot,
                 resource_group: camera.resource_group.clone(),
                 relative_path,
@@ -4705,8 +5040,8 @@ impl CameraRuntime {
             )
             .await?;
         if matches!(outcome, crate::catalog::AcceptJobOutcome::Inserted(_)) {
-            let dispatcher = self.dispatcher(&occurrence.instance)?;
-            self.engine(&occurrence.instance)?
+            let dispatcher = self.dispatcher(instance)?;
+            self.engine(instance)?
                 .queue_preaccepted(&dispatcher, submission)
                 .await?;
         }
@@ -9410,7 +9745,7 @@ mod tests {
                 .await
                 .unwrap();
             let occurrence = ScheduleOccurrence {
-                instance: "camera-a".to_string(),
+                scope: crate::scheduler::ScheduleScope::Camera("camera-a".to_string()),
                 schedule_id: "minute".to_string(),
                 intended_fire_time: chrono::Utc::now(),
                 admit_at: chrono::Utc::now(),
@@ -10488,7 +10823,7 @@ mod tests {
 
             let intended_fire_time = chrono::Utc::now();
             let occurrence = ScheduleOccurrence {
-                instance: "camera-a".to_string(),
+                scope: crate::scheduler::ScheduleScope::Camera("camera-a".to_string()),
                 schedule_id: "minute".to_string(),
                 intended_fire_time,
                 admit_at: intended_fire_time,
@@ -10627,7 +10962,7 @@ mod tests {
                 .await
                 .unwrap();
             let occurrence = ScheduleOccurrence {
-                instance: "camera-a".to_string(),
+                scope: crate::scheduler::ScheduleScope::Camera("camera-a".to_string()),
                 schedule_id: "minute".to_string(),
                 intended_fire_time: chrono::Utc::now(),
                 admit_at: chrono::Utc::now(),
@@ -12929,6 +13264,350 @@ mod tests {
         }
 
         /// The drain reaches durable work regardless of whether an unknown camera is named.
+        /// Rebasing a deadline must not disarm it: a capture that runs out of time still fails.
+        ///
+        /// The terminal-deadline task re-reads its deadline instead of firing on the one it was
+        /// spawned with, because a capture's clocks are rebased when a camera finally takes it. A
+        /// re-reading task that never fires would be worse than the stale one it replaced: captures
+        /// would wait forever instead of dying early. It still fires -- just on the clock in force.
+        #[tokio::test]
+        async fn a_capture_that_runs_out_of_time_while_it_waits_still_fails() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            // The camera never comes online, so this capture waits until its terminal clock runs out.
+            // The stage clocks must fit inside the terminal one, so they come down with it.
+            configuration.global.timeouts.job_terminal_ms = 1_000;
+            configuration.global.timeouts.capture_ms = 500;
+            configuration.global.timeouts.encode_ms = 500;
+            configuration.global.timeouts.persist_ms = 500;
+            let runtime = runtime(configuration, &directory).await;
+
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "waits-forever".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "timeout-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let capture = match accepted {
+                crate::catalog::AcceptJobOutcome::Inserted(record)
+                | crate::catalog::AcceptJobOutcome::Existing(record) => record.capture_id,
+                crate::catalog::AcceptJobOutcome::Conflict => panic!("unexpected ledger conflict"),
+            };
+
+            let record =
+                wait_for_terminal_within(&runtime, &capture, Duration::from_secs(20)).await;
+            assert_eq!(record.state, crate::model::JobState::Failed);
+            assert_eq!(
+                record.error_code.as_deref(),
+                Some(crate::ErrorCode::CaptureTimeout.as_str()),
+                "a capture nobody can run must still be retired by its deadline"
+            );
+        }
+
+        /// The other half of the rule: a capture that really IS retired must be dropped.
+        ///
+        /// The requeue path exists so a store hiccup cannot destroy a capture. It must not become a
+        /// path that resurrects one. A cancelled capture is no longer QUEUED, the catalog says so with
+        /// an invariant error rather than a store error, and the scheduler must let it go -- otherwise
+        /// it pops, fails to rebase, requeues, and spins on a capture nobody is waiting for.
+        #[tokio::test]
+        async fn a_capture_already_retired_is_dropped_not_requeued() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-a"], false);
+            let runtime = runtime(configuration, &directory).await;
+
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "retired-before-dispatch".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "retired-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let capture = match accepted {
+                crate::catalog::AcceptJobOutcome::Inserted(record)
+                | crate::catalog::AcceptJobOutcome::Existing(record) => record.capture_id,
+                crate::catalog::AcceptJobOutcome::Conflict => panic!("unexpected ledger conflict"),
+            };
+            assert_eq!(runtime.scheduler.pending(), 1);
+
+            // Retired while it waited, before any camera could take it -- through the real cancel
+            // command, not a hand-built terminal row.
+            runtime
+                .cancel_capture(CancelRequest {
+                    request_id: "retire-before-dispatch".to_string(),
+                    capture_id: Some(capture.clone()),
+                    capture_group_id: None,
+                    reason: Some("retired while queued".to_string()),
+                })
+                .await
+                .unwrap();
+
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            assert_eq!(
+                runtime.scheduler.pending(),
+                0,
+                "a cancelled capture is not owed a run and must not be put back on the queue"
+            );
+            let record = runtime.catalog.job(&capture).await.unwrap().unwrap();
+            assert_eq!(record.state, crate::model::JobState::Cancelled);
+        }
+
+        /// A group schedule resumes from its durable cursor, and skips what it missed.
+        ///
+        /// The cursor is what tells a restarted component the difference between an occurrence it
+        /// missed while it was down and one that has not come due. With `misfirePolicy: skip`, an
+        /// occurrence older than the misfire grace is consumed and discarded rather than fired late.
+        #[tokio::test]
+        async fn a_group_schedule_resumes_from_its_cursor_and_skips_a_misfire() {
+            let directory = TempDir::new().unwrap();
+            let cameras = ["camera-a", "camera-b"];
+            let mut configuration = config(directory.path(), &cameras, false);
+            let mut schedule =
+                group_schedule("line-a-sync", &cameras, crate::config::OverlapPolicy::Skip);
+            // Hourly, so the occurrences the seeded cursor missed are hours old -- far past the
+            // misfire grace -- and the next one is not due for the rest of the test.
+            schedule.cron = "0 0 * * * *".to_string();
+            configuration.global.capture_group_schedules = vec![schedule];
+            let runtime = runtime(configuration, &directory).await;
+            for camera in cameras {
+                runtime
+                    .start_supervisor(camera.to_string(), runtime.engine(camera).unwrap())
+                    .unwrap();
+                wait_for_online(&runtime, camera).await;
+            }
+
+            // The component was down for three hours.
+            let stale = chrono::Utc::now() - chrono::Duration::hours(3);
+            runtime
+                .catalog
+                .record_group_schedule_occurrence(
+                    "line-a-sync",
+                    stale.timestamp_millis(),
+                    None,
+                    stale.timestamp_millis(),
+                )
+                .await
+                .unwrap();
+
+            runtime.start_schedulers().unwrap();
+            tokio::time::sleep(Duration::from_millis(600)).await;
+
+            let cursor = runtime
+                .catalog
+                .group_schedule_cursor("line-a-sync")
+                .await
+                .unwrap()
+                .expect("the schedule consumed the occurrences it missed");
+            assert!(
+                cursor.intended_fire_time_ms > stale.timestamp_millis(),
+                "a missed occurrence is consumed, not left to be fired again on the next tick"
+            );
+            assert_eq!(
+                cursor.last_group_id, None,
+                "a misfire is skipped -- hours-late captures must not be fired at a live line"
+            );
+        }
+
+        /// A catalog that cannot answer "is the previous group still running?" fails CLOSED.
+        ///
+        /// Firing a second synchronised group on top of one that may still be moving cameras is worse
+        /// than missing a cycle, so an unreadable catalog skips the occurrence rather than assuming
+        /// the coast is clear.
+        #[tokio::test]
+        async fn group_overlap_fails_closed_when_the_catalog_cannot_answer() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+            let runtime = runtime(configuration, &directory).await;
+
+            let database = directory
+                .path()
+                .join("state")
+                .join("camera-adapter.sqlite3");
+            let break_store = rusqlite::Connection::open(&database).unwrap();
+            break_store
+                .execute_batch("ALTER TABLE capture_groups RENAME TO capture_groups_unavailable")
+                .unwrap();
+
+            assert!(
+                runtime
+                    .group_schedule_overlaps(Some("grp_unknowable"))
+                    .await,
+                "a catalog that cannot answer is not permission to fire another group"
+            );
+
+            // And a cursor the store cannot write is survivable: the command ledger, not the cursor,
+            // is what makes an occurrence exactly-once, so the schedule logs and carries on rather
+            // than dying on a recovery hint.
+            break_store
+                .execute_batch(
+                    "ALTER TABLE group_schedule_cursors RENAME TO group_schedule_cursors_unavailable",
+                )
+                .unwrap();
+            runtime
+                .record_group_occurrence("line-a-sync", chrono::Utc::now(), None)
+                .await;
+
+            break_store
+                .execute_batch(
+                    "ALTER TABLE group_schedule_cursors_unavailable RENAME TO group_schedule_cursors",
+                )
+                .unwrap();
+            break_store
+                .execute_batch("ALTER TABLE capture_groups_unavailable RENAME TO capture_groups")
+                .unwrap();
+        }
+
+        /// An occurrence of a schedule that has been disabled or removed is not submitted.
+        #[tokio::test]
+        async fn an_occurrence_of_a_removed_group_schedule_is_not_submitted() {
+            let directory = TempDir::new().unwrap();
+            let cameras = ["camera-a", "camera-b"];
+            let mut configuration = config(directory.path(), &cameras, false);
+            let mut disabled =
+                group_schedule("line-a-sync", &cameras, crate::config::OverlapPolicy::Skip);
+            disabled.enabled = false;
+            configuration.global.capture_group_schedules = vec![disabled];
+            let runtime = runtime(configuration, &directory).await;
+
+            let fire_time = chrono::DateTime::from_timestamp_millis(1_752_000_000_000).unwrap();
+            let occurrence = ScheduleOccurrence {
+                scope: crate::scheduler::ScheduleScope::Group("line-a-sync".to_string()),
+                schedule_id: "line-a-sync".to_string(),
+                intended_fire_time: fire_time,
+                admit_at: fire_time,
+                jitter: Duration::ZERO,
+            };
+            let error = runtime
+                .submit_scheduled_group(&occurrence)
+                .await
+                .expect_err("a disabled schedule must not fire");
+            assert_eq!(error.code(), crate::ErrorCode::InvalidRequest);
+
+            let unknown = ScheduleOccurrence {
+                scope: crate::scheduler::ScheduleScope::Group("gone".to_string()),
+                schedule_id: "gone".to_string(),
+                intended_fire_time: fire_time,
+                admit_at: fire_time,
+                jitter: Duration::ZERO,
+            };
+            assert!(
+                runtime.submit_scheduled_group(&unknown).await.is_err(),
+                "a schedule removed by a reload must not fire"
+            );
+
+            // A camera schedule occurrence is not a group, and must not be submitted as one.
+            let camera_scoped = ScheduleOccurrence {
+                scope: crate::scheduler::ScheduleScope::Camera("camera-a".to_string()),
+                schedule_id: "minute".to_string(),
+                intended_fire_time: fire_time,
+                admit_at: fire_time,
+                jitter: Duration::ZERO,
+            };
+            assert!(runtime.submit_scheduled(&camera_scoped).await.is_err());
+        }
+
+        /// A capture the STORE could not rebase goes back on the queue -- it is not destroyed.
+        ///
+        /// This is B5 wearing a different hat, and the fleet queue rebuilt it. The scheduler pops a
+        /// capture, rebases its clocks onto the moment a camera actually took it, and hands it over.
+        /// When that durable write failed, the code treated it as "this capture is already terminal
+        /// or gone" and dropped the descriptor. It is not gone: a transient `SQLITE_BUSY` under load
+        /// says nothing about the capture, only about the store. The durable row stays QUEUED, the
+        /// only in-memory thing that could have driven it has been destroyed, and the capture waits
+        /// for a deadline that will fail it. It cost a real member of a real group, and it only
+        /// showed up under load -- which is exactly when a contended catalog returns BUSY.
+        ///
+        /// The store failure here is real, not injected into production code: the `jobs` table is
+        /// renamed out from under the catalog, so the rebase UPDATE fails with a genuine
+        /// `CameraError::Sqlite`, and is then renamed back. A store that stops answering and starts
+        /// again is precisely the case that must not lose work.
+        #[tokio::test]
+        async fn a_capture_the_store_could_not_rebase_is_requeued_not_destroyed() {
+            let directory = TempDir::new().unwrap();
+            let configuration = config(directory.path(), &["camera-a"], false);
+            let runtime = runtime(configuration, &directory).await;
+
+            // The camera is deliberately offline, so the capture is accepted, durably QUEUED, and
+            // parked in the fleet queue with nothing yet able to take it.
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "stranded-by-the-store".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "store-failure-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .expect("the capture is accepted while the camera is offline");
+            let capture = match accepted {
+                crate::catalog::AcceptJobOutcome::Inserted(record)
+                | crate::catalog::AcceptJobOutcome::Existing(record) => record.capture_id,
+                crate::catalog::AcceptJobOutcome::Conflict => panic!("unexpected ledger conflict"),
+            };
+            assert_eq!(runtime.scheduler.pending(), 1);
+
+            // The store stops being able to serve the rebase. Done through a SEPARATE connection to
+            // the same database, so no production type grows a fault-injection hook for this.
+            let database = directory
+                .path()
+                .join("state")
+                .join("camera-adapter.sqlite3");
+            let break_store = rusqlite::Connection::open(&database).unwrap();
+            break_store
+                .execute_batch("ALTER TABLE jobs RENAME TO jobs_unavailable")
+                .unwrap();
+
+            // The camera comes online. The scheduler pops the capture, fails to rebase it, and must
+            // put it back: with the defect it drops the descriptor here and `pending()` falls to 0
+            // for the rest of the process.
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert_eq!(
+                runtime.scheduler.pending(),
+                1,
+                "a capture the store could not rebase is still owed a run and must stay queued"
+            );
+
+            // The store recovers. The capture must actually run -- being requeued is only half of
+            // the promise.
+            break_store
+                .execute_batch("ALTER TABLE jobs_unavailable RENAME TO jobs")
+                .unwrap();
+            drop(break_store);
+
+            let record =
+                wait_for_terminal_within(&runtime, &capture, Duration::from_secs(20)).await;
+            assert_eq!(
+                record.state,
+                crate::model::JobState::Succeeded,
+                "once the store recovers, the capture it could not rebase must still run"
+            );
+        }
+
         #[tokio::test]
         async fn queue_status_and_clear_reject_an_unknown_camera() {
             let directory = TempDir::new().unwrap();
@@ -12968,6 +13647,282 @@ mod tests {
         ///
         /// This group is deliberately wider than the component's execution capacity: four cameras
         /// against a single concurrent-capture permit. Every member must still succeed.
+        fn group_schedule(
+            id: &str,
+            cameras: &[&str],
+            overlap: crate::config::OverlapPolicy,
+        ) -> crate::config::CaptureGroupScheduleConfig {
+            crate::config::CaptureGroupScheduleConfig {
+                id: id.to_string(),
+                enabled: true,
+                // Every second: the loop polls at 200 ms, so a test does not wait on a wall clock.
+                cron: "* * * * * *".to_string(),
+                timezone: "UTC".to_string(),
+                instances: cameras.iter().map(|camera| (*camera).to_string()).collect(),
+                capture_profile: None,
+                profile_overrides: BTreeMap::new(),
+                misfire_policy: crate::config::MisfirePolicy::Skip,
+                overlap_policy: overlap,
+                jitter_seconds: 0,
+                timeout_ms: None,
+            }
+        }
+
+        /// Waits for a group schedule to admit an occurrence, and returns the group it admitted.
+        ///
+        /// Read from the schedule's own durable cursor, which is also the thing that has to survive
+        /// a restart -- so a green wait here is evidence for both.
+        async fn wait_for_scheduled_group(runtime: &CameraRuntime, schedule_id: &str) -> String {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Ok(Some(cursor)) = runtime.catalog.group_schedule_cursor(schedule_id).await {
+                    if let Some(group_id) = cursor.last_group_id {
+                        return group_id;
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "group schedule '{schedule_id}' never admitted an occurrence"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        /// G2: a cron fires ONE synchronised group across several cameras.
+        ///
+        /// Before this, grouping existed only on the command path: a synchronised multi-camera
+        /// capture could not be scheduled at all. The assertions that matter are that the members
+        /// are exactly the schedule's cameras -- one capture each, no duplicates, none missing --
+        /// and that it arrives as a single durable group rather than N unrelated captures that
+        /// happened to fire at once.
+        #[tokio::test]
+        async fn a_group_schedule_fires_one_synchronised_group_across_its_cameras() {
+            let directory = TempDir::new().unwrap();
+            let cameras = ["camera-a", "camera-b", "camera-c"];
+            let mut configuration = config(directory.path(), &cameras, false);
+            configuration.global.capture_group_schedules = vec![group_schedule(
+                "line-a-sync",
+                &cameras,
+                crate::config::OverlapPolicy::Skip,
+            )];
+            let runtime = runtime(configuration, &directory).await;
+            for camera in cameras {
+                runtime
+                    .start_supervisor(camera.to_string(), runtime.engine(camera).unwrap())
+                    .unwrap();
+                wait_for_online(&runtime, camera).await;
+            }
+            runtime.start_schedulers().unwrap();
+
+            let group_id = wait_for_scheduled_group(&runtime, "line-a-sync").await;
+            let terminal =
+                wait_for_group_terminal_within(&runtime, &group_id, Duration::from_secs(20)).await;
+
+            let mut members: Vec<_> = terminal
+                .members
+                .iter()
+                .map(|member| member.instance.clone())
+                .collect();
+            members.sort();
+            assert_eq!(
+                members,
+                vec!["camera-a", "camera-b", "camera-c"],
+                "a scheduled group captures exactly its configured cameras, once each"
+            );
+            assert!(
+                terminal
+                    .members
+                    .iter()
+                    .all(|member| member.state == crate::model::JobState::Succeeded),
+                "every member of a scheduled group must succeed: {:?}",
+                terminal
+                    .members
+                    .iter()
+                    .map(|member| member.state)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        /// A group schedule holds an occurrence back while its previous group is still running.
+        ///
+        /// The end-to-end form of the overlap rule: with a cron firing every second and captures that
+        /// take much longer than that, the schedule must produce ONE group and then wait, rather than
+        /// piling a new synchronised capture onto cameras that are still working through the last one.
+        #[tokio::test]
+        async fn a_group_schedule_does_not_stack_groups_on_cameras_still_working() {
+            let directory = TempDir::new().unwrap();
+            let cameras = ["camera-a", "camera-b", "camera-c"];
+            let mut configuration = config(directory.path(), &cameras, false);
+            configuration.global.capture_group_schedules = vec![group_schedule(
+                "line-a-sync",
+                &cameras,
+                crate::config::OverlapPolicy::Skip,
+            )];
+            // One at a time, 700 ms each: the group needs ~2.1 s, and the cron comes round every 1 s.
+            configuration.global.limits.max_concurrent_captures = 1;
+            configuration.global.limits.max_in_flight_bytes =
+                configuration.global.limits.max_frame_bytes_per_camera;
+            for camera in &mut configuration.instances {
+                if let crate::config::BackendConfig::Sim(sim) = &mut camera.backend {
+                    sim.capture_delay_ms = 700;
+                }
+            }
+            let runtime = runtime(configuration, &directory).await;
+            for camera in cameras {
+                runtime
+                    .start_supervisor(camera.to_string(), runtime.engine(camera).unwrap())
+                    .unwrap();
+                wait_for_online(&runtime, camera).await;
+            }
+            runtime.start_schedulers().unwrap();
+
+            let first = wait_for_scheduled_group(&runtime, "line-a-sync").await;
+
+            // While that group works, the cron comes round repeatedly. Every one of those occurrences
+            // must be skipped, and the cursor must still point at the SAME group.
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
+            let cursor = runtime
+                .catalog
+                .group_schedule_cursor("line-a-sync")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                cursor.last_group_id.as_deref(),
+                Some(first.as_str()),
+                "an occurrence that fires while the previous group is still running is skipped"
+            );
+
+            let terminal =
+                wait_for_group_terminal_within(&runtime, &first, Duration::from_secs(20)).await;
+            assert_eq!(terminal.members.len(), 3);
+            assert!(
+                terminal
+                    .members
+                    .iter()
+                    .all(|member| member.state == crate::model::JobState::Succeeded)
+            );
+        }
+
+        /// G2: the same occurrence submitted twice is the same group, not two.
+        ///
+        /// This is what makes a scheduled group exactly-once across a crash. The request id is
+        /// DERIVED from the schedule and the intended fire time, so a component that dies between
+        /// submitting an occurrence and recording that it did re-submits it on restart and is handed
+        /// back the group it already accepted. Give the occurrence a random request id instead --
+        /// the obvious thing to write -- and every restart inside a cron period duplicates the
+        /// group, and the cameras are captured twice.
+        #[tokio::test]
+        async fn resubmitting_an_occurrence_returns_the_group_it_already_accepted() {
+            let directory = TempDir::new().unwrap();
+            let cameras = ["camera-a", "camera-b"];
+            let mut configuration = config(directory.path(), &cameras, false);
+            configuration.global.capture_group_schedules = vec![group_schedule(
+                "line-a-sync",
+                &cameras,
+                crate::config::OverlapPolicy::Skip,
+            )];
+            let runtime = runtime(configuration, &directory).await;
+            for camera in cameras {
+                runtime
+                    .start_supervisor(camera.to_string(), runtime.engine(camera).unwrap())
+                    .unwrap();
+                wait_for_online(&runtime, camera).await;
+            }
+
+            let fire_time = chrono::DateTime::from_timestamp_millis(1_752_000_000_000).unwrap();
+            let occurrence = ScheduleOccurrence {
+                scope: crate::scheduler::ScheduleScope::Group("line-a-sync".to_string()),
+                schedule_id: "line-a-sync".to_string(),
+                intended_fire_time: fire_time,
+                admit_at: fire_time,
+                jitter: Duration::ZERO,
+            };
+
+            let first = runtime.submit_scheduled_group(&occurrence).await.unwrap();
+            let second = runtime.submit_scheduled_group(&occurrence).await.unwrap();
+            assert_eq!(
+                first, second,
+                "one occurrence is one group -- a re-submission must not create a second"
+            );
+
+            let group = runtime.catalog.group(first).await.unwrap().unwrap();
+            assert_eq!(group.members.len(), 2);
+        }
+
+        /// G2: `overlapPolicy` is evaluated against the GROUP, not against individual members.
+        ///
+        /// A group is outstanding until every camera in it is terminal, so the next occurrence is
+        /// skipped while any member is still running. Evaluating this per member would let a
+        /// schedule fire again on the cameras that happened to finish first, tearing a synchronised
+        /// capture into two half-groups.
+        #[tokio::test]
+        async fn group_overlap_is_evaluated_against_the_whole_group() {
+            let directory = TempDir::new().unwrap();
+            let cameras = ["camera-a", "camera-b", "camera-c"];
+            let mut configuration = config(directory.path(), &cameras, false);
+            // One capture at a time and 800 ms each: the group has ~2.4 s of work to get through, so
+            // the assertion below cannot race it even on a badly loaded machine.
+            configuration.global.limits.max_concurrent_captures = 1;
+            configuration.global.limits.max_in_flight_bytes =
+                configuration.global.limits.max_frame_bytes_per_camera;
+            for camera in &mut configuration.instances {
+                if let crate::config::BackendConfig::Sim(sim) = &mut camera.backend {
+                    sim.capture_delay_ms = 800;
+                }
+            }
+            let runtime = runtime(configuration, &directory).await;
+            for camera in cameras {
+                runtime
+                    .start_supervisor(camera.to_string(), runtime.engine(camera).unwrap())
+                    .unwrap();
+                wait_for_online(&runtime, camera).await;
+            }
+
+            assert!(
+                !runtime.group_schedule_overlaps(None).await,
+                "a schedule that has never fired does not overlap"
+            );
+            assert!(
+                !runtime
+                    .group_schedule_overlaps(Some("grp_never_existed"))
+                    .await,
+                "a group that retention has already pruned is long terminal, not an overlap"
+            );
+
+            let group = runtime
+                .submit_group(
+                    GroupCaptureRequest {
+                        request_id: "overlap-probe".to_string(),
+                        instances: cameras.iter().map(|c| (*c).to_string()).collect(),
+                        capture_profile: None,
+                        profile_overrides: BTreeMap::new(),
+                        timeout_ms: None,
+                        metadata: serde_json::Map::new(),
+                    },
+                    "overlap-correlation".to_string(),
+                    crate::admission::CapturePriority::Scheduled,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Three members, one at a time, 800 ms each: the group cannot be terminal yet.
+            assert!(
+                runtime.group_schedule_overlaps(Some(&group.group_id)).await,
+                "a group with members still running IS an overlap -- the next occurrence must skip"
+            );
+
+            let terminal =
+                wait_for_group_terminal_within(&runtime, &group.group_id, Duration::from_secs(20))
+                    .await;
+            assert!(terminal.state.is_terminal());
+            assert!(
+                !runtime.group_schedule_overlaps(Some(&group.group_id)).await,
+                "once every member is terminal the schedule is free to fire again"
+            );
+        }
+
         #[tokio::test]
         async fn an_oversized_group_is_sequenced_rather_than_partially_failed() {
             let directory = TempDir::new().unwrap();
