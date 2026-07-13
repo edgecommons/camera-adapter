@@ -14746,15 +14746,20 @@ mod tests {
             configuration.global.limits.max_concurrent_captures = 1;
             configuration.global.limits.max_in_flight_bytes =
                 configuration.global.limits.max_frame_bytes_per_camera;
-            // Each capture takes 250 ms and only one may run at a time, so the last member does not
-            // even START until ~750 ms in. Its acceptance-time capture clock is 400 ms. If the clock
-            // still began at acceptance -- as it did before Q1 -- the third and fourth members would
-            // arrive at a free camera already dead. That is the defect, and these two numbers are
-            // what make this test able to catch it.
-            configuration.global.timeouts.capture_ms = 400;
+            // Each capture takes 600 ms and only one may run at a time, so member three does not start
+            // until ~1.2 s in and member four until ~1.8 s. Their capture clock is 1 s. If that clock
+            // still began at ACCEPTANCE -- as it did before Q1 -- both would arrive at a free camera
+            // already dead, and the group would come back mostly timed out. That is the defect, and
+            // the gap between 1 s and 1.8 s is what lets this test see it.
+            //
+            // A rebased clock, by contrast, gives each member the full second to do 600 ms of work.
+            // The 400 ms of slack is deliberate: this ran with 150 ms and passed everywhere except a
+            // two-core CI runner under coverage instrumentation, which is a statement about the
+            // runner and not about the component.
+            configuration.global.timeouts.capture_ms = 1_000;
             for camera in &mut configuration.instances {
                 if let crate::config::BackendConfig::Sim(sim) = &mut camera.backend {
-                    sim.capture_delay_ms = 250;
+                    sim.capture_delay_ms = 600;
                 }
             }
             let runtime = runtime(configuration, &directory).await;
