@@ -77,6 +77,11 @@ const SCHEDULER_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// building, and slow enough that watching the component costs nothing -- the sample takes one
 /// grouped COUNT against a catalog that the capture path is also using.
 const METRIC_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+/// Ceiling on the cameras reported in one keepalive's `instances[]`.
+///
+/// The keepalive is published every few seconds forever, so its body must stay bounded even if a
+/// configuration arrives with far more cameras than the design contemplates.
+const MAX_CONNECTIVITY_INSTANCES: usize = 512;
 const SCHEDULER_MISFIRE_GRACE: Duration = Duration::from_secs(5);
 // Lifecycle events are diagnostic-only. Keep their detached work bounded so a stalled broker
 // cannot delay a durable acceptance, physical acquisition, or consume unbounded task memory.
@@ -2009,6 +2014,47 @@ impl CameraRuntime {
             .map(serde_json::to_value)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(crate::CameraError::from)
+    }
+
+    /// Samples every camera's reachability for the heartbeat's per-instance connectivity surface.
+    ///
+    /// Q5: camera presence used to be PULL-ONLY. A camera's state lived in `CameraRegistry` and could
+    /// be learned only by asking -- `sb/list`, `sb/status` -- so a consumer wanting to know that a
+    /// camera had dropped had to poll for it, and nothing was ever published. The assumption that
+    /// camera connectivity was already reaching the standard health surface did not hold: nothing was
+    /// registered against it.
+    ///
+    /// EdgeCommons ships exactly the mechanism this needs. The `main` state keepalive carries an
+    /// `instances[]` array, fed by a provider, precisely so a multi-instance adapter can report each
+    /// connection's health without minting a UNS instance per camera. This is that provider.
+    ///
+    /// `detail` is deliberately low-cardinality: the connection state, plus the stable error CODE
+    /// when a camera is down. Never the error text, never a URL -- this rides a keepalive that is
+    /// published every few seconds, for every camera, forever.
+    #[must_use]
+    pub fn camera_connectivity(&self) -> Vec<edgecommons::heartbeat::InstanceConnectivity> {
+        let Ok(snapshots) = self.registry.snapshots(MAX_CONNECTIVITY_INSTANCES) else {
+            return Vec::new();
+        };
+        snapshots
+            .into_iter()
+            .map(|snapshot| {
+                let connected = snapshot.state == CameraConnectionState::Online;
+                let detail = if connected {
+                    None
+                } else {
+                    Some(match snapshot.last_error.as_ref() {
+                        Some(error) => format!("{:?}: {}", snapshot.state, error.code),
+                        None => format!("{:?}", snapshot.state),
+                    })
+                };
+                edgecommons::heartbeat::InstanceConnectivity::new(
+                    snapshot.instance,
+                    connected,
+                    detail,
+                )
+            })
+            .collect()
     }
 
     /// Answers `sb/queue-status`.
@@ -12524,6 +12570,66 @@ mod tests {
                 1,
                 "the protocol session must be closed instead of leaked server-side"
             );
+        }
+
+        /// Q5: camera presence is pushed, not just polled.
+        ///
+        /// A camera's state lived in the registry and could be learned only by asking -- `sb/list`,
+        /// `sb/status`. Nothing was ever published, so a consumer that wanted to know a camera had
+        /// dropped had to poll for it. The assumption that camera connectivity already reached the
+        /// standard health surface did not hold: EdgeCommons ships the per-instance connectivity
+        /// provider for exactly this, and nothing was registered against it.
+        #[tokio::test]
+        async fn every_camera_reports_its_reachability_to_the_heartbeat() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(
+                config(directory.path(), &["camera-a", "camera-b"], false),
+                &directory,
+            )
+            .await;
+
+            // Before any supervisor runs, both cameras are configured and neither is reachable.
+            let cold = runtime.camera_connectivity();
+            assert_eq!(
+                cold.len(),
+                2,
+                "every configured camera must be reported, not just live ones"
+            );
+            assert!(
+                cold.iter().all(|camera| !camera.connected),
+                "a camera that has never connected must not be reported as connected"
+            );
+            assert!(
+                cold.iter().all(|camera| camera.detail.is_some()),
+                "a camera that is down must say what it is doing -- that is the whole point of the push"
+            );
+
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let warm = runtime.camera_connectivity();
+            let connected = warm
+                .iter()
+                .find(|camera| camera.instance == "camera-a")
+                .expect("camera-a must still be reported");
+            assert!(
+                connected.connected,
+                "an online camera must be reported as connected"
+            );
+            assert!(
+                connected.detail.is_none(),
+                "a healthy camera needs no detail: this rides a keepalive published every few                  seconds, for every camera, forever"
+            );
+            assert!(
+                warm.iter()
+                    .find(|camera| camera.instance == "camera-b")
+                    .is_some_and(|camera| !camera.connected),
+                "and the camera that never started must still be reported as down"
+            );
+
+            runtime.shutdown().await;
         }
 
         /// Q2: the component emitted no metrics at all.

@@ -34,6 +34,17 @@ than events, so there is nothing to miss between samples.
 Neither metric carries a per-camera dimension. A 256-camera fleet would otherwise mint 256 metric streams
 per measure. Per-camera queue depth is answered by `sb/queue-status`.
 
+## Per-camera presence
+
+Every configured camera's reachability is published in the component's `main` state keepalive, in the
+`instances[]` array: `instance` is the camera ID, `connected` is true only while its session is online,
+and `detail` names the connection state and, when the camera is down and an error is known, the stable
+error code. A healthy camera carries no `detail`. Consumers learn that a camera has dropped from the
+keepalive rather than by polling `sb/list` or `sb/status`.
+
+The keepalive stays low-cardinality by design: `detail` never carries error text or a camera URL, because
+it is published for every camera every few seconds.
+
 Readiness is a component gate, not a claim that every camera is online. It requires validated
 configuration, recovered catalog, usable output, active acknowledged command subscription, constructed
 supervisors, at least one accepted enabled camera, available state capacity, and no shutdown.

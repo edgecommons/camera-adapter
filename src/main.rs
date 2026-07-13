@@ -109,6 +109,25 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     router.install(runtime.clone())?;
+
+    // Publish each camera's reachability in the `main` state keepalive's `instances[]`.
+    //
+    // Camera presence was pull-only: it lived in the registry and could be learned only by asking.
+    // A consumer that wanted to know a camera had dropped had to poll for it. This is the surface
+    // EdgeCommons provides so a multi-instance adapter can report every connection's health without
+    // minting a UNS instance per camera, and nothing was registered against it.
+    //
+    // Weak, so the provider held by the heartbeat can never be the thing keeping the runtime alive
+    // through shutdown.
+    {
+        let runtime = Arc::downgrade(&runtime);
+        gg.set_instance_connectivity_provider(Some(Arc::new(move || {
+            runtime
+                .upgrade()
+                .map(|runtime| runtime.camera_connectivity())
+                .unwrap_or_default()
+        })));
+    }
     let app_factory = {
         let gg = Arc::clone(&gg);
         Arc::new(move |instance: &str, config| {
