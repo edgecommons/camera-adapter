@@ -190,6 +190,20 @@ impl CameraActor {
                     ).catch_unwind().await;
                     match result {
                         Ok(Ok(_)) => {}
+                        // The durable store failed, not the camera. Fail this capture and keep
+                        // serving: closing the session here is how a contended SQLite pool became a
+                        // fleet-wide reconnect storm. Every camera whose write lost the race was
+                        // disconnected, every reconnect wrote more, and the contention that caused
+                        // it got worse. The camera never stopped answering.
+                        Ok(Err(error)) if error.is_durable_store_failure() => {
+                            tracing::warn!(
+                                instance = %self.shared.instance,
+                                capture = %panic_descriptor.capture_id(),
+                                error = %error,
+                                "durable store failed a capture; the camera session is unaffected and stays connected"
+                            );
+                            let _ = self.engine.fail_durable_store(&panic_descriptor, &error).await;
+                        }
                         Ok(Err(error)) => {
                             self.shared.accepting.store(false, Ordering::Release);
                             self.reject_controls();

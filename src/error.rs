@@ -175,11 +175,85 @@ impl CameraError {
             Self::Catalog(_) | Self::Messaging(_) | Self::Sqlite(_) => ErrorCode::BackendError,
         }
     }
+
+    /// Whether this failure came from the durable store rather than from the camera.
+    ///
+    /// The distinction decides whether a camera survives a bad moment. A capture that fails is
+    /// recorded and reported; an error that escapes the job engine is the engine saying it could not
+    /// run the job at all, and the actor used to read every one of those as proof that the protocol
+    /// session was dead -- stop accepting, drain the queue, close the session, hand the supervisor a
+    /// failure, get reconnected.
+    ///
+    /// SQLite is not the camera. A `SQLITE_BUSY` from a contended connection pool, a full disk, an
+    /// I/O hiccup: none of them are evidence that the camera stopped answering. Disconnecting on
+    /// them turns a slow disk into a fleet-wide reconnect storm -- and the storm makes the
+    /// contention worse, because every reconnect writes.
+    ///
+    /// Deliberately narrow. It covers the two variants that can only be the store misbehaving, and
+    /// nothing else:
+    ///
+    /// - `Catalog` is NOT included. It carries durable *invariant violations* as well as store
+    ///   errors -- "capture actor expected QUEUED, found Acquiring" means another writer advanced
+    ///   the record underneath this one, and the design deliberately retires the actor and starts a
+    ///   fresh generation rather than let a dispatcher sit wedged behind a session it no longer
+    ///   agrees with. That is a real fatality, not a hiccup.
+    /// - `Io` is NOT included, because a protocol backend could surface a socket error through it,
+    ///   and wrongly keeping a dead session is worse than wrongly dropping a live one.
+    #[must_use]
+    pub const fn is_durable_store_failure(&self) -> bool {
+        matches!(self, Self::Sqlite(_) | Self::Storage(_))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A busy disk is not a broken camera.
+    ///
+    /// The actor tears the camera session down -- stop accepting, drain, close, hand the supervisor a
+    /// failure, get reconnected -- for any error that escapes the job engine. Under contention the
+    /// catalog's two connections return `SQLITE_BUSY`, which arrives here as `Sqlite`, and that used
+    /// to disconnect the camera. At fleet scale it cascaded: each reconnect writes, the writes
+    /// deepen the contention, and the contention disconnects more cameras.
+    ///
+    /// This predicate is the whole decision, so it is worth pinning both directions of it -- and the
+    /// negative cases are the load-bearing ones.
+    #[test]
+    fn only_the_store_misbehaving_spares_the_camera_session() {
+        assert!(
+            CameraError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(5), // SQLITE_BUSY
+                Some("database is locked".to_owned()),
+            ))
+            .is_durable_store_failure(),
+            "a contended connection pool must not disconnect a camera"
+        );
+        assert!(
+            CameraError::Storage("no space left on device".to_owned()).is_durable_store_failure(),
+            "a full disk must not disconnect a camera"
+        );
+
+        assert!(
+            !CameraError::Catalog("capture actor expected QUEUED, found Acquiring".to_owned())
+                .is_durable_store_failure(),
+            "a durable invariant violation is a real fatality: another writer advanced the record, \
+             and the actor must be retired rather than left wedged behind it"
+        );
+        assert!(
+            !CameraError::Backend {
+                backend: "onvif-rtsp",
+                message: "session closed".to_owned(),
+            }
+            .is_durable_store_failure(),
+            "the camera itself failing must still end the session"
+        );
+        assert!(
+            !CameraError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+                .is_durable_store_failure(),
+            "a backend can surface a socket error as Io; keeping a dead session is the worse mistake"
+        );
+    }
 
     #[test]
     fn public_codes_and_internal_error_categories_map_stably() {

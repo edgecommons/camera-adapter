@@ -3887,19 +3887,49 @@ impl CameraRuntime {
                 }
             }
             let now = chrono::Utc::now();
-            let overlap = match self.has_schedule_overlap(&instance, &schedule_id).await {
-                Ok(overlap) => overlap,
-                Err(error) => {
-                    tracing::warn!(
-                        instance = %instance,
-                        schedule_id = %schedule_id,
-                        error = %error,
-                        "camera schedule could not evaluate overlap"
-                    );
-                    false
-                }
+            // Decide first, then ask the catalog -- and only if the answer can still change
+            // anything.
+            //
+            // This loop used to open with `has_schedule_overlap`, a `jobs_page(.., 1_000)` that
+            // rebuilds and re-prepares its SQL, on every 200 ms tick of every schedule, before
+            // anything had established that an occurrence was even due. At 256 cameras that is
+            // ~1,280 catalog reads a second, funnelled through the same two connections that carry
+            // the capture path's fsync-per-write transactions. Nothing was due on virtually all of
+            // those ticks, and an overlap observation cannot make a not-due schedule due: it is read
+            // in exactly one branch of `evaluate`, and only ever turns an `Admit` into a
+            // `SkippedOverlap`. So the entire read volume bought one thing -- contention.
+            //
+            // Evaluating with `false` first is therefore exact, not an approximation: the only
+            // decision an overlap can alter is `Admit`, so that is the only one worth asking about.
+            let mut decision = plan.evaluate(last_consumed, now, SCHEDULER_MISFIRE_GRACE, false);
+            let admitted = match &decision {
+                Ok(ScheduleDecision::Admit {
+                    occurrence,
+                    consumed,
+                }) if plan.skips_on_overlap() => Some((occurrence.clone(), *consumed)),
+                _ => None,
             };
-            match plan.evaluate(last_consumed, now, SCHEDULER_MISFIRE_GRACE, overlap) {
+            if let Some((occurrence, consumed)) = admitted {
+                let overlap = match self.has_schedule_overlap(&instance, &schedule_id).await {
+                    Ok(overlap) => overlap,
+                    Err(error) => {
+                        tracing::warn!(
+                            instance = %instance,
+                            schedule_id = %schedule_id,
+                            error = %error,
+                            "camera schedule could not evaluate overlap"
+                        );
+                        false
+                    }
+                };
+                if overlap {
+                    decision = Ok(ScheduleDecision::SkippedOverlap {
+                        occurrence,
+                        consumed,
+                    });
+                }
+            }
+            match decision {
                 Ok(ScheduleDecision::NotDue) => {}
                 Ok(ScheduleDecision::SkippedMisfire { latest, consumed }) => {
                     last_consumed = latest.intended_fire_time;

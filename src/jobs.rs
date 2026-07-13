@@ -1280,6 +1280,32 @@ impl JobEngine {
         .await
     }
 
+    /// Retires a capture whose failure came from the durable store, keeping the camera session.
+    ///
+    /// Best effort by construction: the store is the thing that just failed, so writing the terminal
+    /// row may fail too. Either way the runtime MUST be completed. It is normally retired inside
+    /// `finish_failure`, but an error escaping `execute` skips that -- and the actor now keeps
+    /// serving this camera instead of being torn down and rebuilt, so nothing else would ever clean
+    /// up: the `active` entry would be held forever and its terminal-deadline task would outlive the
+    /// job it belongs to.
+    pub(crate) async fn fail_durable_store(
+        &self,
+        descriptor: &CaptureDescriptor,
+        error: &CameraError,
+    ) -> Result<JobRecord> {
+        let outcome = self
+            .finish_failure(
+                &descriptor.runtime,
+                error.code(),
+                bounded_detail(error.to_string()),
+            )
+            .await;
+        if outcome.is_err() {
+            self.complete_runtime(&descriptor.runtime);
+        }
+        outcome
+    }
+
     async fn prepare_blocking(
         &self,
         runtime: &Arc<JobRuntime>,
