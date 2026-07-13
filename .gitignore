@@ -17,3 +17,7 @@ __pycache__/
 # the workspace read-only, so a git-sourced lock cannot be rewritten there either. The three cannot
 # all be true. file-replicator does the same.
 /Cargo.lock
+
+# The ONVIF simulator TLS material is MINTED, never committed: simulators/generate-tls-fixtures.{sh,ps1}.
+# A private key in a public repository is a private key in a public repository, however worthless.
+/simulators/onvif_sim/fixtures/tls/

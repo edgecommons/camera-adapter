@@ -16,6 +16,13 @@ function Invoke-DockerChecked {
     }
 }
 
+# The simulator's TLS material is minted, not committed, so it must exist before the image that bakes
+# it in is built. Idempotent: a no-op once the certificates are present and unexpired.
+& (Join-Path $PSScriptRoot 'generate-tls-fixtures.ps1')
+if ($LASTEXITCODE -ne 0) {
+    throw "could not generate the simulator TLS fixtures"
+}
+
 Invoke-DockerChecked @('compose', '-f', $composeFile, 'config', '--quiet')
 Invoke-DockerChecked @(
     'compose', '-f', $composeFile, '--profile', 'verify', 'run', '--rm', '--build',

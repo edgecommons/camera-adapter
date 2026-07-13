@@ -26,6 +26,25 @@ also pins its Python base by multi-platform index digest.
 ./simulators/verify.ps1 -LinuxL2 -AravisInterface eth0
 ```
 
+### TLS material is minted, not committed
+
+The ONVIF simulator's TLS certificates are generated on demand and are **not** in the repository. A
+private key in a public repository is a private key in a public repository, however worthless the
+thing it guards -- and this one guards a simulator that serves fake cameras to a test suite.
+
+`verify.ps1` mints them for you. Anything that starts `onvif-sim-tls` by hand needs them first:
+
+```powershell
+./simulators/generate-tls-fixtures.ps1      # or: sh ./simulators/generate-tls-fixtures.sh
+docker compose -f simulators/compose.yaml up -d --build onvif-sim-tls
+```
+
+The script is idempotent -- it does nothing when the material is present and more than 30 days from
+expiry -- and takes `--force` / `-Force` to mint a fresh set. It writes a throwaway CA plus one
+server certificate for `camera.test` (with `localhost`, `127.0.0.1` and `::1` as additional SANs)
+into `onvif_sim/fixtures/tls/`, which is gitignored in its entirety. `openssl` is the only
+prerequisite; it ships with Git for Windows.
+
 The normal endpoints exposed on the host are:
 
 - ONVIF device service: `http://127.0.0.1:18080/onvif/device_service`
