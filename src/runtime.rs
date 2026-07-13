@@ -14539,13 +14539,21 @@ mod tests {
             assert_eq!(record.state, crate::model::JobState::Cancelled);
         }
 
-        /// A group schedule resumes from its durable cursor, and skips what it missed.
+        /// A group schedule resumes from its durable cursor rather than from "now".
         ///
         /// The cursor is what tells a restarted component the difference between an occurrence it
-        /// missed while it was down and one that has not come due. With `misfirePolicy: skip`, an
-        /// occurrence older than the misfire grace is consumed and discarded rather than fired late.
+        /// missed while it was down and one that has not come due. A schedule that ignored it would
+        /// simply start afresh, and the outage would be invisible.
+        ///
+        /// What this asserts is that the cursor was READ and moved on -- not what was decided about
+        /// the occurrences it found. That decision belongs to the misfire rule, and it is decided on
+        /// wall-clock time: whether the last hourly occurrence is older than the five-second grace is
+        /// true for 3595 seconds out of every 3600 and false for the other five. Asserting it here
+        /// made this test pass 99.9% of the time and fail on a CI run that happened to start at
+        /// 23:00:01. The rule itself is now proved where its clock can be held still, in
+        /// `scheduler::tests::occurrences_missed_while_the_component_was_down_are_skipped`.
         #[tokio::test]
-        async fn a_group_schedule_resumes_from_its_cursor_and_skips_a_misfire() {
+        async fn a_group_schedule_resumes_from_its_durable_cursor() {
             let directory = TempDir::new().unwrap();
             let cameras = ["camera-a", "camera-b"];
             let mut configuration = config(directory.path(), &cameras, false);
@@ -14587,11 +14595,8 @@ mod tests {
                 .expect("the schedule consumed the occurrences it missed");
             assert!(
                 cursor.intended_fire_time_ms > stale.timestamp_millis(),
-                "a missed occurrence is consumed, not left to be fired again on the next tick"
-            );
-            assert_eq!(
-                cursor.last_group_id, None,
-                "a misfire is skipped -- hours-late captures must not be fired at a live line"
+                "the schedule resumed from the durable cursor and consumed what it had missed, \
+                 rather than starting afresh as though the outage never happened"
             );
         }
 

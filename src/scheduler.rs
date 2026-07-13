@@ -352,6 +352,79 @@ fn schedule_error<T>(message: impl Into<String>) -> Result<T> {
 #[cfg(test)]
 mod tests {
 
+    /// Occurrences missed while the component was down are skipped, not fired hours late.
+    ///
+    /// `now` is passed in, so this decides the rule on a clock the test owns. The integration test
+    /// that used to cover this took its `now` from the wall clock and asked whether the last hourly
+    /// occurrence was older than the five-second misfire grace -- which is true for 3595 seconds out
+    /// of every 3600, and false for the five seconds after the hour. CI ran it at 23:00:01.
+    #[test]
+    fn occurrences_missed_while_the_component_was_down_are_skipped() {
+        let hourly = crate::config::CaptureGroupScheduleConfig {
+            id: "line-a-sync".to_string(),
+            enabled: true,
+            cron: "0 0 * * * *".to_string(),
+            timezone: "UTC".to_string(),
+            instances: vec!["cam-01".to_string(), "cam-02".to_string()],
+            capture_profile: None,
+            profile_overrides: std::collections::BTreeMap::new(),
+            misfire_policy: MisfirePolicy::Skip,
+            overlap_policy: OverlapPolicy::Skip,
+            jitter_seconds: 0,
+            timeout_ms: None,
+        };
+        let plan = SchedulePlan::compile_group(&hourly).unwrap();
+
+        // The component stopped just after 20:00 and came back at 23:30. Three occurrences came due
+        // while it was down, and the most recent of them is half an hour stale.
+        let last_consumed = "2026-07-13T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let now = "2026-07-13T23:30:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        let decision = plan
+            .evaluate(last_consumed, now, Duration::from_secs(5), false)
+            .unwrap();
+        match decision {
+            ScheduleDecision::SkippedMisfire { latest, consumed } => {
+                assert_eq!(
+                    consumed, 3,
+                    "21:00, 22:00 and 23:00 all came due while it was down"
+                );
+                assert_eq!(
+                    latest.intended_fire_time,
+                    "2026-07-13T23:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+                    "the cursor moves to the most recent of them, so they are not offered again"
+                );
+            }
+            other => {
+                panic!("a half-hour-stale occurrence must not be fired at a live line: {other:?}")
+            }
+        }
+
+        // `coalesce` is the operator saying they DO want the latest missed one -- exactly one of it.
+        let coalescing = crate::config::CaptureGroupScheduleConfig {
+            misfire_policy: MisfirePolicy::Coalesce,
+            ..hourly
+        };
+        let plan = SchedulePlan::compile_group(&coalescing).unwrap();
+        match plan
+            .evaluate(last_consumed, now, Duration::from_secs(5), false)
+            .unwrap()
+        {
+            ScheduleDecision::Admit {
+                occurrence,
+                consumed,
+            } => {
+                assert_eq!(consumed, 3);
+                assert_eq!(
+                    occurrence.intended_fire_time,
+                    "2026-07-13T23:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+                    "coalesce admits the LATEST missed occurrence, not the oldest, and not all three"
+                );
+            }
+            other => panic!("coalesce must admit the latest missed occurrence: {other:?}"),
+        }
+    }
+
     /// A camera token and a group token can never be mistaken for one another.
     ///
     /// The scope token keys the jitter hash, the scheduler task map, and the durable cursor. If a
