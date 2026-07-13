@@ -11,3 +11,9 @@ simulators/.env
 simulators/generated/
 __pycache__/
 *.py[cod]
+
+# Cargo.lock is NOT tracked. See .github/workflows/ci.yml — a local build through the gitignored
+# .cargo/config.toml [patch] rewrites it to a path source, and the RTSP validation container mounts
+# the workspace read-only, so a git-sourced lock cannot be rewritten there either. The three cannot
+# all be true. file-replicator does the same.
+/Cargo.lock
