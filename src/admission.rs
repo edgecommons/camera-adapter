@@ -728,7 +728,7 @@ impl ByteBudget {
     }
 }
 
-struct ByteReservation {
+pub(crate) struct ByteReservation {
     budget: Arc<ByteBudgetInner>,
     reserved: u64,
 }
@@ -1084,6 +1084,26 @@ impl AdmissionController {
     #[must_use]
     pub fn outstanding_disk_bytes(&self) -> u64 {
         self.disk.outstanding()
+    }
+
+    /// Reserve memory from the SAME budget every capture is admitted against.
+    ///
+    /// `maxInFlightBytes` is meant to be the component's memory ceiling, and a capture reserves its
+    /// whole declared `maximumFrameBytes` up front so that it is. The thumbnail renderer was the one
+    /// allocation that escaped it: a JPEG frame's DECODED size is not its file size, so decoding one
+    /// asks the allocator for memory the budget never saw and never counted. Bounded, because the
+    /// decode-bomb guard refuses a JPEG whose header declares more than `maximumFrameBytes` -- but
+    /// bounded is not the same as reserved, and a ceiling that is quietly exceeded is not a ceiling.
+    ///
+    /// A caller that cannot get this reservation must go without its preview. It must NOT fail the
+    /// capture: the image is already in hand, and a thumbnail never outranks the result.
+    pub(crate) async fn reserve_memory(
+        &self,
+        amount: u64,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<ByteReservation> {
+        self.memory.reserve(amount, deadline, cancellation).await
     }
 
     /// Returns a compact, allocation-light snapshot of live admission capacity.

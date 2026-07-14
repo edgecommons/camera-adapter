@@ -1498,12 +1498,58 @@ impl JobEngine {
             .admission
             .outstanding_disk_bytes()
             .saturating_sub(current);
-        let thumbnail = runtime.spec.profile.capture.thumbnail;
+        let mut thumbnail = runtime.spec.profile.capture.thumbnail;
         let policy = self.thumbnail_policy;
         // The picture the thumbnail may decode is bounded by the same ceiling the capture was
         // ADMITTED with. A JPEG frame's decoded size is not its file size, and this is the only code
         // in the component that decodes one -- see `thumbnail::render`.
         let maximum_frame_bytes = runtime.spec.profile.maximum_frame_bytes;
+
+        // ...and BOUNDED IS NOT RESERVED. The capture already holds `maximumFrameBytes` against the
+        // byte budget, and it holds it across this whole block -- `processing.release_memory()` runs
+        // below, after the render. But the decode buffer is memory ON TOP of that: the frame bytes a
+        // JPEG capture actually carries are the COMPRESSED ones, and expanding them into pixels asks
+        // the allocator for something `maxInFlightBytes` never counted. A ceiling that is quietly
+        // exceeded is not a ceiling, and B2 exists to make that number mean what it says.
+        //
+        // So the decode is reserved from the same budget, at exactly the size the JPEG header
+        // declares, and the reservation is released the moment the pixels are gone. A frame that
+        // decodes nothing (every raw format -- they scale through a view) reserves nothing.
+        //
+        // If the budget cannot lend it, THE CAPTURE STILL SUCCEEDS AND IS STILL ANNOUNCED. It simply
+        // carries no preview. A thumbnail never outranks the result, and least of all when the
+        // component is already short of memory -- the moment it would be maddest to spend more.
+        let decode_reservation = match thumbnail
+            .and_then(|_| crate::thumbnail::declared_decode_bytes(&frame))
+        {
+            Some(bytes) => {
+                match self
+                    .admission
+                    .reserve_memory(
+                        bytes,
+                        instant_for_epoch(deadline_ms),
+                        &runtime.cancellation,
+                    )
+                    .await
+                {
+                    Ok(reservation) => Some(reservation),
+                    Err(error) => {
+                        tracing::warn!(
+                            capture = %runtime.spec.capture_id,
+                            instance = %runtime.spec.instance,
+                            decode_bytes = bytes,
+                            error = %error,
+                            "the thumbnail's decode buffer could not be reserved against the byte \
+                             budget; the capture is unaffected and is announced without a preview"
+                        );
+                        self.hooks.thumbnail_failed().await;
+                        thumbnail = None;
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         let request = PrepareCapture {
             capture_id: runtime.spec.capture_id.clone(),
             relative_path: runtime.spec.relative_path.clone(),
@@ -1532,6 +1578,9 @@ impl JobEngine {
                     maximum_frame_bytes,
                 )
             });
+            // The pixels are gone; give the budget its bytes back before the write, rather than
+            // holding them for the whole of persistence, where nothing needs them.
+            drop(decode_reservation);
             let prepared = storage.prepare_capture(request, &cancellation)?;
             processing.release_memory();
             processing.shrink_disk(prepared.artifact().bytes)?;

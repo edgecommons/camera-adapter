@@ -260,6 +260,27 @@ pub enum ThumbnailOutcome {
 /// about how much memory to reserve. It is not believed past the ceiling the capture was admitted
 /// with, and the decode is refused before a byte of it is allocated.
 ///
+/// How many bytes rendering a thumbnail from this frame will ask the allocator for, or `None` when
+/// it will ask for nothing worth reserving.
+///
+/// Only a JPEG is ever decoded here. The raw formats are scaled through a *view* over bytes the
+/// capture already holds, and allocate nothing but the small scaled output. A JPEG has to be expanded
+/// into pixels first, and its decoded size is emphatically not its file size -- which is exactly why
+/// this allocation is the one the byte budget could not see.
+///
+/// The answer comes from the JPEG HEADER, before a single pixel is allocated. That is the same source
+/// the decode-bomb guard in [`decode`] already trusts, and the reason the memory can be reserved
+/// *before* it is spent rather than discovered afterwards. A header this component cannot parse
+/// yields `None`: the render will fail on it in a moment anyway, and it will fail without allocating.
+#[must_use]
+pub(crate) fn declared_decode_bytes(frame: &CaptureFrame) -> Option<u64> {
+    if frame.pixel_format != PixelFormat::Jpeg {
+        return None;
+    }
+    let decoder = JpegDecoder::new(Cursor::new(frame.bytes.as_ref())).ok()?;
+    Some(decoder.total_bytes())
+}
+
 /// This is CPU-bound and must be called from a blocking context (the capture pipeline calls it
 /// inside the same `spawn_blocking` as the encoder, under the same admission permits).
 ///
@@ -782,6 +803,44 @@ mod tests {
     ///
     /// The frame is otherwise entirely valid, which is the point: it passes `validate_frame` (the
     /// declared dimensions match the header's), so the CAPTURE succeeds and only the preview does not.
+    /// What we RESERVE has to be what the decoder ACTUALLY allocates, or the reservation is theatre.
+    ///
+    /// Both halves matter. A JPEG is expanded into pixels, and the size of those pixels is nothing
+    /// like the size of the file -- that gap is the whole reason the byte budget could not see this
+    /// allocation. The raw formats decode nothing at all: they are scaled through a *view* over bytes
+    /// the capture already holds and already reserved, so reserving for them a second time would
+    /// halve the component's capacity to buy nothing.
+    #[test]
+    fn the_bytes_reserved_are_exactly_the_bytes_the_decode_will_allocate() {
+        let pixels = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_fn(64, 48, |x, y| {
+            Rgb([(x * 4) as u8, (y * 5) as u8, ((x + y) * 2) as u8])
+        });
+        let mut encoded = Vec::new();
+        JpegEncoder::new_with_quality(&mut encoded, 90)
+            .encode_image(&DynamicImage::ImageRgb8(pixels))
+            .expect("encode the fixture JPEG");
+
+        let jpeg = frame(PixelFormat::Jpeg, encoded.clone(), 64, 48);
+        let declared = declared_decode_bytes(&jpeg).expect("a JPEG is decoded, so it is reserved");
+        assert_eq!(
+            declared,
+            u64::from(64_u32 * 48 * 3),
+            "the reservation is the DECODED size -- 64x48 RGB -- and not the {} bytes of the file",
+            encoded.len()
+        );
+        assert!(
+            declared > encoded.len() as u64,
+            "which is the entire point: the pixels dwarf the file, and the budget never saw them"
+        );
+
+        for raw in [PixelFormat::Rgb8, PixelFormat::Bgr8, PixelFormat::Mono8] {
+            assert!(
+                declared_decode_bytes(&frame(raw, vec![0; 64 * 48 * 3], 64, 48)).is_none(),
+                "{raw:?} is scaled through a view and allocates nothing worth reserving"
+            );
+        }
+    }
+
     #[test]
     fn a_jpeg_header_that_lies_about_its_size_is_refused_before_a_byte_is_allocated() {
         let (jpeg, width, height) = oversized_jpeg_header();
