@@ -644,6 +644,26 @@ fn selector_value_matches(
     })
 }
 
+/// A mandatory stop that has been armed and not yet delivered (DESIGN 15.5).
+///
+/// This used to be a bare `CancellationToken`, and the axes it was armed for lived nowhere but inside
+/// the timer task's closure. So the timer was the only thing in the component that COULD deliver the
+/// stop -- and every path that took the camera's actor away before the deadline dropped the stop on
+/// the floor, because the timer resolves its actor lazily and simply gives up when there is not one.
+///
+/// Holding the axes here is what lets a retiring supervisor, or a shutting-down component, deliver the
+/// stop itself while it still has an actor to deliver it through.
+#[derive(Clone)]
+struct ArmedStop {
+    /// Retires the timer. A stop delivered by someone else must not also arrive from the deadline.
+    cancellation: CancellationToken,
+    pan: bool,
+    tilt: bool,
+    zoom: bool,
+    /// The bound on the stop's own protocol call.
+    ptz_ms: u64,
+}
+
 /// Most recent bounded, credential-free discovery observation.  The cache is intentionally
 /// in-memory: it is an operator aid, never a configuration or camera-claim mechanism.
 #[derive(Default)]
@@ -695,7 +715,7 @@ pub struct CameraRuntime {
     /// requester -- is what stops the camera. Holding the token here is what lets a later stop, a
     /// superseding move, or a retiring supervisor disarm it, so a timer armed for one move can never
     /// stop a different one.
-    motion_stops: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    motion_stops: Arc<RwLock<HashMap<String, ArmedStop>>>,
     /// Completion signals paired with [`Self::supervisor_cancellations`].  A replacement waits
     /// for the old loop to retire before publishing a new actor for the same camera ID.
     supervisor_finished: Arc<RwLock<HashMap<String, CancellationToken>>>,
@@ -2833,15 +2853,23 @@ impl CameraRuntime {
             return None;
         }
         let token = CancellationToken::new();
-        let previous = self
-            .motion_stops
-            .write()
-            .ok()?
-            .insert(instance.to_owned(), token.clone());
+        let ptz_ms = self
+            .config_snapshot()
+            .map_or(10_000, |config| config.global.timeouts.ptz_ms);
+        let previous = self.motion_stops.write().ok()?.insert(
+            instance.to_owned(),
+            ArmedStop {
+                cancellation: token.clone(),
+                pan,
+                tilt,
+                zoom,
+                ptz_ms,
+            },
+        );
         // A superseding move retires the timer the previous one armed, or the old deadline would
         // stop the NEW motion early.
         if let Some(previous) = previous {
-            previous.cancel();
+            previous.cancellation.cancel();
         }
 
         // The CURRENT actor is looked up when the timer fires, not captured now: a reconnect replaces
@@ -2850,16 +2878,16 @@ impl CameraRuntime {
         let stops = Arc::clone(&self.motion_stops);
         let instance = instance.to_owned();
         let deadline = tokio::time::Instant::now() + timeout;
-        let ptz_ms = self
-            .config_snapshot()
-            .map_or(10_000, |config| config.global.timeouts.ptz_ms);
         let shutting_down = self.cancellation.clone();
         self.spawn_task(async move {
             tokio::select! {
                 () = token.cancelled() => return,
-                // The component is stopping, and the actor's own teardown delivers a stop to a
-                // camera that is still moving (DESIGN §20.2). Sitting here until the deadline would
-                // hold shutdown open for as long as the move was allowed to last.
+                // The component is stopping, and `shutdown` delivers the stop through the actor
+                // before it cancels anything (DESIGN 20.2 step 2). Sitting here until the deadline
+                // would hold shutdown open for as long as the move was allowed to last.
+                //
+                // That claim used to be false. This arm returned, `shutdown` stopped nothing, and
+                // the camera went on moving -- the comment pointed at a mechanism that did not exist.
                 () = shutting_down.cancelled() => return,
                 () = tokio::time::sleep_until(deadline) => {}
             }
@@ -2903,14 +2931,93 @@ impl CameraRuntime {
 
     /// Retires a camera's armed stop: its motion has been ended by something else.
     fn disarm_motion_stop(&self, instance: &str) {
-        let token = self
+        let armed = self
             .motion_stops
             .write()
             .ok()
             .and_then(|mut stops| stops.remove(instance));
-        if let Some(token) = token {
-            token.cancel();
+        if let Some(armed) = armed {
+            armed.cancellation.cancel();
         }
+    }
+
+    /// Stops every camera that is still moving, through the actor that is about to be taken away.
+    ///
+    /// DESIGN 15.5 makes the DEADLINE, not the requester, responsible for stopping a camera in
+    /// continuous motion -- and the timer that owns that deadline resolves its actor lazily, when it
+    /// fires. That is right for a reconnect (a stop pushed at a handle the camera no longer answers is
+    /// not a stop) and catastrophic for everything else: retire the supervisor, disable the camera,
+    /// drop it from the roster, or shut the component down, and the timer wakes to find no actor, logs
+    /// that the camera "is gone", and returns. The camera is not gone. It is still moving.
+    ///
+    /// DESIGN 20.2 step 2 -- "send safety stop to cameras with active continuous PTZ motion" -- was
+    /// simply not implemented. The actor has always known how to deliver a stop that outlives its own
+    /// cancellation (`drain_controls_for_shutdown`), and there is a test proving it does. Nothing ever
+    /// gave it one: the timer at the mandatory deadline was the ONLY producer of a `SafetyStop` in the
+    /// component, and on shutdown it deliberately stands down.
+    ///
+    /// So this is the missing producer. Every path that is about to take an actor away calls it FIRST,
+    /// while there is still an actor to deliver through. `instances` selects the cameras being retired;
+    /// `None` means all of them, which is what shutdown wants.
+    fn deliver_mandatory_stops(&self, instances: Option<&[String]>) -> usize {
+        let armed = {
+            let Ok(mut stops) = self.motion_stops.write() else {
+                return 0;
+            };
+            let selected = stops
+                .iter()
+                .filter(|(instance, _)| {
+                    instances.is_none_or(|retiring| retiring.contains(instance))
+                })
+                .map(|(instance, armed)| (instance.clone(), armed.clone()))
+                .collect::<Vec<_>>();
+            for (instance, _) in &selected {
+                stops.remove(instance);
+            }
+            selected
+        };
+        if armed.is_empty() {
+            return 0;
+        }
+
+        let actors = self.actors.read().ok();
+        let mut delivered = 0;
+        for (instance, armed) in armed {
+            // The stop is being delivered now, so the deadline must not deliver a second one at an
+            // actor that by then belongs to a different session.
+            armed.cancellation.cancel();
+            let actor = actors
+                .as_ref()
+                .and_then(|actors| actors.get(&instance).cloned());
+            let Some(actor) = actor else {
+                tracing::error!(
+                    instance = %instance,
+                    "a camera in continuous motion is being retired with no actor to stop it through"
+                );
+                continue;
+            };
+            let stop = crate::admission::SafetyStop {
+                pan: armed.pan,
+                tilt: armed.tilt,
+                zoom: armed.zoom,
+                deadline: tokio::time::Instant::now() + Duration::from_millis(armed.ptz_ms),
+            };
+            match actor.safety_stop(stop) {
+                Ok(()) => {
+                    delivered += 1;
+                    tracing::info!(
+                        instance = %instance,
+                        "a camera in continuous motion was sent its stop before its actor was retired"
+                    );
+                }
+                Err(error) => tracing::error!(
+                    instance = %instance,
+                    error = %error,
+                    "a moving camera could not be sent its stop before its actor was retired"
+                ),
+            }
+        }
+        delivered
     }
 
     async fn perform_ptz(&self, request: PtzCommandRequest) -> Result<serde_json::Value> {
@@ -3914,6 +4021,11 @@ impl CameraRuntime {
             if let Ok(mut sessions) = self.session_cancellations.write() {
                 sessions.retain(|instance, _| !diff.removed.contains(instance));
             }
+            // `replace_supervisors` has already stopped and drained these; the retain is what keeps
+            // the map honest if a camera is ever removed by a path that does not go through it.
+            if let Ok(mut stops) = self.motion_stops.write() {
+                stops.retain(|instance, _| !diff.removed.contains(instance));
+            }
         }
         Ok(diff)
     }
@@ -3938,6 +4050,12 @@ impl CameraRuntime {
     /// Cancels complete supervisor generations, not merely live actors.  This covers a reload
     /// arriving while a backend is connecting or sleeping in exponential backoff.
     async fn replace_supervisors(&self, instances: &[String], timeout: Duration) -> Result<()> {
+        // A camera being retired may be in the middle of a continuous move, and cancelling its
+        // supervisor takes away the only actor its mandatory stop could ever have been delivered
+        // through. Stop it while that actor still exists. The field's own documentation has always
+        // said a retiring supervisor disarms the timer; until now nothing did.
+        self.deliver_mandatory_stops(Some(instances));
+
         let cancellations = self
             .supervisor_cancellations
             .read()
@@ -4035,6 +4153,10 @@ impl CameraRuntime {
     /// within the configured grace period so the process cannot hang behind a native backend.
     pub async fn shutdown(&self) {
         self.readiness.begin_shutdown();
+        // DESIGN 20.2 step 2, and it has to happen HERE -- before the cancellation, while the actors
+        // are still there to deliver through. The actor lets a safety stop outlive its own
+        // cancellation precisely so that this one lands.
+        self.deliver_mandatory_stops(None);
         self.cancellation.cancel();
         let grace = match self.config_snapshot() {
             Ok(config) => Duration::from_millis(config.global.timeouts.shutdown_grace_ms),
@@ -15149,6 +15271,158 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
+            runtime.shutdown().await;
+        }
+
+        /// The stop reaches a camera whose actor is about to be taken away.
+        ///
+        /// The mandatory-stop timer resolves its actor LAZILY, when the deadline fires -- right for a
+        /// reconnect, and catastrophic for everything else. Retire the supervisor, disable the camera,
+        /// drop it from the roster, or shut the component down, and the timer wakes to find no actor,
+        /// logs that the camera "is gone", and returns. The camera is not gone. It is still moving.
+        ///
+        /// So there has to be a producer that delivers the stop while an actor still exists. This is
+        /// that producer, against a camera that is genuinely moving and whose deadline is nine seconds
+        /// away: nothing else is going to stop it, and it must stop.
+        #[tokio::test]
+        async fn a_moving_camera_is_stopped_through_the_actor_it_is_about_to_lose() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(ptz_camera(&directory, 10_000), &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let request: PtzCommandRequest = crate::commands::parse_closed(json!({
+                "operation": "continuous",
+                "instance": "camera-a",
+                "requestId": "estop-retire",
+                "velocity": { "pan": 0.5, "tilt": 0.0, "zoom": 0.0 },
+                "timeoutMs": 9_000
+            }))
+            .unwrap();
+            runtime.perform_ptz(request).await.unwrap();
+            assert!(
+                camera_is_moving(&runtime).await,
+                "the camera must actually be moving, or this proves nothing"
+            );
+
+            assert_eq!(
+                runtime.deliver_mandatory_stops(None),
+                1,
+                "the moving camera must be sent its stop through the actor it still has"
+            );
+
+            // And it has to REACH the camera -- a stop that is queued and never delivered is not a stop.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if !camera_is_moving(&runtime).await {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the camera is still moving; its mandatory deadline is seconds away and nothing \
+                     else is coming to stop it"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            runtime.shutdown().await;
+        }
+
+        /// DESIGN 20.2 step 2: shutting down sends a stop to a camera in continuous motion.
+        ///
+        /// It did not. `shutdown` cancelled the root token and joined its tasks; the word "stop" did
+        /// not appear in it. The mandatory-stop timer, seeing that cancellation, deliberately STOOD
+        /// DOWN -- on the stated belief that "the actor's own teardown delivers a stop to a camera that
+        /// is still moving". The actor's teardown delivers safety stops that were already QUEUED, and
+        /// on the shutdown path nobody ever queued one: the timer was the only producer of a
+        /// `SafetyStop` in the entire component, and it had just declined to produce.
+        ///
+        /// So the component could be shut down while a camera was executing a continuous pan, and the
+        /// camera would go on panning. The machinery was there, tested, and fed by nothing.
+        #[tokio::test]
+        async fn shutting_down_does_not_walk_away_from_a_moving_camera() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(ptz_camera(&directory, 10_000), &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let request: PtzCommandRequest = crate::commands::parse_closed(json!({
+                "operation": "continuous",
+                "instance": "camera-a",
+                "requestId": "estop-shutdown",
+                "velocity": { "pan": 0.5, "tilt": 0.0, "zoom": 0.0 },
+                "timeoutMs": 9_000
+            }))
+            .unwrap();
+            runtime.perform_ptz(request).await.unwrap();
+            assert!(
+                camera_is_moving(&runtime).await,
+                "the camera must actually be moving, or this proves nothing"
+            );
+            assert!(
+                runtime
+                    .motion_stops
+                    .read()
+                    .unwrap()
+                    .contains_key("camera-a"),
+                "the move must be armed before shutdown, or this proves nothing"
+            );
+
+            runtime.shutdown().await;
+
+            // Drained means DELIVERED: `deliver_mandatory_stops` is the only thing on this path that
+            // empties the map, and it empties it by pushing the stop at the camera's actor -- which
+            // then hands it to the transport even though cancellation has already been tripped
+            // (`drain_controls_for_shutdown`, proven in
+            // `cancelled_actor_runs_its_safety_stop_and_session_close_within_the_grace`).
+            //
+            // Before the fix the entry SURVIVED shutdown, because the timer holding it returned
+            // without stopping anything and nothing else touched it.
+            assert!(
+                runtime.motion_stops.read().unwrap().is_empty(),
+                "the component shut down and left a camera armed, moving, and unstopped"
+            );
+        }
+
+        /// A supervisor being retired stops its camera before it takes the actor away.
+        ///
+        /// A config reload retires supervisors. If the camera is mid-move, cancelling its supervisor
+        /// destroys the only actor its mandatory stop could ever have been delivered through -- and the
+        /// timer, firing later, would find nothing and give up. The field's own documentation said "a
+        /// retiring supervisor" could disarm the timer. Nothing did.
+        #[tokio::test]
+        async fn a_retiring_supervisor_stops_its_camera_before_it_disappears() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(ptz_camera(&directory, 10_000), &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            let request: PtzCommandRequest = crate::commands::parse_closed(json!({
+                "operation": "continuous",
+                "instance": "camera-a",
+                "requestId": "estop-reload",
+                "velocity": { "pan": 0.0, "tilt": 0.4, "zoom": 0.0 },
+                "timeoutMs": 9_000
+            }))
+            .unwrap();
+            runtime.perform_ptz(request).await.unwrap();
+            assert!(camera_is_moving(&runtime).await);
+
+            runtime
+                .replace_supervisors(&["camera-a".to_string()], Duration::from_secs(10))
+                .await
+                .expect("the supervisor must retire");
+
+            assert!(
+                runtime.motion_stops.read().unwrap().is_empty(),
+                "a supervisor was retired out from under a moving camera and the stop it was owed \
+                 went with it"
+            );
             runtime.shutdown().await;
         }
 
