@@ -4295,3 +4295,142 @@ async fn a_command_runtime_cannot_be_installed_once_shutdown_has_begun() {
     );
     runtime.shutdown().await;
 }
+
+/// The image that is delivered is the image the camera produced. Byte for byte.
+///
+/// Nothing proved this. The chain the suite DID cover is self-referential: storage writes the bytes it
+/// was handed, then computes the SHA-256 by RE-READING the file it just wrote, then verifies the file
+/// against that same digest before confirming, and finally reports that digest on the wire. Every link
+/// checks the file against itself. Not one of them checks the file against the CAMERA.
+///
+/// So a defect that truncated, padded, reordered or swapped a frame anywhere between the backend and the
+/// partial write would produce a perfectly self-consistent digest OF THE WRONG IMAGE, the install would
+/// verify it, the wire would report it, and all 568 tests would pass. For an adapter whose entire purpose
+/// is to deliver the picture the camera took, that is the one thing worth pinning.
+///
+/// The simulator's frame is a pure function of its seed and the capture ordinal, so the exact bytes the
+/// camera produced can be regenerated INDEPENDENTLY of the pipeline that carried them, and compared with
+/// what actually landed on disk. `Raw` encoding is what makes this a byte-for-byte claim rather than a
+/// pixel-for-pixel one: it is passthrough, so the persisted artifact must equal the frame exactly.
+#[tokio::test]
+async fn the_image_that_is_delivered_is_the_image_the_camera_took() {
+    use sha2::{Digest, Sha256};
+
+    let directory = TempDir::new().unwrap();
+    let mut configuration = config(directory.path(), &["camera-a"], false);
+    let crate::config::BackendConfig::Sim(sim) = &mut configuration.instances[0].backend else {
+        panic!("test fixture must use the simulator backend");
+    };
+    // An explicit seed makes the frame reproducible; without it the sim derives one from the instance id.
+    sim.seed = Some(20_260_714);
+    sim.frame.width = 64;
+    sim.frame.height = 48;
+    let backend_config = sim.clone();
+
+    // Passthrough, so "the same picture" means "the same bytes" and nothing re-encodes them.
+    for profile in configuration.instances[0].capture_profiles.values_mut() {
+        profile.output.encoding = crate::model::OutputEncoding::Raw;
+    }
+
+    let runtime = runtime(configuration, &directory).await;
+    runtime
+        .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+        .unwrap();
+    wait_for_online(&runtime, "camera-a").await;
+
+    let accepted = runtime
+        .submit_capture(
+            "camera-a".to_string(),
+            "byte-fidelity".to_string(),
+            None,
+            None,
+            serde_json::Map::new(),
+            "byte-fidelity-correlation".to_string(),
+            "sb/capture-submit",
+            crate::admission::CapturePriority::Submitted,
+        )
+        .await
+        .unwrap();
+    let capture_id = match accepted {
+        crate::catalog::AcceptJobOutcome::Inserted(record) => record.capture_id,
+        other => panic!("expected a newly accepted capture, got {other:?}"),
+    };
+    let terminal = wait_for_terminal(&runtime, &capture_id).await;
+    assert_eq!(terminal.state, crate::model::JobState::Succeeded);
+
+    // What the component says it delivered.
+    let final_path = terminal
+        .final_path
+        .as_deref()
+        .expect("a succeeded capture must name the artifact it installed");
+    let installed_sha256 = terminal
+        .installed_sha256
+        .as_deref()
+        .expect("a succeeded capture must report the digest it installed");
+    let installed_bytes = terminal
+        .installed_bytes
+        .expect("a succeeded capture must report the size it installed");
+
+    // What the camera actually produced -- regenerated from the same seed, through the backend itself,
+    // with no part of the capture pipeline involved.
+    use crate::backend::CameraBackendFactory as _;
+    let factory = crate::backend::sim::SimBackendFactory;
+    let mut session = factory
+        .connect(crate::backend::ConnectRequest {
+            instance_id: "camera-a".to_owned(),
+            backend: crate::config::BackendConfig::Sim(backend_config),
+            timeout: Duration::from_secs(5),
+            cancellation: CancellationToken::new(),
+        })
+        .await
+        .expect("the simulator must connect");
+    let expected = session
+        .capture(crate::backend::CaptureRequest {
+            capture_id: "regenerated".to_owned(),
+            profile: terminal_profile(&terminal),
+            maximum_frame_bytes: 8 * 1024 * 1024,
+            timeout: Duration::from_secs(5),
+            cancellation: CancellationToken::new(),
+        })
+        .await
+        .expect("the simulator must produce its first frame")
+        .bytes;
+    session.close().await.ok();
+
+    // What is actually on disk.
+    let delivered = std::fs::read(final_path).expect("the installed artifact must be readable");
+
+    assert_eq!(
+        delivered.len(),
+        expected.len(),
+        "the delivered image is a different SIZE from the frame the camera produced"
+    );
+    assert!(
+        delivered == expected.as_ref(),
+        "the delivered image is not the image the camera took -- same length, different bytes, which is \
+         precisely the corruption a self-referential digest cannot see"
+    );
+
+    // And the digest the operator is handed describes THAT image, not merely the file it was taken from.
+    let camera_digest = hex::encode(Sha256::digest(&expected));
+    assert_eq!(
+        installed_sha256, camera_digest,
+        "the digest on the wire must be the digest of the CAMERA'S frame; a digest computed from the \
+         file it was written to would agree with a corrupted file just as happily"
+    );
+    assert_eq!(
+        installed_bytes,
+        expected.len() as u64,
+        "and the size on the wire must be the camera's frame size"
+    );
+
+    runtime.shutdown().await;
+}
+
+/// The profile the durable record says was used, so the regenerated frame is asked for on the same terms.
+fn terminal_profile(record: &crate::catalog::JobRecord) -> crate::config::CaptureProfile {
+    let snapshot: crate::jobs::JobProfileSnapshot =
+        serde_json::from_value(record.effective_profile.clone())
+            .expect("the durable record must carry the profile it used");
+    snapshot.capture
+}
