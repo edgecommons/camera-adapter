@@ -1,26 +1,14 @@
-# Dockerfile-specific build context filter. The build context is the EdgeCommons umbrella, but the
-# adapter image needs only these local source dependencies. Keep generated outputs, other component
-# repositories, credentials, and simulator runtime state out of the build context.
+# Dockerfile-specific build context filter. The context is this repository, and the image needs only
+# the crate manifest and its Rust sources. Keep build output, runtime state, credentials, simulator
+# fixtures, and the developer's local Cargo overrides out of it.
 **
 
-!camera-adapter/
-camera-adapter/**
-!camera-adapter/Cargo.toml
-!camera-adapter/Cargo.lock
-!camera-adapter/src/**
-!camera-adapter/native/**
+!Cargo.toml
+!src/**
+!native/**
 
-!core/
-core/**
-!core/libs/
-core/libs/**
-!core/libs/rust/
-!core/libs/rust/**
-!core/libs/rust-streamlog/
-!core/libs/rust-streamlog/**
-!core/proto/
-!core/proto/**
-
-# Local Cargo outputs are never source inputs to the image build.
-core/libs/rust/target/
-core/libs/rust-streamlog/target/
+# `Cargo.lock` is NOT admitted, and deliberately so. It is untracked, so a developer's copy is
+# whatever their gitignored `.cargo/config.toml` `[patch]` last wrote -- a PATH source pointing at a
+# checkout that does not exist inside the image. Letting it into the context would put a local,
+# unreviewable file in charge of what the image is built from. `edgecommons` is pinned by REV in
+# Cargo.toml; that is the pin that decides the library source here.

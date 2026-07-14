@@ -38,17 +38,17 @@ The default build is the standalone ONVIF snapshot path. It does not include nat
 GenICam libraries.
 
 ```powershell
-cargo build --locked --release
+cargo build --release
 ```
 
 Feature choices are explicit:
 
 ```powershell
 # ONVIF plus native GStreamer RTSP capture (Linux native dependencies required)
-cargo build --locked --release --no-default-features --features standalone,onvif,rtsp
+cargo build --release --no-default-features --features standalone,onvif,rtsp
 
 # Linux Aravis GenICam support (Aravis 0.8.36 or newer required)
-cargo build --locked --release --no-default-features --features standalone,onvif,genicam
+cargo build --release --no-default-features --features standalone,onvif,genicam
 ```
 
 The Rust package declares MSRV 1.85. Use the locked dependency graph; do not update native or

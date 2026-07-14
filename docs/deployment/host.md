@@ -149,12 +149,12 @@ The checked-in [Dockerfile](../../Dockerfile) has two explicit targets:
 - `onvif` (default): standalone ONVIF snapshot capture;
 - `rtsp`: ONVIF plus the packaged GStreamer runtime for RTSP frame capture.
 
-Build from the EdgeCommons umbrella because the adapter has a sibling path dependency on
-`core/libs/rust`:
+Build from this repository. The `edgecommons` library is a git dependency pinned by revision, so the
+image resolves it directly and needs no sibling checkout:
 
 ```bash
-docker build -f camera-adapter/Dockerfile --target onvif -t camera-adapter:onvif .
-docker build -f camera-adapter/Dockerfile --target rtsp -t camera-adapter:rtsp .
+docker build --target onvif -t camera-adapter:onvif .
+docker build --target rtsp -t camera-adapter:rtsp .
 ```
 
 Both base images and Debian package snapshots are pinned. The current base pins are Linux/amd64;
@@ -177,7 +177,7 @@ deployment recipe. Exercise a real MQTT command/reply capture after the stack is
 CAMERA_ADAPTER_DOCKER_E2E=1 \
 CAMERA_ADAPTER_DOCKER_E2E_HOST=127.0.0.1 \
 CAMERA_ADAPTER_DOCKER_E2E_PORT=1884 \
-cargo test --locked --no-default-features --features standalone --test docker_capture_submit
+cargo test --no-default-features --features standalone --test docker_capture_submit
 ```
 
 See [the simulator README](../../simulators/README.md) for protocol and native test commands.

@@ -4021,8 +4021,8 @@ mod tests {
     /// NOTHING DURABLE CARRIES THE THUMBNAIL -- not the catalog, not the sidecar, not a reply.
     ///
     /// This is the whole point of the preview being volatile, and it is the reason the durable
-    /// outbox was deleted in the first place: a capture must not pay to STORE an envelope. A 48 KiB
-    /// preview in the terminal body would put ~64 KB of base64 into the catalog's `terminal_result`
+    /// outbox was deleted in the first place: a capture must not pay to STORE an envelope. A 60 KiB
+    /// preview in the terminal body would put ~80 KB of base64 into the catalog's `terminal_result`
     /// for every capture, the same again into the on-disk metadata sidecar beside the very image it
     /// is a thumbnail OF, and N times over into a group reply.
     ///
@@ -4128,7 +4128,7 @@ mod tests {
     /// terminal message would be lost. So the thumbnail is what gives way, and it is counted.
     #[tokio::test]
     async fn a_thumbnail_over_the_ceiling_is_dropped_while_the_capture_succeeds_and_is_announced() {
-        // Incompressible per-pixel noise: at 640px even quality 50 cannot get under 48 KiB.
+        // Incompressible per-pixel noise: at 640px even quality 50 cannot get under the budget.
         let (width, height) = (640_u32, 640_u32);
         let mut bytes = Vec::with_capacity((width * height * 3) as usize);
         let mut state = 0x2545_F491_4F6C_DD1D_u64;

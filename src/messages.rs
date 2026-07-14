@@ -216,8 +216,9 @@ impl Thumbnail {
     /// # Errors
     /// Returns [`CameraError::Messaging`] when the messaging library refuses the bytes as a binary
     /// value -- which it does above `MAX_BINARY_BODY_BYTES` (64 KiB). The renderer never offers
-    /// bytes that large ([`crate::thumbnail::MAX_THUMBNAIL_BYTES`] is 48 KiB), so this is the
-    /// belt-and-braces path: a thumbnail must never be able to fail an announcement's construction.
+    /// bytes that large: it encodes to the transport's budget ([`crate::thumbnail::ThumbnailPolicy`]
+    /// -- 6 KiB on Greengrass IPC, 60 KiB on MQTT) and drops the picture rather than exceed it. So
+    /// this is the belt-and-braces path: a thumbnail must never fail an announcement's construction.
     pub fn new(width: u32, height: u32, jpeg: &[u8]) -> Result<Self> {
         let data = edgecommons::messaging::message::binary_value(jpeg)
             .map_err(|error| CameraError::Messaging(error.to_string()))?;

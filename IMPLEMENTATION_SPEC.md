@@ -934,8 +934,10 @@ the component has mis-modelled.
 The messaging library caps a binary value at `MAX_BINARY_BODY_BYTES` = 64 KiB and errors above it. If a
 thumbnail exceeded that, the announcement itself would fail to build and the capture's message would be
 lost — a preview must never be able to do that. The component therefore encodes at JPEG quality 80, then 65,
-then 50, accepting the first result at or under **48 KiB**; if none fits, the thumbnail is dropped and the
-announcement is published without it.
+then 50, accepting the first result at or under **the transport's preview budget** (the table above: 6 KiB
+on IPC, 60 KiB on MQTT); if none fits, the thumbnail is dropped and the announcement is published without
+it. The MQTT budget sits under the 64 KiB library cap by construction, and a compile-time assertion pins it
+there.
 
 That 64 KiB is **not** a transport limit. `core/docs/platform/DESIGN-binary-messaging.md` §3.6 sizes it for
 the JSON BinaryValue path, where base64 inflates the payload and it flows through JSON parsers. On the

@@ -65,8 +65,8 @@ services:
 
   camera-adapter:
     build:
-      context: ../../..
-      dockerfile: camera-adapter/Dockerfile
+      context: ../..
+      dockerfile: Dockerfile
       target: onvif
     image: camera-adapter:simulator
     depends_on:

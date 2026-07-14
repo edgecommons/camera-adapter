@@ -863,7 +863,7 @@ mod tests {
     #[test]
     fn a_thumbnail_that_will_not_fit_the_ceiling_is_dropped_after_the_ladder() {
         // Per-pixel pseudo-random noise: incompressible on purpose, so 640x640 of it cannot be
-        // squeezed under 48 KiB even at the bottom of the quality ladder.
+        // squeezed under the MQTT preview budget even at the bottom of the quality ladder.
         let (width, height) = (640_u32, 640_u32);
         let mut bytes = Vec::with_capacity((width * height * 3) as usize);
         let mut state = 0x2545_F491_4F6C_DD1D_u64;
@@ -882,7 +882,7 @@ mod tests {
                     "a dropped thumbnail must be one that genuinely did not fit: {bytes} bytes"
                 );
             }
-            other => panic!("incompressible noise at 640px must not fit 48 KiB, got {other:?}"),
+            other => panic!("incompressible noise at 640px must not fit the MQTT budget, got {other:?}"),
         }
 
         // ...and the same noise DOES fit once the picture is small enough, which proves the drop

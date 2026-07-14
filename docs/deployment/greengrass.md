@@ -12,7 +12,7 @@ Build the architecture-matched Linux binary with the Greengrass transport featur
 this feature on Linux or WSL because the Greengrass SDK is Linux-only.
 
 ```bash
-cargo +1.90.0 build --locked --release --no-default-features --features greengrass,onvif
+cargo +1.90.0 build --release --no-default-features --features greengrass,onvif
 ```
 
 For RTSP, add `rtsp` and package the matching GStreamer runtime libraries. For GenICam, package a

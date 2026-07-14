@@ -4640,7 +4640,7 @@ fn mean_channel_difference(left: &image::RgbImage, right: &image::RgbImage) -> f
 /// A group reply carries one body PER MEMBER -- and not one preview among them.
 ///
 /// This is where a preview in the durable record would hurt most: the group aggregate embeds every
-/// member's committed terminal body verbatim, so a 48 KiB thumbnail per capture becomes N of them in
+/// member's committed terminal body verbatim, so a 60 KiB thumbnail per capture becomes N of them in
 /// a single reply. It is also the sharpest statement of the rule, because the aggregate is built
 /// from the CATALOG -- if the durable bodies were clean and the aggregate still had previews, or the
 /// other way round, this is the test that would say so.

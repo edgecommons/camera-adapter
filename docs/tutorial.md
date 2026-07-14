@@ -24,7 +24,7 @@ Run the test client from the adapter checkout:
 CAMERA_ADAPTER_DOCKER_E2E=1 \
 CAMERA_ADAPTER_DOCKER_E2E_HOST=127.0.0.1 \
 CAMERA_ADAPTER_DOCKER_E2E_PORT=1884 \
-cargo test --locked --no-default-features --features standalone --test docker_capture_submit
+cargo test --no-default-features --features standalone --test docker_capture_submit
 ```
 
 The test publishes to `ecv1/NOT_GREENGRASS/camera-adapter/main/cmd/sb/capture-submit` and asserts

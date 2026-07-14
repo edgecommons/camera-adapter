@@ -10,10 +10,10 @@
 //!
 //! [`CameraRuntime`] is ONE type with four planes, and the planes are modules rather than types:
 //!
-//! - [`command`] -- everything reachable from a southbound command.
-//! - [`supervision`] -- keeping cameras connected, and the periodic work nobody asked for.
-//! - [`reload`] -- replacing one generation of configuration with another, atomically.
-//! - [`schedule`] -- the work the component gives itself.
+//! - `command` -- everything reachable from a southbound command.
+//! - `supervision` -- keeping cameras connected, and the periodic work nobody asked for.
+//! - `reload` -- replacing one generation of configuration with another, atomically.
+//! - `schedule` -- the work the component gives itself.
 //!
 //! They are not separate TYPES, and that is a decision rather than an omission. Eighteen of this
 //! struct's twenty-six fields are touched by more than one plane, and the shared state is not

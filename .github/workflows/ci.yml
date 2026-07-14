@@ -175,3 +175,65 @@ jobs:
         run: |
           cargo test --lib \
             --no-default-features --features standalone,onvif,rtsp
+
+  image:
+    # The Dockerfile was built by NOTHING. Not by CI, not by any script -- the only automated docker
+    # builds in this repo are the simulator validation images, which are different files. So when
+    # 3c0d83d stopped tracking `Cargo.lock`, the `COPY camera-adapter/Cargo.lock` on line 35 and the
+    # two `cargo build --locked` invocations became a build that CANNOT SUCCEED in a clean clone --
+    # `"/camera-adapter/Cargo.lock": not found` -- and it stayed that way, because a developer with a
+    # stale lock still lying around in their working tree never saw it. The shipped container image
+    # was unbuildable by anyone who cloned the repo, and nothing said a word.
+    #
+    # This job builds it. Both targets, from a clean checkout, and it runs the binary it produced --
+    # compiling is not the same as producing a working image, and the RTSP target exists precisely to
+    # carry a GStreamer runtime the ONVIF one does not.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # A clean checkout has no `Cargo.lock` (it is untracked -- see the note in the `msrv` job). If a
+      # future change reintroduces `--locked` or copies the lock, the build dies here, which is the
+      # entire point of this job.
+      - name: Build the default image (onvif)
+        run: docker build --target onvif -t camera-adapter:onvif .
+
+      - name: Build the rtsp image
+        run: docker build --target rtsp -t camera-adapter:rtsp .
+
+      # The entrypoint refuses an incomplete command line, which is enough to prove the binary is
+      # present, dynamically links, and parses its own CLI inside the image.
+      - name: The images run
+        run: |
+          for image in camera-adapter:onvif camera-adapter:rtsp; do
+            output="$(docker run --rm "$image" --platform HOST 2>&1 || true)"
+            case "$output" in
+              *"--transport MQTT"*) echo "$image: runs" ;;
+              *) echo "$image: did not start as expected:"; echo "$output"; exit 1 ;;
+            esac
+          done
+
+      # The RTSP image must carry the plugins the decode pipeline actually loads; the ONVIF image must
+      # carry none at all. Assert both halves -- an rtsp image whose plugins are missing is exactly the
+      # gap that shipped a decoder nothing could construct, and a fattened base image is a regression in
+      # the other direction.
+      #
+      # Assert the plugin LIBRARIES, not `gst-inspect-1.0`. That tool ships in gstreamer1.0-tools, a
+      # development package with no business in a runtime image -- requiring it here would mean fattening
+      # the shipped image to satisfy its own test. (The first cut of this step did exactly that, and
+      # reported a missing h264parse when the plugin was present and only the TOOL was absent.)
+      - name: The rtsp image carries the GStreamer decode plugins, and the onvif image carries none
+        run: |
+          docker run --rm --entrypoint sh camera-adapter:rtsp -c '
+            set -e
+            dir="$(dirname "$(find /usr/lib -name libgstapp.so -print -quit)")"
+            for plugin in libgstvideoparsersbad.so libgstlibav.so libgstvideoconvertscale.so libgstapp.so; do
+              test -e "$dir/$plugin" || { echo "rtsp image is missing $plugin"; exit 1; }
+            done
+            echo "rtsp: h264parse, avdec_h264, videoconvert and appsrc/appsink plugins present"'
+          if docker run --rm --entrypoint sh camera-adapter:onvif -c 'find /usr/lib -type d -name gstreamer-1.0 | grep -q .'; then
+            echo "onvif image unexpectedly carries a GStreamer plugin tree"; exit 1
+          fi
+          echo "onvif: no GStreamer runtime, as intended"
