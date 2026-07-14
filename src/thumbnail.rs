@@ -13,12 +13,17 @@
 //!   the picture or letterbox it. The configured [`ThumbnailSize`] bounds the LONGEST edge and the
 //!   other axis follows, and a frame already smaller than the bound is carried at its own size --
 //!   never upscaled, because inventing pixels is not a preview.
-//! * **The byte ceiling.** [`edgecommons::messaging::message::binary_value`] refuses a binary value
-//!   over `MAX_BINARY_BODY_BYTES` (64 KiB), and the thumbnail rides inside the terminal announcement. A
-//!   thumbnail that blew that ceiling would fail the ANNOUNCEMENT ITSELF to build, and the capture's
-//!   terminal message would be lost -- so this module encodes down a quality ladder against a
-//!   deliberately lower ceiling ([`MAX_THUMBNAIL_BYTES`], 48 KiB) and, if even the bottom of the
-//!   ladder will not fit, drops the thumbnail rather than the message.
+//! * **The byte budget, which belongs to the TRANSPORT.** A preview rides inside the terminal
+//!   announcement, so what it may cost is whatever the transport the component actually resolved can
+//!   carry -- and the two transports are not close. Greengrass IPC caps a whole message at 10,000
+//!   bytes inside our own client library; an MQTT broker takes a megabyte. [`ThumbnailPolicy`] is
+//!   that answer, derived from the resolved [`Transport`]: it caps the SIZE (a profile asking for
+//!   more is clamped down, never rejected) and the BYTES (the quality ladder encodes down to it, and
+//!   a picture that still will not fit is dropped rather than the message).
+//!
+//! The second bound is not theoretical. A previous cut of this feature offered `medium` and `large`
+//! previews to Greengrass IPC and lost 90 announcements to NOMEM on the lab device -- every capture
+//! succeeded, every image landed, and nobody was told about any of them.
 
 use std::io::Cursor;
 
@@ -29,32 +34,185 @@ use image::{
     imageops,
 };
 
+use edgecommons::platform::Transport;
+
 use crate::config::ThumbnailSize;
 use crate::messages::Thumbnail;
 use crate::model::{CaptureFrame, PixelFormat};
 
-/// The component's own ceiling for the encoded thumbnail, deliberately under the library's.
+/// What the Greengrass IPC transport can carry, in bytes of encoded preview.
 ///
-/// The messaging library caps one binary value at 64 KiB and returns an error above it. That error
-/// would surface as "the terminal announcement could not be built", so the margin between this
-/// number and that one is what guarantees a thumbnail can never cost a capture its announcement.
-pub const MAX_THUMBNAIL_BYTES: usize = 48 * 1024;
+/// The binding constraint is NOT a Greengrass protocol limit and NOT the Java nucleus. It is the IPC
+/// client this component links: `aws-greengrass-component-sdk` encodes the whole eventstream packet
+/// into a **static 10,000-byte buffer** (`GG_IPC_MAX_MSG_LEN`, `csrc/ipc/client.c`), and
+/// `eventstream_encode` answers NOMEM above it -- inside our own process, before a byte reaches the
+/// nucleus. The packet must also hold the envelope (the largest terminal body measured on the lab
+/// device was 1,677 bytes), the protobuf and eventstream headers, and the topic. 6 KiB leaves real
+/// margin inside 10,000, and `small` at this budget carried 45/45 captures on the device.
+const IPC_BUDGET_BYTES: usize = 6 * 1024;
 
-/// The component's ceiling must stay under the library's, or a thumbnail could fail an announcement.
+/// What the MQTT transport can carry, in bytes of encoded preview.
 ///
-/// Asserted at COMPILE time, because it is the one relationship in this module that nothing at
-/// runtime would notice being wrong: a thumbnail that fits 64 KiB but not the margin is announced
-/// happily, right up until the envelope it is stamped into overflows the library's bound.
+/// A broker takes a megabyte without blinking, so the binding constraint here is the messaging
+/// library's 64 KiB cap on a single binary value -- not the transport. This leaves that cap room for
+/// the rest of the envelope.
+const MQTT_BUDGET_BYTES: usize = 60 * 1024;
+
+/// The MQTT budget must stay under the library's binary-value bound, or a thumbnail could fail an
+/// announcement to BUILD -- a failure no transport is involved in and no retry could survive.
+///
+/// Asserted at COMPILE time, because it is the one relationship here that nothing at runtime would
+/// notice being wrong until an announcement was already lost.
 const _: () = assert!(
-    MAX_THUMBNAIL_BYTES < edgecommons::messaging::message::MAX_BINARY_BODY_BYTES,
-    "the thumbnail ceiling must leave the messaging library's binary-value bound room for the rest \
+    MQTT_BUDGET_BYTES < edgecommons::messaging::message::MAX_BINARY_BODY_BYTES,
+    "the thumbnail budget must leave the messaging library's binary-value bound room for the rest \
      of the envelope"
 );
 
-/// The JPEG qualities tried, in order, until one fits [`MAX_THUMBNAIL_BYTES`].
+/// What the resolved transport can actually carry.
+///
+/// # Why this exists
+///
+/// A thumbnail was supposed to be unable to harm a capture. On the lab device it harmed 90 of them:
+/// every capture SUCCEEDED and every image landed on disk, but on Greengrass IPC the `medium` and
+/// `large` previews made the announcement itself undeliverable -- 45/45 NOMEM on each of two
+/// cameras. The result was durable and nobody was told about it, which is a real loss dressed up as
+/// a convenience feature.
+///
+/// The engine sheds a preview that costs an announcement (see `JobEngine::announce_terminal`), and
+/// that safety net stays -- but discovering a transport's limit by FAILING against it is not a
+/// policy. This is the policy: the component asks what the transport it actually resolved can carry,
+/// and never offers it more than that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThumbnailPolicy {
+    transport: Transport,
+    largest: ThumbnailSize,
+    budget: usize,
+}
+
+impl ThumbnailPolicy {
+    /// The policy for one resolved transport.
+    ///
+    /// The transport is the one the component actually started with (`gg.args().transport`, already
+    /// resolved from `--platform`/`--transport`/auto) -- not a guess from the config file.
+    #[must_use]
+    pub const fn for_transport(transport: Transport) -> Self {
+        match transport {
+            Transport::Ipc => Self {
+                transport,
+                largest: ThumbnailSize::Small,
+                budget: IPC_BUDGET_BYTES,
+            },
+            Transport::Mqtt => Self {
+                transport,
+                largest: ThumbnailSize::Large,
+                budget: MQTT_BUDGET_BYTES,
+            },
+        }
+    }
+
+    /// The transport this policy was derived from.
+    #[must_use]
+    pub const fn transport(self) -> Transport {
+        self.transport
+    }
+
+    /// The largest size this transport can carry.
+    #[must_use]
+    pub const fn largest_size(self) -> ThumbnailSize {
+        self.largest
+    }
+
+    /// The byte budget for one encoded preview on this transport.
+    #[must_use]
+    pub const fn budget_bytes(self) -> usize {
+        self.budget
+    }
+
+    /// The size actually produced for a profile that asked for `requested`.
+    ///
+    /// A size the transport cannot carry is CLAMPED DOWN, never rejected. The same configuration is
+    /// deployed to Greengrass and to Kubernetes, and refusing to start on one of them because a
+    /// preview is too big for its transport would be a hostile way to report a convenience.
+    #[must_use]
+    pub const fn effective_size(self, requested: ThumbnailSize) -> ThumbnailSize {
+        if requested.longest_edge() > self.largest.longest_edge() {
+            self.largest
+        } else {
+            requested
+        }
+    }
+
+    /// Whether `requested` is larger than this transport can carry.
+    #[must_use]
+    pub const fn clamps(self, requested: ThumbnailSize) -> bool {
+        requested.longest_edge() > self.largest.longest_edge()
+    }
+
+    /// Why this transport caps the preview, in words an operator can act on.
+    #[must_use]
+    pub const fn limit_reason(self) -> &'static str {
+        match self.transport {
+            Transport::Ipc => {
+                "the Greengrass IPC client caps a whole message at 10,000 bytes (GG_IPC_MAX_MSG_LEN)"
+            }
+            Transport::Mqtt => "the messaging library caps one binary value at 64 KiB",
+        }
+    }
+}
+
+/// One camera whose configured preview size the resolved transport cannot carry.
+///
+/// Produced ONCE, from the configuration, at startup and on reload -- never per capture. A clamp is
+/// a fact about the deployment, not an event; logging it 45 times per camera per hour would bury the
+/// one line that tells an operator why their `large` previews are arriving at 160 px.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClampNotice {
+    /// The camera instance whose profiles were clamped.
+    pub instance: String,
+    /// The capture profiles that asked for more than the transport can carry.
+    pub profiles: Vec<String>,
+    /// The size that is produced instead.
+    pub effective: ThumbnailSize,
+}
+
+/// Every camera whose configured preview size this transport must clamp -- one notice per camera.
+///
+/// The caller logs these at WARN, once, at startup and after a reload. Nothing else in the component
+/// reports a clamp, and the per-capture path ([`render`]) deliberately cannot: it is handed the
+/// policy and returns a picture, with no way to say a word about it.
+#[must_use]
+pub fn clamp_notices(config: &crate::config::AdapterConfig, policy: ThumbnailPolicy) -> Vec<ClampNotice> {
+    let mut notices = Vec::new();
+    for camera in &config.instances {
+        let mut profiles: Vec<String> = camera
+            .capture_profiles
+            .iter()
+            .filter(|(_, profile)| {
+                profile
+                    .thumbnail
+                    .is_some_and(|thumbnail| policy.clamps(thumbnail.size))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if profiles.is_empty() {
+            continue;
+        }
+        profiles.sort();
+        notices.push(ClampNotice {
+            instance: camera.id.clone(),
+            profiles,
+            effective: policy.largest_size(),
+        });
+    }
+    notices
+}
+
+/// The JPEG qualities tried, in order, until one fits the policy's byte budget.
 ///
 /// This is the whole "quality" surface, and it is deliberately not configurable: the component owns
-/// the trade between fidelity and the byte ceiling, because the ceiling is not negotiable.
+/// the trade between fidelity and the byte budget, because the budget is not negotiable -- it is
+/// whatever the transport can actually carry.
 pub const QUALITY_LADDER: [u8; 3] = [80, 65, 50];
 
 /// The one resampling filter. Fixed so that the same frame always yields the same thumbnail.
@@ -66,9 +224,9 @@ const FILTER: FilterType = FilterType::Lanczos3;
 /// the capture survives.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThumbnailOutcome {
-    /// A thumbnail that fits the ceiling and can be announced.
+    /// A thumbnail that fits the transport's budget and can be announced.
     Rendered(Thumbnail),
-    /// The frame rendered, but the smallest encoding still exceeded [`MAX_THUMBNAIL_BYTES`].
+    /// The frame rendered, but the smallest encoding still exceeded the transport's byte budget.
     ///
     /// Carries the smallest encoded size that was tried, which is what an operator needs in order to
     /// understand why a configured thumbnail is not arriving.
@@ -83,7 +241,12 @@ pub enum ThumbnailOutcome {
     },
 }
 
-/// Renders one thumbnail of `frame`, bounded by `size` and by [`MAX_THUMBNAIL_BYTES`].
+/// Renders one thumbnail of `frame`, bounded by what `policy` says the transport can carry.
+///
+/// `requested` is what the capture profile asked for. What is produced is
+/// [`ThumbnailPolicy::effective_size`] of it -- clamped down, silently and per capture, because the
+/// operator was already told once at startup (see [`clamp_notices`]) and a WARN per capture would
+/// only bury it.
 ///
 /// The source is the camera's frame, so the thumbnail shows the same picture the artifact is made
 /// of. It is nevertheless a LOSSY re-encode of it and carries no digest: see [`Thumbnail`].
@@ -105,9 +268,11 @@ pub enum ThumbnailOutcome {
 #[must_use]
 pub fn render(
     frame: &CaptureFrame,
-    size: ThumbnailSize,
+    requested: ThumbnailSize,
+    policy: ThumbnailPolicy,
     maximum_frame_bytes: u64,
 ) -> ThumbnailOutcome {
+    let size = policy.effective_size(requested);
     let pixels = match decode(frame, size.longest_edge(), maximum_frame_bytes) {
         Ok(pixels) => pixels,
         Err(reason) => return ThumbnailOutcome::Failed { reason },
@@ -121,7 +286,7 @@ pub fn render(
             Err(reason) => return ThumbnailOutcome::Failed { reason },
         };
         smallest = smallest.min(encoded.len());
-        if encoded.len() <= MAX_THUMBNAIL_BYTES {
+        if encoded.len() <= policy.budget_bytes() {
             return match Thumbnail::new(width, height, &encoded) {
                 Ok(thumbnail) => ThumbnailOutcome::Rendered(thumbnail),
                 Err(error) => ThumbnailOutcome::Failed {
@@ -396,6 +561,16 @@ mod tests {
     /// A generous stand-in for one capture's `maximumFrameBytes`, big enough for every fixture here.
     const CEILING: u64 = 8 * 1024 * 1024;
 
+    /// The permissive transport: an MQTT broker, which carries all three sizes.
+    fn mqtt() -> ThumbnailPolicy {
+        ThumbnailPolicy::for_transport(Transport::Mqtt)
+    }
+
+    /// The strict one: Greengrass IPC, whose client caps a whole message at 10,000 bytes.
+    fn ipc() -> ThumbnailPolicy {
+        ThumbnailPolicy::for_transport(Transport::Ipc)
+    }
+
     fn frame(format: PixelFormat, bytes: Vec<u8>, width: u32, height: u32) -> CaptureFrame {
         CaptureFrame {
             bytes: Bytes::from(bytes),
@@ -453,7 +628,7 @@ mod tests {
             (ThumbnailSize::Medium, 320),
             (ThumbnailSize::Large, 640),
         ] {
-            let thumbnail = rendered(render(&rgb(1024, 768), size, CEILING));
+            let thumbnail = rendered(render(&rgb(1024, 768), size, mqtt(), CEILING));
             assert_eq!(
                 thumbnail.width, edge,
                 "{size:?} must bound the longest edge to {edge}"
@@ -472,7 +647,7 @@ mod tests {
     /// claims more resolution than the frame it came from.
     #[test]
     fn a_frame_smaller_than_the_bound_is_never_upscaled() {
-        let thumbnail = rendered(render(&rgb(100, 60), ThumbnailSize::Large, CEILING));
+        let thumbnail = rendered(render(&rgb(100, 60), ThumbnailSize::Large, mqtt(), CEILING));
         assert_eq!(
             (thumbnail.width, thumbnail.height),
             (100, 60),
@@ -495,6 +670,7 @@ mod tests {
             let thumbnail = rendered(render(
                 &frame(format, bytes, 640, 480),
                 ThumbnailSize::Medium,
+                mqtt(),
                 CEILING,
             ));
             let data = thumbnail.data_bytes().expect("the marker must carry bytes");
@@ -527,6 +703,7 @@ mod tests {
         let thumbnail = rendered(render(
             &frame(PixelFormat::Jpeg, encoded.clone(), 800, 600),
             ThumbnailSize::Small,
+            mqtt(),
             CEILING,
         ));
         assert_eq!((thumbnail.width, thumbnail.height), (160, 120));
@@ -585,7 +762,7 @@ mod tests {
             ),
         ];
         for (what, source) in cases {
-            match render(&source, ThumbnailSize::Medium, CEILING) {
+            match render(&source, ThumbnailSize::Medium, mqtt(), CEILING) {
                 ThumbnailOutcome::Failed { reason } => {
                     assert!(!reason.is_empty(), "{what}: a failure must say why")
                 }
@@ -615,7 +792,7 @@ mod tests {
 
         let source = frame(PixelFormat::Jpeg, jpeg, width, height);
         // 8 MiB is a generous frame ceiling; the header claims 1.2 GB.
-        match render(&source, ThumbnailSize::Medium, CEILING) {
+        match render(&source, ThumbnailSize::Medium, mqtt(), CEILING) {
             ThumbnailOutcome::Failed { reason } => assert!(
                 reason.contains("ceiling"),
                 "the refusal must name the ceiling it enforced: {reason}"
@@ -638,6 +815,7 @@ mod tests {
                 render(
                     &frame(PixelFormat::Jpeg, encoded.clone(), 320, 240),
                     ThumbnailSize::Small,
+                    mqtt(),
                     exact,
                 ),
                 ThumbnailOutcome::Rendered(_)
@@ -649,6 +827,7 @@ mod tests {
                 render(
                     &frame(PixelFormat::Jpeg, encoded, 320, 240),
                     ThumbnailSize::Small,
+                    mqtt(),
                     exact - 1,
                 ),
                 ThumbnailOutcome::Failed { .. }
@@ -696,10 +875,10 @@ mod tests {
         }
         let noise = frame(PixelFormat::Rgb8, bytes, width, height);
 
-        match render(&noise, ThumbnailSize::Large, CEILING) {
+        match render(&noise, ThumbnailSize::Large, mqtt(), CEILING) {
             ThumbnailOutcome::Dropped { bytes } => {
                 assert!(
-                    bytes > MAX_THUMBNAIL_BYTES,
+                    bytes > mqtt().budget_bytes(),
                     "a dropped thumbnail must be one that genuinely did not fit: {bytes} bytes"
                 );
             }
@@ -708,12 +887,167 @@ mod tests {
 
         // ...and the same noise DOES fit once the picture is small enough, which proves the drop
         // above is the ceiling talking and not a broken encoder.
-        let small = rendered(render(&noise, ThumbnailSize::Small, CEILING));
+        let small = rendered(render(&noise, ThumbnailSize::Small, mqtt(), CEILING));
         assert!(
-            small.bytes <= MAX_THUMBNAIL_BYTES as u64,
+            small.bytes <= mqtt().budget_bytes() as u64,
             "a small thumbnail of the same frame must fit: {} bytes",
             small.bytes
         );
+    }
+
+    /// Each transport permits exactly what it can carry -- IPC one size, MQTT all three.
+    ///
+    /// These two numbers per transport are the whole policy, and they were both learned the
+    /// expensive way: on the lab device, `medium` and `large` on Greengrass IPC lost 45 of 45
+    /// announcements each to NOMEM, and `small` lost none.
+    #[test]
+    fn each_transport_permits_only_what_it_can_actually_carry() {
+        let ipc = ipc();
+        assert_eq!(
+            ipc.largest_size(),
+            ThumbnailSize::Small,
+            "the IPC client encodes a whole message into a 10,000-byte buffer; only `small` fits"
+        );
+        assert_eq!(ipc.budget_bytes(), 6 * 1024);
+        assert_eq!(ipc.transport(), Transport::Ipc);
+        assert!(ipc.clamps(ThumbnailSize::Large) && ipc.clamps(ThumbnailSize::Medium));
+        assert!(!ipc.clamps(ThumbnailSize::Small));
+
+        let mqtt = mqtt();
+        assert_eq!(
+            mqtt.largest_size(),
+            ThumbnailSize::Large,
+            "a broker carries a megabyte; nothing here needs clamping"
+        );
+        assert_eq!(mqtt.budget_bytes(), 60 * 1024);
+        assert_eq!(mqtt.transport(), Transport::Mqtt);
+        for size in [
+            ThumbnailSize::Small,
+            ThumbnailSize::Medium,
+            ThumbnailSize::Large,
+        ] {
+            assert!(!mqtt.clamps(size), "{size:?} must be carryable on MQTT");
+            assert_eq!(mqtt.effective_size(size), size, "and produced as asked");
+        }
+    }
+
+    /// A size the transport cannot carry is CLAMPED DOWN, never rejected and never attempted.
+    ///
+    /// The same configuration is deployed to Greengrass and to Kubernetes. Refusing to start on the
+    /// one whose transport is smaller would be a hostile way to report a convenience -- and sending
+    /// it anyway is what cost the lab 90 announcements.
+    #[test]
+    fn a_size_the_transport_cannot_carry_is_clamped_down_not_rejected() {
+        let ipc = ipc();
+        assert_eq!(ipc.effective_size(ThumbnailSize::Large), ThumbnailSize::Small);
+        assert_eq!(
+            ipc.effective_size(ThumbnailSize::Medium),
+            ThumbnailSize::Small
+        );
+        assert_eq!(
+            ipc.effective_size(ThumbnailSize::Small),
+            ThumbnailSize::Small,
+            "what already fits is left alone"
+        );
+
+        // And the render path honours it: a profile asking for `large` on IPC gets 160 px.
+        let thumbnail = rendered(render(&rgb(1024, 768), ThumbnailSize::Large, ipc, CEILING));
+        assert_eq!(
+            (thumbnail.width, thumbnail.height),
+            (160, 120),
+            "a `large` profile on IPC must produce a `small` picture, not a large one nobody receives"
+        );
+    }
+
+    /// A `small` preview fits inside what the IPC client can actually put on the wire.
+    ///
+    /// The budget is 6 KiB of an ~10,000-byte packet that must also hold the envelope (the largest
+    /// terminal body measured on the device was 1,677 bytes), the headers and the topic. If a
+    /// `small` thumbnail did not fit that, the policy would be permitting a size it cannot deliver.
+    #[test]
+    fn a_small_preview_fits_what_the_ipc_client_can_put_on_the_wire() {
+        for frame in [rgb(1920, 1080), rgb(1024, 768), rgb(640, 480)] {
+            let thumbnail = rendered(render(&frame, ThumbnailSize::Small, ipc(), CEILING));
+            assert!(
+                thumbnail.bytes <= ipc().budget_bytes() as u64,
+                "a small preview must fit the IPC budget: {} bytes",
+                thumbnail.bytes
+            );
+            assert_eq!(thumbnail.width.max(thumbnail.height), 160);
+        }
+    }
+
+    /// On MQTT, `large` is produced AT `large` -- the clamp is a property of the transport, not a
+    /// blanket downgrade that would quietly rob every deployment of the size it asked for.
+    #[test]
+    fn on_mqtt_a_large_preview_is_produced_at_large() {
+        let thumbnail = rendered(render(&rgb(1920, 1080), ThumbnailSize::Large, mqtt(), CEILING));
+        assert_eq!(
+            (thumbnail.width, thumbnail.height),
+            (640, 360),
+            "a broker can carry 640 px, so 640 px is what a `large` profile must get"
+        );
+        assert!(thumbnail.bytes <= mqtt().budget_bytes() as u64);
+    }
+
+    /// The clamp is reported ONCE per camera, from the configuration -- never per capture.
+    ///
+    /// A clamp is a fact about the deployment, not an event. Forty-five captures an hour per camera,
+    /// each re-announcing the same unchanging fact, is how the one line an operator needed gets
+    /// buried. The per-capture path cannot even produce a notice: [`render`] is handed the policy and
+    /// returns a picture.
+    #[test]
+    fn a_clamp_is_reported_once_per_camera_and_never_per_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = clamp_fixture(directory.path());
+
+        let notices = clamp_notices(&config, ipc());
+        assert_eq!(
+            notices.len(),
+            1,
+            "one notice per CAMERA, however many of its profiles are clamped: {notices:?}"
+        );
+        assert_eq!(notices[0].instance, "camera-a");
+        assert_eq!(
+            notices[0].profiles,
+            ["big", "middling"],
+            "and it names every profile that is being clamped -- but not the one that fits, and not \
+             the one that asked for no preview at all"
+        );
+        assert_eq!(notices[0].effective, ThumbnailSize::Small);
+
+        assert!(
+            clamp_notices(&config, mqtt()).is_empty(),
+            "a transport that can carry what was asked for has nothing to report"
+        );
+    }
+
+    /// A camera with `large`, `medium`, `small`, and no-thumbnail profiles.
+    fn clamp_fixture(root: &std::path::Path) -> crate::config::AdapterConfig {
+        let raw = serde_json::json!({
+            "component": {
+                "global": { "output": { "rootDirectory": root.to_string_lossy() } },
+                "instances": [{
+                    "id": "camera-a",
+                    "backend": { "type": "sim" },
+                    "defaultCaptureProfile": "fitting",
+                    "captureProfiles": {
+                        "big": { "output": { "encoding": "jpeg" }, "thumbnail": { "size": "large" } },
+                        "middling": { "output": { "encoding": "jpeg" }, "thumbnail": { "size": "medium" } },
+                        "fitting": { "output": { "encoding": "jpeg" }, "thumbnail": { "size": "small" } },
+                        "plain": { "output": { "encoding": "jpeg" } }
+                    }
+                }]
+            }
+        });
+        let core = edgecommons::config::Config::from_value(
+            crate::COMPONENT_NAME,
+            "gw-01",
+            raw,
+        )
+        .expect("the fixture configuration must be valid");
+        crate::config::AdapterConfig::from_core_reload(&core)
+            .expect("the fixture configuration must be accepted")
     }
 
     /// Whatever is rendered fits the ceiling, and therefore fits `binary_value`'s 64 KiB bound.
@@ -729,8 +1063,8 @@ mod tests {
             [80, 65, 50],
             "the ladder is the agreed one: 80, then 65, then 50"
         );
-        let thumbnail = rendered(render(&rgb(1920, 1080), ThumbnailSize::Large, CEILING));
-        assert!(thumbnail.bytes <= MAX_THUMBNAIL_BYTES as u64);
+        let thumbnail = rendered(render(&rgb(1920, 1080), ThumbnailSize::Large, mqtt(), CEILING));
+        assert!(thumbnail.bytes <= mqtt().budget_bytes() as u64);
         assert!(thumbnail.data_bytes().is_ok());
     }
 
@@ -746,6 +1080,7 @@ mod tests {
         let thumbnail = rendered(render(
             &frame(PixelFormat::Mono8, bytes, 64, 64),
             ThumbnailSize::Small,
+            mqtt(),
             CEILING,
         ));
         let decoded = ImageReader::new(Cursor::new(
@@ -765,8 +1100,8 @@ mod tests {
     #[test]
     fn rendering_is_deterministic() {
         let source = rgb(500, 400);
-        let first = rendered(render(&source, ThumbnailSize::Medium, CEILING));
-        let second = rendered(render(&source, ThumbnailSize::Medium, CEILING));
+        let first = rendered(render(&source, ThumbnailSize::Medium, mqtt(), CEILING));
+        let second = rendered(render(&source, ThumbnailSize::Medium, mqtt(), CEILING));
         assert_eq!(
             first.data_bytes().unwrap(),
             second.data_bytes().unwrap(),
@@ -779,7 +1114,7 @@ mod tests {
     fn a_bgr_frame_is_not_previewed_with_its_channels_swapped() {
         // A flat, unambiguous red: BGR8 stores it as (0, 0, 255).
         let bgr = frame(PixelFormat::Bgr8, [0_u8, 0, 255].repeat(64 * 64), 64, 64);
-        let thumbnail = rendered(render(&bgr, ThumbnailSize::Small, CEILING));
+        let thumbnail = rendered(render(&bgr, ThumbnailSize::Small, mqtt(), CEILING));
         let decoded = ImageReader::new(Cursor::new(thumbnail.data_bytes().unwrap()))
             .with_guessed_format()
             .expect("format")

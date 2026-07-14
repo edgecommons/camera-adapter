@@ -42,7 +42,7 @@ use crate::storage::{
     InstallGate, PrepareCapture, RecoveryOutcome, RecoveryRequest, RelativeOutputPath,
     StorageReservation, StorageRoot,
 };
-use crate::thumbnail::ThumbnailOutcome;
+use crate::thumbnail::{ThumbnailOutcome, ThumbnailPolicy};
 use crate::{CameraError, ErrorCode, Result};
 
 /// How long the terminal reaper waits before trying a durable store that just refused it.
@@ -424,10 +424,18 @@ pub struct JobEngine {
     install_gate: Arc<dyn InstallGate>,
     acceptance_hook: Arc<dyn AcceptanceHook>,
     active: Arc<Mutex<HashMap<String, ActiveJob>>>,
+    /// What the RESOLVED transport can carry. Required, not defaulted: a permissive default is
+    /// exactly the assumption that cost the lab 90 announcements.
+    thumbnail_policy: ThumbnailPolicy,
 }
 
 impl JobEngine {
     /// Creates an engine with connected-session availability and catalog installation arbitration.
+    ///
+    /// `thumbnail_policy` is derived from the transport the component actually started with. It is a
+    /// required argument rather than an overridable default because every previous version of this
+    /// question -- "what can the wire take?" -- was answered by assumption, and the assumption was
+    /// wrong on the one transport that matters most.
     #[must_use]
     pub fn new(
         catalog: Catalog,
@@ -435,6 +443,7 @@ impl JobEngine {
         storage: StorageRoot,
         announcer: Arc<dyn TerminalAnnouncer>,
         hooks: Arc<dyn JobHooks>,
+        thumbnail_policy: ThumbnailPolicy,
     ) -> Self {
         Self {
             install_gate: Arc::new(catalog.clone()),
@@ -446,6 +455,7 @@ impl JobEngine {
             availability: Arc::new(ConnectedAvailability),
             acceptance_hook: Arc::new(NoopAcceptanceHook),
             active: Arc::new(Mutex::new(HashMap::new())),
+            thumbnail_policy,
         }
     }
 
@@ -1481,6 +1491,7 @@ impl JobEngine {
             .outstanding_disk_bytes()
             .saturating_sub(current);
         let thumbnail = runtime.spec.profile.capture.thumbnail;
+        let policy = self.thumbnail_policy;
         // The picture the thumbnail may decode is bounded by the same ceiling the capture was
         // ADMITTED with. A JPEG frame's decoded size is not its file size, and this is the only code
         // in the component that decodes one -- see `thumbnail::render`.
@@ -1506,7 +1517,12 @@ impl JobEngine {
             let _writer = writer;
             let mut processing = processing;
             let thumbnail = thumbnail.map(|thumbnail| {
-                crate::thumbnail::render(&request.frame, thumbnail.size, maximum_frame_bytes)
+                crate::thumbnail::render(
+                    &request.frame,
+                    thumbnail.size,
+                    policy,
+                    maximum_frame_bytes,
+                )
             });
             let prepared = storage.prepare_capture(request, &cancellation)?;
             processing.release_memory();
@@ -1546,9 +1562,10 @@ impl JobEngine {
                     capture = %runtime.spec.capture_id,
                     instance = %runtime.spec.instance,
                     bytes,
-                    ceiling = crate::thumbnail::MAX_THUMBNAIL_BYTES,
-                    "the thumbnail did not fit the announcement ceiling even at the lowest quality \
-                     and was dropped; the capture and its announcement are unaffected"
+                    budget = self.thumbnail_policy.budget_bytes(),
+                    transport = ?self.thumbnail_policy.transport(),
+                    "the thumbnail did not fit what this transport can carry, even at the lowest \
+                     quality, and was dropped; the capture and its announcement are unaffected"
                 );
                 self.hooks.thumbnail_dropped().await;
                 None
@@ -1711,18 +1728,63 @@ impl JobEngine {
         thumbnail: Option<&Thumbnail>,
     ) {
         let started = Instant::now();
-        let announcement = match terminal_kind(record.state)
+        let base = match terminal_kind(record.state)
             .and_then(|kind| TerminalMessage::from_committed_body(kind, body.clone()))
-            .and_then(|message| match thumbnail {
-                // The one thing the wire carries that the durable record does not: a volatile,
-                // derived preview, attached to the message and to nothing else. An announcement
-                // REBUILT from the durable body in a later process -- the recovery paths below --
-                // passes `None` here and simply has no preview, because the frame is long gone.
-                Some(thumbnail) => message.with_thumbnail(thumbnail),
-                None => Ok(message),
-            }) {
-            Ok(message) => self.announcer.announce(&message).await,
-            Err(error) => Err(error),
+        {
+            Ok(message) => message,
+            Err(error) => {
+                self.hooks.terminal_announcement_failed(record, &error).await;
+                tracing::warn!(
+                    capture = %record.capture_id,
+                    instance = %record.instance,
+                    error = %error,
+                    "the terminal capture result is durable but no announcement could be built for it"
+                );
+                return;
+            }
+        };
+
+        // The one thing the wire carries that the durable record does not: a volatile, derived preview,
+        // attached to the message and to nothing else. An announcement REBUILT from the durable body in
+        // a later process -- the recovery paths -- passes `None` here and simply has no preview, because
+        // the frame is long gone.
+        //
+        // A PREVIEW MAY BE THE VERY THING THAT MAKES THE MESSAGE UNDELIVERABLE, and only the transport
+        // knows. The Greengrass IPC client this component links encodes the whole eventstream packet
+        // into a 10,000-byte STATIC buffer (`GG_IPC_MAX_MSG_LEN` in the component SDK) and answers NOMEM
+        // above it -- before a single byte reaches the nucleus. A local MQTT broker takes a megabyte
+        // without blinking. The component cannot know which it is talking to, and must not have to.
+        //
+        // So the preview is shed the instant it costs anything: if the announcement carrying it does not
+        // go out, the RESULT is announced again without it. A result nobody was told about is a real
+        // loss; a missing preview is an inconvenience. The preview never outranks the result.
+        let announcement = match thumbnail {
+            None => self.announcer.announce(&base).await,
+            Some(thumbnail) => {
+                let previewed = base.clone().with_thumbnail(thumbnail);
+                match previewed {
+                    Ok(previewed) => {
+                        let first = self.announcer.announce(&previewed).await;
+                        match first {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                tracing::warn!(
+                                    capture = %record.capture_id,
+                                    instance = %record.instance,
+                                    error = %error,
+                                    "the capture result could not be announced with its thumbnail;                                      retrying without the preview so the result itself is not lost"
+                                );
+                                self.hooks.thumbnail_dropped().await;
+                                self.announcer.announce(&base).await
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        self.hooks.thumbnail_dropped().await;
+                        self.announcer.announce(&base).await
+                    }
+                }
+            }
         };
         match announcement {
             Ok(()) => {
@@ -1968,12 +2030,35 @@ pub(crate) mod testing {
         pub body: serde_json::Value,
     }
 
+    impl Announcement {
+        /// Exactly what this message would have put on the wire.
+        fn of(message: &TerminalMessage) -> Self {
+            Self {
+                header_name: message.header_name(),
+                channel: message.channel(),
+                event_id: message.event_id().to_string(),
+                capture_id: message.body()["captureId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                correlation_id: message.correlation_id().to_string(),
+                body: message.body().clone(),
+            }
+        }
+
+        /// Whether this announcement carried a preview.
+        pub fn carries_thumbnail(&self) -> bool {
+            self.body.get("thumbnail").is_some()
+        }
+    }
+
     /// Records every announcement, and fails them all while `fail` is set -- which is what a broker
     /// that is not there looks like from inside the component.
     #[derive(Debug, Default)]
     pub(crate) struct RecordingAnnouncer {
         announced: Mutex<Vec<Announcement>>,
         fail: AtomicBool,
+        refuse_previews: AtomicBool,
     }
 
     impl RecordingAnnouncer {
@@ -1982,6 +2067,19 @@ pub(crate) mod testing {
             Self {
                 announced: Mutex::new(Vec::new()),
                 fail: AtomicBool::new(true),
+                refuse_previews: AtomicBool::new(false),
+            }
+        }
+
+        /// A transport with a size ceiling: it refuses any message carrying a preview and takes the
+        /// same message without one. This is the Greengrass IPC client, whose static send buffer
+        /// answers NOMEM above 10,000 bytes -- observed on lab-5950x, where every `medium` and `large`
+        /// announcement was lost and every `small` one landed.
+        pub fn refusing_previews() -> Self {
+            Self {
+                announced: Mutex::new(Vec::new()),
+                fail: AtomicBool::new(false),
+                refuse_previews: AtomicBool::new(true),
             }
         }
 
@@ -2010,20 +2108,21 @@ pub(crate) mod testing {
     #[async_trait]
     impl TerminalAnnouncer for RecordingAnnouncer {
         async fn announce(&self, message: &TerminalMessage) -> Result<()> {
+            // Every ATTEMPT is recorded, including the ones that fail. What the component tried to
+            // put on the wire, and what it fell back to, is the whole question these doubles answer.
+            let announcement = Announcement::of(message);
+            let carries_preview = announcement.carries_thumbnail();
             self.announced
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(Announcement {
-                    header_name: message.header_name(),
-                    channel: message.channel(),
-                    event_id: message.event_id().to_string(),
-                    capture_id: message.body()["captureId"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    correlation_id: message.correlation_id().to_string(),
-                    body: message.body().clone(),
-                });
+                .push(announcement);
+            if carries_preview && self.refuse_previews.load(Ordering::SeqCst) {
+                // The lab's failure, exactly: our own client's send buffer, not the broker, and only
+                // for the message that carries the picture.
+                return Err(CameraError::Messaging(
+                    "greengrass IPC error: NOMEM".to_string(),
+                ));
+            }
             if self.fail.load(Ordering::SeqCst) {
                 return Err(CameraError::Messaging(
                     "the local broker is not connected".to_string(),
@@ -2579,14 +2678,17 @@ mod tests {
         engine_with_announcer(
             Arc::new(RecordingAnnouncer::default()),
             Arc::new(NoopJobHooks),
+            mqtt(),
         )
         .await
     }
 
     /// An engine whose announcements a test can see, and whose hooks it can count.
+    /// An engine on a chosen transport, whose announcements a test can see and whose hooks it counts.
     async fn engine_with_announcer(
         announcer: Arc<RecordingAnnouncer>,
         hooks: Arc<dyn JobHooks>,
+        policy: ThumbnailPolicy,
     ) -> (JobEngine, TempDir, Arc<RecordingAnnouncer>) {
         let directory = TempDir::new().unwrap();
         let output = directory.path().join("output");
@@ -2608,6 +2710,7 @@ mod tests {
                 StorageRoot::open(&output).unwrap(),
                 Arc::clone(&announcer) as Arc<dyn TerminalAnnouncer>,
                 hooks,
+                policy,
             ),
             directory,
             announcer,
@@ -3429,6 +3532,7 @@ mod tests {
         let (engine, _directory, announcer) = engine_with_announcer(
             Arc::new(RecordingAnnouncer::failing()),
             Arc::clone(&hooks) as Arc<dyn JobHooks>,
+            mqtt(),
         )
         .await;
         let now = Utc::now().timestamp_millis();
@@ -3482,6 +3586,7 @@ mod tests {
         let (engine, _directory, announcer) = engine_with_announcer(
             Arc::new(RecordingAnnouncer::failing()),
             Arc::clone(&hooks) as Arc<dyn JobHooks>,
+            mqtt(),
         )
         .await;
         let now = Utc::now().timestamp_millis();
@@ -3520,6 +3625,7 @@ mod tests {
         let (engine, _directory, announcer) = engine_with_announcer(
             Arc::new(RecordingAnnouncer::default()),
             Arc::clone(&hooks) as Arc<dyn JobHooks>,
+            mqtt(),
         )
         .await;
         let now = Utc::now().timestamp_millis();
@@ -3589,6 +3695,7 @@ mod tests {
     #[derive(Default)]
     struct ThumbnailHooks {
         announced: AtomicUsize,
+        announcement_failed: AtomicUsize,
         thumbnail_failed: AtomicUsize,
         thumbnail_dropped: AtomicUsize,
     }
@@ -3597,6 +3704,10 @@ mod tests {
     impl JobHooks for ThumbnailHooks {
         async fn terminal_announced(&self, _record: &JobRecord, _latency: Duration) {
             self.announced.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn terminal_announcement_failed(&self, _record: &JobRecord, _error: &CameraError) {
+            self.announcement_failed.fetch_add(1, Ordering::SeqCst);
         }
 
         async fn thumbnail_failed(&self) {
@@ -3656,12 +3767,31 @@ mod tests {
         frame: CaptureFrame,
         hooks: &Arc<ThumbnailHooks>,
     ) -> (JobRecord, Vec<super::testing::Announcement>, TempDir) {
+        capture_frame_on(submission, frame, hooks, mqtt(), Arc::new(RecordingAnnouncer::default()))
+            .await
+    }
+
+    /// The permissive transport: an MQTT broker.
+    fn mqtt() -> ThumbnailPolicy {
+        ThumbnailPolicy::for_transport(edgecommons::platform::Transport::Mqtt)
+    }
+
+    /// The strict one: Greengrass IPC, whose client cannot put more than 10,000 bytes on the wire.
+    fn ipc() -> ThumbnailPolicy {
+        ThumbnailPolicy::for_transport(edgecommons::platform::Transport::Ipc)
+    }
+
+    /// Runs one capture end to end against a chosen frame, transport, and announcer.
+    async fn capture_frame_on(
+        submission: JobSubmission,
+        frame: CaptureFrame,
+        hooks: &Arc<ThumbnailHooks>,
+        policy: ThumbnailPolicy,
+        announcer: Arc<RecordingAnnouncer>,
+    ) -> (JobRecord, Vec<super::testing::Announcement>, TempDir) {
         let capture_id = submission.spec.capture_id.clone();
-        let (engine, directory, announcer) = engine_with_announcer(
-            Arc::new(RecordingAnnouncer::default()),
-            Arc::clone(hooks) as Arc<dyn JobHooks>,
-        )
-        .await;
+        let (engine, directory, announcer) =
+            engine_with_announcer(announcer, Arc::clone(hooks) as Arc<dyn JobHooks>, policy).await;
         let dispatcher = RecordingDispatcher::default();
         engine
             .accept_and_queue(&dispatcher, submission)
@@ -3777,6 +3907,117 @@ mod tests {
         assert_eq!(hooks.announced.load(Ordering::SeqCst), 1);
     }
 
+    /// On IPC, a `large` profile announces a `small` picture -- clamped, and still announced.
+    ///
+    /// The lab ran this exact configuration and lost 45 of 45 announcements to NOMEM. The capture
+    /// pipeline does not ask the transport whether it will take the picture; it asks the POLICY what
+    /// the transport can carry, and produces that. Nothing is rejected and nothing fails: the profile
+    /// asked for 640 px, the wire can take 160 px, and 160 px is what goes out.
+    #[tokio::test]
+    async fn a_large_profile_on_the_ipc_transport_announces_a_small_picture() {
+        let hooks = Arc::new(ThumbnailHooks::default());
+        let (record, announced, _directory) = capture_frame_on(
+            thumbnail_submission(
+                "cap-thumb-ipc",
+                Some(crate::config::ThumbnailSize::Large),
+                OutputEncoding::Jpeg,
+            ),
+            gradient_frame(1024, 768),
+            &hooks,
+            ipc(),
+            Arc::new(RecordingAnnouncer::default()),
+        )
+        .await;
+
+        assert_eq!(record.state, JobState::Succeeded);
+        assert_eq!(
+            announced.len(),
+            1,
+            "one announcement, and it went out -- which is the entire point"
+        );
+        let thumbnail = &announced[0].body["thumbnail"];
+        assert_eq!(
+            (thumbnail["width"].as_u64(), thumbnail["height"].as_u64()),
+            (Some(160), Some(120)),
+            "a `large` profile on IPC must be clamped to `small`, not sent and lost: {thumbnail}"
+        );
+        assert!(
+            thumbnail["bytes"].as_u64().unwrap() <= ipc().budget_bytes() as u64,
+            "and it must fit inside what the IPC client can actually put on the wire"
+        );
+        assert_eq!(
+            hooks.thumbnail_dropped.load(Ordering::SeqCst),
+            0,
+            "a clamped preview is not a dropped one: it was produced, carried, and delivered"
+        );
+        assert_eq!(hooks.thumbnail_failed.load(Ordering::SeqCst), 0);
+    }
+
+    /// A transport that refuses the previewed message still gets the RESULT.
+    ///
+    /// The safety net beneath the policy, and the thing the lab did not have: if the wire will not
+    /// take the message that carries the picture, the picture is shed and the message is sent again
+    /// without it. A result nobody was told about is a real loss; a missing preview is an
+    /// inconvenience. The preview never outranks the result -- and `announcementFailed` must NOT be
+    /// counted, because nothing was ultimately lost.
+    #[tokio::test]
+    async fn a_transport_that_refuses_the_preview_still_gets_the_result_announced() {
+        let hooks = Arc::new(ThumbnailHooks::default());
+        let (record, announced, _directory) = capture_frame_on(
+            thumbnail_submission(
+                "cap-thumb-nomem",
+                Some(crate::config::ThumbnailSize::Small),
+                OutputEncoding::Jpeg,
+            ),
+            gradient_frame(1024, 768),
+            &hooks,
+            // A permissive POLICY against a transport that in fact refuses the preview: the exact
+            // shape of a limit the component has mis-modelled, which is what this net is for.
+            mqtt(),
+            Arc::new(RecordingAnnouncer::refusing_previews()),
+        )
+        .await;
+
+        assert_eq!(
+            record.state,
+            JobState::Succeeded,
+            "the capture is on disk whatever the wire did"
+        );
+        assert_eq!(
+            announced.len(),
+            2,
+            "two attempts: the one carrying the picture, and the one that had to give it up"
+        );
+        assert!(
+            announced[0].carries_thumbnail(),
+            "the first attempt is the one with the preview -- the one the transport refused"
+        );
+        assert!(
+            !announced[1].carries_thumbnail(),
+            "and the second is the RESULT, shorn of the preview so that it can actually go out"
+        );
+        assert_eq!(
+            announced[1].body["image"], announced[0].body["image"],
+            "it is the same result, not a rebuilt or degraded one"
+        );
+        assert_eq!(
+            hooks.thumbnail_dropped.load(Ordering::SeqCst),
+            1,
+            "the shed preview is counted -- it is how an operator learns the limit was mis-modelled"
+        );
+        assert_eq!(
+            hooks.announced.load(Ordering::SeqCst),
+            1,
+            "and the announcement, on its second attempt, SUCCEEDED"
+        );
+        assert_eq!(
+            hooks.announcement_failed.load(Ordering::SeqCst),
+            0,
+            "nothing was ultimately lost, so nothing may be counted as lost: an operator watching \
+             announcementFailed must not be paged for a preview that was merely shed"
+        );
+    }
+
     /// NOTHING DURABLE CARRIES THE THUMBNAIL -- not the catalog, not the sidecar, not a reply.
     ///
     /// This is the whole point of the preview being volatile, and it is the reason the durable
@@ -3813,6 +4054,7 @@ mod tests {
         let (engine, _directory, announcer) = engine_with_announcer(
             Arc::new(RecordingAnnouncer::default()),
             Arc::clone(&hooks) as Arc<dyn JobHooks>,
+            mqtt(),
         )
         .await;
         let dispatcher = RecordingDispatcher::default();

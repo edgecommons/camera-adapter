@@ -755,6 +755,7 @@ mod tests {
             storage,
             Arc::clone(&announcer) as Arc<dyn TerminalAnnouncer>,
             hooks.clone(),
+            crate::thumbnail::ThumbnailPolicy::for_transport(edgecommons::platform::Transport::Mqtt),
         );
         let pause = pause_install.then(|| {
             Arc::new(PausingInstallGate {

@@ -305,6 +305,7 @@ async fn runtime_with_everything(
                 storage.clone(),
                 Arc::clone(&announcer) as Arc<dyn crate::jobs::TerminalAnnouncer>,
                 Arc::clone(&waiters) as Arc<dyn JobHooks>,
+                crate::thumbnail::ThumbnailPolicy::for_transport(edgecommons::platform::Transport::Mqtt),
             )
             .with_acceptance_hook(Arc::clone(&waiters) as Arc<dyn AcceptanceHook>),
         );
@@ -312,6 +313,8 @@ async fn runtime_with_everything(
     let scheduler = crate::dispatch::CaptureScheduler::new(&config.global.limits).unwrap();
     let runtime = Arc::new(CameraRuntime {
         config: RwLock::new(Arc::new(config)),
+        // The harness is a HOST/standalone runtime, which is an MQTT transport.
+        thumbnail_policy: crate::thumbnail::ThumbnailPolicy::for_transport(edgecommons::platform::Transport::Mqtt),
         backend_context: BackendRuntimeContext::new(
             None,
             &crate::config::LimitsConfig::default(),
@@ -4862,6 +4865,8 @@ async fn runtime_startup_router_and_deferred_capture_flows_use_real_core_facades
             events,
             component_events: core.events(),
             metrics: Arc::new(RecordingMetrics::default()),
+            // A standalone/HOST runtime is an MQTT transport.
+            transport: edgecommons::platform::Transport::Mqtt,
             readiness: readiness.clone(),
             backend_context: BackendRuntimeContext::new(
                 None,

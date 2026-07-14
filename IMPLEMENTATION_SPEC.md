@@ -901,6 +901,34 @@ invite a consumer to believe it is verifiable against the artifact, which it is 
 
 `data` is a binary value and MUST reach the wire as native protobuf bytes, never as base64 inside JSON.
 
+### The transport decides the ceiling
+
+The component resolves its transport at startup (`--platform`/`--transport`, or auto) and derives the
+thumbnail policy from it. It never guesses from the config file, and it never learns the limit by failing.
+
+| transport | largest size carried | preview budget |
+|---|---|---|
+| `IPC` (GREENGRASS) | `small` (160 px) | 6 KiB |
+| `MQTT` (HOST, KUBERNETES) | `large` (640 px) | 60 KiB |
+
+The IPC number is not a Greengrass protocol limit and not the Java nucleus's limit. The Greengrass IPC
+*client* this component links (`aws-greengrass-component-sdk`) encodes the whole eventstream packet into a
+**static 10,000-byte buffer** — `GG_IPC_MAX_MSG_LEN` in `include/gg/ipc/limits.h`, backing
+`static uint8_t ipc_send_mem[…]` in `csrc/ipc/client.c` — and `eventstream_encode` answers `NOMEM` above
+it, *before a byte reaches the nucleus*. The packet must also carry the envelope, the eventstream headers
+and the topic, so the preview gets 6 KiB of it. The define is overridable at SDK build time
+(`-D GG_IPC_MAX_MSG_LEN=<N>`); raising it is a core decision, not this component's.
+
+A configured size larger than the transport carries is **clamped down, never rejected** — the same
+configuration is deployed to Greengrass and to Kubernetes, and refusing to start on one of them would be
+hostile. The clamp is reported once per camera at startup (and again after a reload, which may introduce a
+new one), never per capture.
+
+**A preview never outranks the result.** If an announcement carrying a thumbnail cannot be published, the
+result is announced again without it. A result nobody was told about is a real loss; a missing preview is
+an inconvenience. This is the belt to the transport policy's braces: it covers any transport whose limit
+the component has mis-modelled.
+
 ### Byte ceiling — a known constraint, not a design
 
 The messaging library caps a binary value at `MAX_BINARY_BODY_BYTES` = 64 KiB and errors above it. If a

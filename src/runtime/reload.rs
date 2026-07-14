@@ -335,6 +335,10 @@ impl CameraRuntime {
                 }
             }
         }
+        // A reload can introduce a preview size this transport cannot carry, and the operator who
+        // just deployed it is exactly the person who needs to hear so. Said once, here -- not on
+        // every capture the new configuration goes on to take.
+        super::log_thumbnail_clamps(&replacement, self.thumbnail_policy);
 
         for instance in &incompatible {
             if let Err(error) = self.interrupt_reload_queued(instance).await {

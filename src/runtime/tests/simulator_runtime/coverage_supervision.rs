@@ -41,6 +41,7 @@ async fn runtime_with_component_events(
                 storage.clone(),
                 Arc::clone(&announcer) as Arc<dyn crate::jobs::TerminalAnnouncer>,
                 Arc::clone(&waiters) as Arc<dyn JobHooks>,
+                crate::thumbnail::ThumbnailPolicy::for_transport(edgecommons::platform::Transport::Mqtt),
             )
             .with_acceptance_hook(Arc::clone(&waiters) as Arc<dyn AcceptanceHook>),
         );
@@ -48,6 +49,7 @@ async fn runtime_with_component_events(
     let scheduler = crate::dispatch::CaptureScheduler::new(&config.global.limits).unwrap();
     let runtime = Arc::new(CameraRuntime {
         config: RwLock::new(Arc::new(config)),
+        thumbnail_policy: crate::thumbnail::ThumbnailPolicy::for_transport(edgecommons::platform::Transport::Mqtt),
         backend_context: BackendRuntimeContext::new(None, &crate::config::LimitsConfig::default()),
         catalog,
         admission,
@@ -733,6 +735,7 @@ async fn a_panic_while_finishing_a_capture_is_isolated_to_its_own_camera() {
         runtime.storage.clone(),
         Arc::new(PanickingAnnouncer),
         Arc::clone(&runtime.waiters) as Arc<dyn JobHooks>,
+        crate::thumbnail::ThumbnailPolicy::for_transport(edgecommons::platform::Transport::Mqtt),
     );
     runtime
         .start_supervisor("camera-a".to_string(), panicking)

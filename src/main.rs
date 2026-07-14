@@ -104,6 +104,10 @@ async fn main() -> anyhow::Result<()> {
             readiness: readiness.clone(),
             backend_context,
             metrics: gg.metrics(),
+            // The RESOLVED transport, not a guess. It decides what a terminal announcement may
+            // carry: the Greengrass IPC client encodes a whole message into a 10,000-byte static
+            // buffer, and an MQTT broker takes a megabyte.
+            transport: gg.args().transport,
         },
     )
     .await?;

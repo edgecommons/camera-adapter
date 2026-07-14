@@ -151,6 +151,12 @@ A thumbnail is present only in the published result. It is never written to the 
 stored in the catalog, and never included in a `sb/capture` reply or a group reply. A result republished
 after a restart therefore carries no thumbnail: the frame it would be made from is gone.
 
+A thumbnail is never allowed to cost the result it decorates. If a result cannot be published with its
+thumbnail, it is published again without it, and the thumbnail is dropped.
+
+`thumbnail` may also be smaller than the profile asked for: the messaging transport decides what it can
+carry, and a size it cannot carry is reduced to one it can. See the capture-profile reference.
+
 `thumbnail` may be absent even when a profile asks for one — a frame the component cannot render, or a
 thumbnail that will not fit the message's byte ceiling, is left out. The capture still succeeds and its
 image is still installed.

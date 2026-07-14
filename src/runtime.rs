@@ -54,7 +54,7 @@ use edgecommons::config::{
 };
 use edgecommons::facades::{AppFacade, EventsFacade, Severity};
 use edgecommons::messaging::Message;
-use edgecommons::platform::Platform;
+use edgecommons::platform::{Platform, Transport};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -834,6 +834,9 @@ pub struct CameraRuntime {
     /// caller holding one keeps the configuration it started with, which is the property the deep
     /// clone was really providing.
     config: RwLock<Arc<AdapterConfig>>,
+    /// What the resolved transport can carry, in previews. Fixed for the life of the process: the
+    /// transport is a startup argument, and a reload cannot change it.
+    thumbnail_policy: crate::thumbnail::ThumbnailPolicy,
     backend_context: BackendRuntimeContext,
     catalog: Catalog,
     admission: AdmissionController,
@@ -1328,6 +1331,12 @@ pub struct RuntimeServices {
     pub backend_context: BackendRuntimeContext,
     /// Component metric service. Capture counts ride the job hooks; queue levels are sampled.
     pub metrics: Arc<dyn edgecommons::metrics::MetricService>,
+    /// The RESOLVED messaging transport (`gg.args().transport`).
+    ///
+    /// What the component may put on the wire depends on what the wire can take, and only the
+    /// resolved transport knows. It decides the thumbnail policy: Greengrass IPC caps a whole
+    /// message at 10,000 bytes inside our own client library, and an MQTT broker does not.
+    pub transport: Transport,
 }
 
 fn capture_trigger_type(trigger: &crate::messages::CaptureTrigger) -> &'static str {
@@ -1504,6 +1513,7 @@ impl CameraRuntime {
             self.storage.clone(),
             Arc::new(AppTerminalAnnouncer::new(app)),
             Arc::clone(&self.waiters) as Arc<dyn JobHooks>,
+            self.thumbnail_policy,
         )
         .with_acceptance_hook(Arc::clone(&self.waiters) as Arc<dyn AcceptanceHook>)
     }
@@ -1526,7 +1536,9 @@ impl CameraRuntime {
             readiness,
             backend_context,
             metrics,
+            transport,
         } = services;
+        let thumbnail_policy = crate::thumbnail::ThumbnailPolicy::for_transport(transport);
         let metrics = Arc::new(crate::observability::CaptureMetrics::new(metrics));
         let health = Arc::new(crate::observability::FleetHealth::default());
         backend_context.validate_config(&config)?;
@@ -1565,13 +1577,18 @@ impl CameraRuntime {
                     resources.storage.clone(),
                     Arc::new(AppTerminalAnnouncer::new(Arc::clone(app))),
                     Arc::clone(&waiters) as Arc<dyn JobHooks>,
+                    thumbnail_policy,
                 )
                 .with_acceptance_hook(Arc::clone(&waiters) as Arc<dyn AcceptanceHook>),
             );
         }
+        // Once, here, and nowhere else: the operator is told that this transport cannot carry the
+        // preview they asked for, and what they are getting instead. Not per capture.
+        log_thumbnail_clamps(&config, thumbnail_policy);
 
         let runtime = Arc::new(Self {
             config: RwLock::new(Arc::new(config)),
+            thumbnail_policy,
             backend_context,
             health,
             catalog: resources.catalog,
@@ -2324,6 +2341,28 @@ pub struct StartupResources {
     pub admission: AdmissionController,
     /// Compact configured roster, including disabled cameras.
     pub registry: Arc<CameraRegistry>,
+}
+
+/// Tells the operator, ONCE per camera, that this transport cannot carry the preview they configured.
+///
+/// A clamp is a fact about the deployment, not an event: the same configuration is deployed to
+/// Greengrass and to Kubernetes, and on Greengrass a `large` preview simply cannot be put on the
+/// wire. Refusing to start would be a hostile way to say so, and saying it on every capture would
+/// bury it -- 45 captures an hour per camera, all reporting the same unchanging fact. So it is said
+/// here: at startup, and again after a reload, because a reload can introduce a new one.
+fn log_thumbnail_clamps(config: &AdapterConfig, policy: crate::thumbnail::ThumbnailPolicy) {
+    for notice in crate::thumbnail::clamp_notices(config, policy) {
+        tracing::warn!(
+            instance = %notice.instance,
+            profiles = %notice.profiles.join(", "),
+            transport = ?policy.transport(),
+            effective_size = ?notice.effective,
+            "the configured thumbnail size is not carryable on this transport, because {}; \
+             producing '{:?}' instead",
+            policy.limit_reason(),
+            notice.effective,
+        );
+    }
 }
 
 /// Resolves and validates all startup resources that are independent of live camera sessions.

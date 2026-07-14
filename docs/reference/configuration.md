@@ -90,7 +90,13 @@ object:
 ```
 
 `size` is `small`, `medium`, or `large`, bounding the thumbnail's **longest edge** at 160, 320, or 640
-pixels. The aspect ratio is preserved and a frame smaller than the bound is carried at its own size,
+pixels.
+
+What the messaging transport can carry decides which sizes are usable. On the **IPC** transport
+(`--platform GREENGRASS`) the component's Greengrass IPC client encodes a whole message into a fixed
+10,000-byte buffer, so only `small` is carried; a profile asking for `medium` or `large` is reduced to
+`small`, and the component says so once for each camera at startup. On the **MQTT** transport
+(`--platform HOST` and `--platform KUBERNETES`) all three sizes are carried. The aspect ratio is preserved and a frame smaller than the bound is carried at its own size,
 never enlarged. The thumbnail is always JPEG, whatever the profile's own output encoding, and it travels
 with the published capture result — it is not written to disk and not stored in the catalog. A thumbnail
 that cannot be rendered, or that will not fit the message's byte ceiling, is left out of the result; the
