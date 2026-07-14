@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use edgecommons::messaging::MessagingService;
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -13,6 +14,12 @@ use crate::catalog::{Catalog, OutboxRecord, OutboxStats};
 use crate::{CameraError, Result};
 
 const DEFAULT_BATCH: usize = 100;
+
+/// Confirmations a single pass may have outstanding at once.
+///
+/// Bounded because an unbounded fan-out at the design's batch size would hand a hundred simultaneous
+/// publishes to a broker that is already struggling, which is not help.
+const MAX_CONCURRENT_CONFIRMATIONS: usize = 16;
 const INITIAL_BACKOFF_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 60_000;
 const DELAYED_AGE_MS: u64 = 60_000;
@@ -258,16 +265,35 @@ where
             ..OutboxPass::default()
         };
         let mut last_error = None;
-        for record in records {
-            match self
+
+        // The batch used to be published ONE AT A TIME, each with a ten-second confirmation timeout.
+        // The nominal drain was about a hundred messages a second against the sixteen a second the
+        // design target produces -- a margin, but no headroom at all for a broker having a bad day.
+        // And the degenerate case is not exotic: a broker that accepts TCP and never PUBACKs turns one
+        // pass of a hundred records into a thousand seconds of waiting, in series, while the backlog
+        // behind it grows.
+        //
+        // Waiting for a broker is not work. These wait CONCURRENTLY now, bounded so a batch cannot
+        // open a hundred confirmations at once, and a slow message no longer holds up the ninety-nine
+        // behind it. The durable writes below stay in order and stay serial -- they are the part that
+        // must not race.
+        let confirmations = futures::stream::iter(records.into_iter().map(|record| async {
+            let result = self
                 .publisher
                 .publish_confirmed(
                     &record.topic,
                     &record.encoded_envelope,
                     self.confirmation_timeout,
                 )
-                .await
-            {
+                .await;
+            (record, result)
+        }))
+        .buffer_unordered(MAX_CONCURRENT_CONFIRMATIONS)
+        .collect::<Vec<_>>()
+        .await;
+
+        for (record, confirmation) in confirmations {
+            match confirmation {
                 Ok(()) => {
                     // A failed SQLite commit after PUBACK intentionally leaves the row pending;
                     // the next attempt reuses identical bytes and yields at-least-once delivery.
@@ -560,6 +586,80 @@ mod tests {
             seen[0].1,
             Duration::from_millis(250),
             "the latency is from the moment the message was written to the moment it was confirmed"
+        );
+    }
+
+    /// One slow message does not hold up the ninety-nine behind it.
+    ///
+    /// The batch was published strictly one at a time, each with a ten-second confirmation timeout. A
+    /// broker that accepts TCP and never PUBACKs therefore turned a pass of a hundred records into a
+    /// thousand seconds of waiting, in series, while the backlog behind it grew. Waiting for a broker
+    /// is not work, and it does not need a queue.
+    ///
+    /// Here every message takes 200 ms to confirm. Serially that is 2 seconds for ten of them; the
+    /// pass must take far less, because they wait together.
+    #[tokio::test]
+    async fn a_slow_broker_does_not_serialise_the_whole_batch() {
+        #[derive(Default)]
+        struct SlowPublisher {
+            in_flight: Mutex<usize>,
+            peak: Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl ConfirmedPublisher for SlowPublisher {
+            async fn publish_confirmed(
+                &self,
+                _topic: &str,
+                _envelope: &[u8],
+                _timeout: Duration,
+            ) -> Result<()> {
+                {
+                    let mut in_flight = self.in_flight.lock().unwrap();
+                    *in_flight += 1;
+                    let mut peak = self.peak.lock().unwrap();
+                    *peak = (*peak).max(*in_flight);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                *self.in_flight.lock().unwrap() -= 1;
+                Ok(())
+            }
+        }
+
+        let store = Arc::new(FakeStore::default());
+        {
+            let mut records = store.records.lock().unwrap();
+            for id in 0..10 {
+                let mut pending = record();
+                pending.id = id;
+                pending.event_key = format!("evt_{id}");
+                pending.envelope_uuid = format!("uuid_{id}");
+                records.push(pending);
+            }
+        }
+        let publisher = Arc::new(SlowPublisher::default());
+        let worker = OutboxPublisher::new(
+            store.clone(),
+            publisher.clone(),
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            1_000,
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let pass = worker.run_once().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(pass.delivered, 10);
+        assert!(
+            elapsed < Duration::from_millis(1_200),
+            "ten 200 ms confirmations took {elapsed:?}; in series they would take two seconds, and \
+             the point of the change is that they do not wait in series"
+        );
+        assert!(
+            *publisher.peak.lock().unwrap() > 1,
+            "the confirmations must actually overlap, or this passed for the wrong reason"
         );
     }
 

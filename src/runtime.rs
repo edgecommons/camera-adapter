@@ -207,6 +207,8 @@ struct OutboxHealthWatchers {
     pressure: watch::Receiver<OutboxPressure>,
     durability: watch::Receiver<OutboxDurability>,
     catalog_availability: watch::Receiver<crate::catalog::CatalogAvailability>,
+    /// Raised while the backlog has escalated, and read by the acceptance path.
+    escalated: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -705,6 +707,14 @@ pub struct CameraRuntime {
     scheduler: crate::dispatch::CaptureScheduler,
     cancellation: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Whether the outbox backlog has escalated.
+    ///
+    /// The flag existed and NOTHING SHED. It tripped at eighty thousand pending messages, raised an
+    /// alarm, and the component carried on accepting captures at full rate -- each one adding another
+    /// durable message to a queue that was already losing. There is no honest way to shed a durable
+    /// message: it is the record of a capture that happened, and dropping it loses data. The only
+    /// place load can be shed is where it is taken on.
+    outbox_escalated: Arc<AtomicBool>,
     connect_gate: Arc<Semaphore>,
     waiters: Arc<RuntimeJobHooks>,
     cursors: CursorStore,
@@ -1381,6 +1391,7 @@ impl CameraRuntime {
             scheduler,
             cancellation: CancellationToken::new(),
             tasks: Mutex::new(Vec::new()),
+            outbox_escalated: Arc::new(AtomicBool::new(false)),
             connect_gate: Arc::new(Semaphore::new(max_connection_attempts)),
             waiters: Arc::clone(&waiters),
             cursors: CursorStore::default(),
@@ -4059,6 +4070,17 @@ impl CameraRuntime {
     }
 
     async fn ensure_storage_capacity(&self) -> Result<()> {
+        // A capture the component cannot tell anyone about is not a capture. When the outbox has
+        // escalated, every new one adds a durable message to a queue that is already losing ground --
+        // and a durable message cannot be shed, because it is the record of something that happened.
+        // Backpressure at the intake is the only load-shedding that does not lose data, and it is what
+        // the escalation flag was raised for. It raised an alarm and nothing else.
+        if self.outbox_escalated.load(Ordering::Acquire) {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::ResourceLimit,
+                "the component cannot publish results as fast as it is being asked to produce them",
+            ));
+        }
         let Some(snapshot) = self.refresh_storage_pressure().await else {
             return Ok(());
         };
@@ -4432,6 +4454,7 @@ impl CameraRuntime {
             pressure: publisher.pressure(),
             durability: publisher.durability(),
             catalog_availability: self.catalog.availability(),
+            escalated: Arc::clone(&self.outbox_escalated),
         };
         let catalog = self.catalog.clone();
         let storage_pressure = self.storage_pressure.clone();
@@ -4482,6 +4505,7 @@ impl CameraRuntime {
                         return;
                     }
                     let current = watchers.pressure.borrow_and_update().clone();
+                    watchers.escalated.store(current.escalated, Ordering::Release);
                     if let Some(transition) = alarms.transition(&current) {
                         let result = match transition {
                             OutboxAlarmTransition::Raise(context) => events.raise_alarm(
@@ -7981,6 +8005,7 @@ mod tests {
                 scheduler,
                 cancellation: CancellationToken::new(),
                 tasks: Mutex::new(Vec::new()),
+                outbox_escalated: Arc::new(AtomicBool::new(false)),
                 connect_gate: Arc::new(Semaphore::new(1)),
                 waiters: Arc::clone(&waiters),
                 cursors: CursorStore::default(),
@@ -15694,6 +15719,71 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            runtime.shutdown().await;
+        }
+
+        /// An outbox that cannot keep up stops the component taking more work.
+        ///
+        /// The escalation flag existed, tripped at eighty thousand pending messages, raised an alarm --
+        /// and NOTHING SHED. The component carried on accepting captures at full rate, each one adding
+        /// another durable message to a queue that was already losing ground.
+        ///
+        /// There is no honest way to shed a durable message: it is the record of a capture that
+        /// actually happened, and dropping it loses data an operator was promised. The only place load
+        /// can be shed is where it is taken on, and a capture nobody can be told about is not a
+        /// capture.
+        #[tokio::test]
+        async fn a_drowning_outbox_refuses_new_captures_rather_than_making_it_worse() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+
+            runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "before-the-flood".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "shed-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .expect("a healthy component takes work");
+
+            // The outbox escalates: it cannot publish results as fast as they are being produced.
+            runtime.outbox_escalated.store(true, Ordering::Release);
+
+            let error = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "during-the-flood".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "shed-correlation-2".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .expect_err("a component that cannot publish must not keep producing");
+            assert_eq!(error.code(), crate::ErrorCode::ResourceLimit);
+
+            // And it takes work again the moment it recovers -- shedding is backpressure, not a fuse.
+            runtime.outbox_escalated.store(false, Ordering::Release);
+            runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "after-the-flood".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "shed-correlation-3".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .expect("a recovered component takes work again");
             runtime.shutdown().await;
         }
 
