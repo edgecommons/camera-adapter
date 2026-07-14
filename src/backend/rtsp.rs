@@ -771,6 +771,14 @@ struct EncodedAccessUnit {
     rtp_timestamp: u32,
     compressed_bytes: u64,
     dimensions: Option<(u32, u32)>,
+    /// This access unit is a random-access point: a decoder handed this unit first, with no history,
+    /// can start producing pictures from it.
+    ///
+    /// H.264 signals one with an IDR (NAL 5). H.265 signals one with any IRAP (NAL 16..=23), and
+    /// **that set is mostly not IDRs** -- x265, and every encoder that defaults to an open GOP, marks
+    /// its random-access points with a CRA (NAL 21) and emits no IDR at all, ever. Code that waits
+    /// for an IDR on an H.265 stream waits forever.
+    random_access: bool,
 }
 
 #[derive(Debug)]
@@ -790,6 +798,7 @@ struct AccessUnitAssembler {
     fragment: Option<FragmentState>,
     bytes: Vec<u8>,
     has_vcl: bool,
+    has_random_access: bool,
     bootstrap_nals: Vec<Vec<u8>>,
     bootstrap_pending: bool,
     bootstrap_injected_for_unit: bool,
@@ -814,6 +823,7 @@ impl AccessUnitAssembler {
             fragment: None,
             bytes: Vec::new(),
             has_vcl: false,
+            has_random_access: false,
             bootstrap_nals: track.bootstrap_nals.clone(),
             bootstrap_pending: !track.bootstrap_nals.is_empty(),
             bootstrap_injected_for_unit: false,
@@ -877,9 +887,9 @@ impl AccessUnitAssembler {
             .ok_or_else(|| security_error("complete RTP access unit has no timestamp"))?;
         self.expected_sequence = None;
         self.has_vcl = false;
+        let random_access = std::mem::take(&mut self.has_random_access);
         if self.bootstrap_injected_for_unit {
             self.bootstrap_pending = false;
-            self.bootstrap_nals.clear();
             self.bootstrap_injected_for_unit = false;
         }
         let bytes = std::mem::take(&mut self.bytes);
@@ -889,6 +899,7 @@ impl AccessUnitAssembler {
             rtp_timestamp: timestamp,
             compressed_bytes,
             dimensions: self.dimensions,
+            random_access,
         }))
     }
 
@@ -930,7 +941,7 @@ impl AccessUnitAssembler {
                         return Err(security_error("H.264 FU-A fragments overlap"));
                     }
                     let vcl = (1..=5).contains(&(reconstructed & 0x1f));
-                    self.inject_bootstrap_before_vcl(vcl)?;
+                    self.begin_vcl(vcl, reconstructed & 0x1f == 5)?;
                     self.append_start_code()?;
                     let nal_offset = self.bytes.len();
                     self.append_bytes(&[reconstructed])?;
@@ -1012,7 +1023,10 @@ impl AccessUnitAssembler {
                         return Err(security_error("H.265 FU fragments overlap"));
                     }
                     let vcl = reconstructed_type <= 31;
-                    self.inject_bootstrap_before_vcl(vcl)?;
+                    // A CRA (21) is an IRAP and is the ONLY random-access point an open-GOP H.265
+                    // encoder ever emits. It is also large enough that it always arrives here, in
+                    // fragments -- never through `append_nal`.
+                    self.begin_vcl(vcl, (16..=23).contains(&reconstructed_type))?;
                     self.append_start_code()?;
                     let nal_offset = self.bytes.len();
                     self.append_bytes(&reconstructed)?;
@@ -1052,8 +1066,43 @@ impl AccessUnitAssembler {
         }
     }
 
+    /// Is this VCL NAL a random-access point -- one a decoder with no history can start from?
+    ///
+    /// H.264: an IDR (NAL 5). H.265: any IRAP (NAL 16..=23), which is *not* mostly IDRs -- an
+    /// open-GOP encoder such as x265 marks every random-access point with a CRA (NAL 21) and never
+    /// emits an IDR in its life.
+    fn nal_is_random_access(&self, nal: &[u8]) -> bool {
+        match self.codec {
+            RtspCodec::H264 => nal.first().is_some_and(|byte| byte & 0x1f == 5),
+            RtspCodec::H265 => nal.len() >= 2 && (16..=23).contains(&((nal[0] >> 1) & 0x3f)),
+        }
+    }
+
+    /// Everything that must happen in front of a VCL NAL, whether it arrived whole or in fragments.
+    ///
+    /// There are THREE ways a VCL NAL enters this assembler -- single, aggregated (STAP-A/AP), and
+    /// fragmented (FU-A/FU) -- and only the first went through `append_nal`. The other two called
+    /// `inject_bootstrap_before_vcl` by hand. That split is why the first cut of this fix did
+    /// nothing: a keyframe is the biggest picture in the stream and is therefore *always*
+    /// fragmented, so a random-access flag set only in `append_nal` never once saw a keyframe.
+    fn begin_vcl(&mut self, vcl: bool, random_access: bool) -> Result<()> {
+        if vcl && random_access {
+            self.has_random_access = true;
+            // Re-arm the bootstrap so it rides in front of THIS unit too, not only the first one.
+            //
+            // A decoder that restarts here needs the parameter sets, and a camera that advertises
+            // them only in the SDP (`sprop-vps`/`sprop-sps`/`sprop-pps`) will never send them again
+            // for as long as the session lives. Injecting them ahead of every random-access point is
+            // what `h264parse config-interval=-1` does, for the same reason, and it costs a few
+            // dozen bytes per keyframe.
+            self.bootstrap_pending = !self.bootstrap_nals.is_empty();
+        }
+        self.inject_bootstrap_before_vcl(vcl)
+    }
+
     fn append_nal(&mut self, nal: &[u8], vcl: bool) -> Result<()> {
-        self.inject_bootstrap_before_vcl(vcl)?;
+        let random_access = self.nal_is_random_access(nal);
+        self.begin_vcl(vcl, random_access)?;
         self.observe_nal(nal)?;
         self.append_start_code()?;
         self.append_bytes(nal)?;
@@ -1115,6 +1164,7 @@ impl AccessUnitAssembler {
     }
 
     fn discard_incomplete(&mut self) {
+        self.has_random_access = false;
         if !self.bytes.is_empty() || self.fragment.is_some() {
             self.incomplete_units = self.incomplete_units.saturating_add(1);
         }
@@ -1477,6 +1527,7 @@ struct GstreamerDecoder {
     source: AppSrc,
     sink: AppSink,
     codec: RtspCodec,
+    maximum_bytes: u64,
     next_pts: u64,
     pending: BTreeMap<u64, PendingDecoderUnit>,
     recently_terminal_pts: VecDeque<u64>,
@@ -1546,10 +1597,33 @@ impl GstreamerDecoder {
             source,
             sink,
             codec,
+            maximum_bytes,
             next_pts: 1,
             pending: BTreeMap::new(),
             recently_terminal_pts: VecDeque::new(),
         })
+    }
+
+    /// Throw this decoder away and stand a fresh one up in its place.
+    ///
+    /// A warm session stops feeding the decoder between captures (that is the whole point of warm:
+    /// it refuses to decode pictures nobody asked for). When a capture arrives, the decoder is
+    /// therefore holding a reference chain with a hole punched through it, and no amount of feeding
+    /// it more pictures will heal that -- it has to begin again.
+    ///
+    /// The comment that used to sit on the warm path said the decoder "emits nothing until the
+    /// stream's next IDR". That is true of H.264. It is false of H.265, where an open-GOP encoder
+    /// emits CRAs and never an IDR, so the wait was unbounded and every warm H.265 capture died on
+    /// its deadline. A decoder restarted here, and then handed a CRA as its FIRST picture, treats it
+    /// as a clean start (`NoRaslOutputFlag`), discards the RASL pictures that hang off it, and
+    /// produces a frame -- which is exactly what a mid-stream CRA cannot do to a decoder that still
+    /// remembers the pictures before the hole.
+    fn restart(&mut self) -> Result<()> {
+        let fresh = Self::new(self.codec, self.maximum_bytes)?;
+        // Dropping the old one sets it to `Null`, which joins its streaming threads. This runs on a
+        // blocking thread (see `restart_decoder_bounded`), which is where that is allowed to happen.
+        drop(std::mem::replace(self, fresh));
+        Ok(())
     }
 
     fn push_and_pull(
@@ -1836,6 +1910,40 @@ async fn create_decoder_bounded(
         _ = cancellation.cancelled() => Err(cancelled_error("decoder creation")),
         _ = tokio::time::sleep_until(deadline) => Err(timeout_error("decoder creation")),
         result = &mut creation => result.map_err(|_| backend_error("GStreamer creation task failed"))?,
+    }
+}
+
+/// Restart a decoder that has been starved of pictures, under the same gate and deadline as any
+/// other blocking GStreamer call.
+#[cfg(feature = "rtsp")]
+async fn restart_decoder_bounded(
+    decoder: &Arc<Mutex<GstreamerDecoder>>,
+    deadline: Instant,
+    decode_gate: &Arc<Semaphore>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let permit = Arc::clone(decode_gate).acquire_owned();
+    tokio::pin!(permit);
+    let permit = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(cancelled_error("decoder admission")),
+        _ = tokio::time::sleep_until(deadline) => return Err(timeout_error("decoder admission")),
+        result = &mut permit => result.map_err(|_| security_error("GStreamer limiter was closed"))?,
+    };
+    let decoder = Arc::clone(decoder);
+    let restart = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decoder
+            .lock()
+            .map_err(|_| backend_error("GStreamer decoder lock was poisoned"))?
+            .restart()
+    });
+    tokio::pin!(restart);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(cancelled_error("decoder restart")),
+        _ = tokio::time::sleep_until(deadline) => Err(timeout_error("decoder restart")),
+        result = &mut restart => result.map_err(|_| backend_error("GStreamer restart task failed"))?,
     }
 }
 
@@ -3212,6 +3320,13 @@ async fn run_rtsp_worker(
     // `ready_at` is exactly the interest instant, so this is all that is needed to answer "is
     // anybody still waiting for a frame?" -- see `capture` above.
     let mut delivered_at: Option<Instant> = None;
+    // The decoder has been starved: this worker assembled access units and threw them away because
+    // nobody was waiting for a picture, so the decoder's reference chain now has a hole in it.
+    let mut decoder_starved = false;
+    // The decoder has just been restarted and holds no history at all, so the only unit it can start
+    // from is a random-access point. Feeding it anything else burns a decode permit to produce
+    // nothing.
+    let mut awaiting_random_access = false;
     let run_result = async {
         loop {
             let operation_deadline = match session_policy {
@@ -3265,13 +3380,42 @@ async fn run_rtsp_worker(
             // out of the gate; a dozen warm cameras could starve the capture path outright.
             //
             // Skipping the decode leaves the GStreamer decoder without the intervening reference
-            // frames, so on the next capture it emits nothing until the stream's next IDR --
-            // `push_and_pull` already reports that as `Ok(None)` and the loop simply waits. A warm
-            // capture therefore costs up to one GOP rather than one frame. That is the deliberate
-            // trade: warm sessions keep the expensive things (the RTSP session, the negotiated
-            // track, the built pipeline) and stop paying to decode pictures nobody asked for.
+            // frames. It cannot be healed by feeding it more pictures -- it has to begin again from a
+            // random-access point, which is what the two steps below do. A warm capture therefore
+            // costs a decoder restart plus up to one GOP, rather than one frame. That is the
+            // deliberate trade: warm sessions keep the expensive things (the RTSP session, the
+            // negotiated track) and stop paying to decode pictures nobody asked for.
+            //
+            // THIS USED TO SAY the decoder "emits nothing until the stream's next IDR", and simply
+            // waited. That is true of H.264 and FALSE OF H.265: an open-GOP encoder -- x265, and the
+            // default of most cameras -- marks its random-access points with a CRA (NAL 21) and emits
+            // no IDR in its life. So the wait was unbounded, and EVERY warm H.265 capture after the
+            // first one died on its deadline. The live fixture that proves it runs only in the
+            // simulator harness, which was itself broken; nothing in CI compiles this file's decode
+            // path against a real stream.
             if !capture_is_waiting(*interest.borrow(), delivered_at) {
+                decoder_starved = true;
                 continue;
+            }
+            if decoder_starved {
+                restart_decoder_bounded(
+                    &decoder,
+                    operation_deadline,
+                    &decode_gate,
+                    &cancellation,
+                )
+                .await?;
+                decoder_starved = false;
+                awaiting_random_access = true;
+            }
+            if awaiting_random_access {
+                // A decoder with no history can only start at a random-access point. Anything else
+                // references pictures it has never seen, so it would spend a decode permit and
+                // produce nothing.
+                if !unit.random_access {
+                    continue;
+                }
+                awaiting_random_access = false;
             }
             let ingested_at = Instant::now();
             let Some(frame) = decode_bounded(
@@ -3784,6 +3928,108 @@ mod tests {
             bootstrap_nals,
             ..track(codec)
         }
+    }
+
+    /// An open-GOP H.265 encoder emits NO IDR. Ever. Its random-access point is a CRA (NAL 21), and
+    /// a keyframe is the largest picture in the stream, so it always arrives FRAGMENTED.
+    ///
+    /// Both halves of that sentence are load-bearing, and both were wrong in the shipped code. The
+    /// warm path waited for "the stream's next IDR", which on x265 never comes; and the first fix
+    /// marked random-access points only in `append_nal`, which a fragmented NAL never reaches. Either
+    /// mistake alone makes every warm H.265 capture after the first one die on its deadline.
+    #[test]
+    fn an_h265_keyframe_is_a_fragmented_cra_and_it_is_still_a_place_to_start() {
+        let h265 = track(RtspCodec::H265);
+        let mut assembler = AccessUnitAssembler::new(&h265, 4096).unwrap();
+        // A CRA (21) split across two FU packets (type 49): S, then E.
+        let start = rtp(1, 10, false, 96, &[49 << 1, 1, 0x80 | 21, 0xaa]);
+        let end = rtp(2, 10, true, 96, &[49 << 1, 1, 0x40 | 21, 0xbb]);
+        assert!(
+            assembler
+                .push(parse_rtp_packet(&start).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let complete = assembler
+            .push(parse_rtp_packet(&end).unwrap())
+            .unwrap()
+            .expect("complete fragmented H.265 CRA");
+        assert!(
+            complete.random_access,
+            "a fragmented CRA is a random-access point -- it is the only one an open-GOP H.265 \
+             stream ever offers, and a decoder that will not start at it never starts at all"
+        );
+    }
+
+    /// The other side of the same contract: a picture that references pictures a restarted decoder
+    /// has never seen is NOT a place to start, and offering it as one would hand the decoder a frame
+    /// it cannot decode and call the capture served.
+    #[test]
+    fn a_picture_that_needs_history_is_not_a_place_to_start() {
+        let h265 = track(RtspCodec::H265);
+        let mut assembler = AccessUnitAssembler::new(&h265, 4096).unwrap();
+        let trail = rtp(1, 10, true, 96, &[1 << 1, 1, 0x02]);
+        let complete = assembler
+            .push(parse_rtp_packet(&trail).unwrap())
+            .unwrap()
+            .expect("complete H.265 TRAIL_R");
+        assert!(!complete.random_access, "TRAIL_R depends on earlier pictures");
+
+        let h264 = track(RtspCodec::H264);
+        let mut assembler = AccessUnitAssembler::new(&h264, 4096).unwrap();
+        let inter = rtp(1, 10, true, 96, &[0x41, 0x02]);
+        let complete = assembler
+            .push(parse_rtp_packet(&inter).unwrap())
+            .unwrap()
+            .expect("complete H.264 non-IDR");
+        assert!(!complete.random_access, "a P picture depends on earlier pictures");
+
+        // ...and H.264's random-access point, the IDR, still is one -- including fragmented.
+        let mut assembler = AccessUnitAssembler::new(&h264, 4096).unwrap();
+        let start = rtp(1, 11, false, 96, &[0x7c, 0x85, 0x03]);
+        let end = rtp(2, 11, true, 96, &[0x7c, 0x45, 0x04]);
+        assembler.push(parse_rtp_packet(&start).unwrap()).unwrap();
+        let complete = assembler
+            .push(parse_rtp_packet(&end).unwrap())
+            .unwrap()
+            .expect("complete fragmented H.264 IDR");
+        assert!(complete.random_access, "a fragmented IDR is a random-access point");
+    }
+
+    /// The parameter sets must ride in front of EVERY random-access point, not only the first one.
+    ///
+    /// A decoder restarted at the second keyframe of a session needs the VPS/SPS/PPS as much as one
+    /// starting at the first, and a camera that advertises them only in the SDP
+    /// (`sprop-vps`/`sprop-sps`/`sprop-pps`) will never send them again for as long as the session
+    /// lives. The assembler used to inject them once and then `clear()` them, which left every later
+    /// restart facing a keyframe it had no parameters to decode.
+    #[test]
+    fn the_parameter_sets_ride_in_front_of_every_random_access_point_not_only_the_first() {
+        let vps = vec![32 << 1, 1, 0xaa];
+        let track = track_with_bootstrap(RtspCodec::H265, vec![vps.clone()]);
+        let mut assembler = AccessUnitAssembler::new(&track, 4096).unwrap();
+
+        let first = rtp(1, 10, true, 96, &[21 << 1, 1, 0x02]);
+        let complete = assembler
+            .push(parse_rtp_packet(&first).unwrap())
+            .unwrap()
+            .expect("first H.265 CRA");
+        assert!(complete.random_access);
+        assert!(
+            complete.bytes.windows(vps.len()).any(|window| window == vps.as_slice()),
+            "the first keyframe carries the SDP parameter sets"
+        );
+
+        let second = rtp(2, 20, true, 96, &[21 << 1, 1, 0x03]);
+        let complete = assembler
+            .push(parse_rtp_packet(&second).unwrap())
+            .unwrap()
+            .expect("second H.265 CRA");
+        assert!(complete.random_access);
+        assert!(
+            complete.bytes.windows(vps.len()).any(|window| window == vps.as_slice()),
+            "and so does EVERY later keyframe -- a decoder restarted here has no parameters otherwise"
+        );
     }
 
     #[test]
