@@ -1749,6 +1749,60 @@ mod tests {
         actor_task.await.unwrap().unwrap();
     }
 
+    /// An actor serves exactly one camera, and only while it is up.
+    ///
+    /// `reserve` is the fleet scheduler's two-phase handshake: capacity is taken here, BEFORE the
+    /// descriptor leaves the queue, so a refusal has to be a refusal -- the caller still holds the
+    /// work and can put it back. Both guards protect that.
+    ///
+    /// The instance check is not paranoia about a typo. The scheduler looks an actor up by camera id
+    /// and a reload swaps actors underneath it, so the handle it holds can belong to a camera that is
+    /// no longer the one it thinks it is. Reserving anyway would hand `camera-b`'s capture to
+    /// `camera-a`'s session -- a frame taken by the wrong physical camera, filed under the right
+    /// capture id, and reported as a success. Nothing downstream could ever detect that.
+    ///
+    /// The accepting check is the shutdown counterpart: an actor that has drained its queue and closed
+    /// its session must not accept a descriptor it will never run, because the reservation is what
+    /// makes the scheduler let go of it.
+    #[tokio::test]
+    async fn an_actor_reserves_for_its_own_camera_only_and_for_none_once_it_has_stopped() {
+        let harness = harness(sim(1, false, false), 2, 2, false, false).await;
+
+        let misrouted = harness
+            .handle
+            .reserve("cam-b")
+            .err()
+            .expect("a capture for another camera must never be run by this one");
+        assert_eq!(misrouted.code(), ErrorCode::UnknownInstance);
+        assert_eq!(
+            harness.handle.queued_captures(),
+            0,
+            "a refused reservation must not have taken a capture slot with it"
+        );
+
+        drop(
+            harness
+                .handle
+                .reserve("cam-a")
+                .expect("its own camera is exactly what this actor is for"),
+        );
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        harness
+            .actor
+            .run(shutdown)
+            .await
+            .expect("a cancelled actor stops cleanly");
+
+        let stopped = harness
+            .handle
+            .reserve("cam-a")
+            .err()
+            .expect("an actor that has closed its session cannot promise to run anything");
+        assert_eq!(stopped.code(), ErrorCode::ComponentStopping);
+    }
+
     #[tokio::test]
     async fn backend_panic_is_terminalized_and_isolated_to_its_actor() {
         let mut harness = harness(sim(1, false, false), 2, 2, false, false).await;

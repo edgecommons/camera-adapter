@@ -657,6 +657,179 @@ mod tests {
         );
     }
 
+    /// A protocol call that reaches the camera the moment it is polled, and is answered at once.
+    ///
+    /// `reached_camera` is the assertion these tests actually turn on: once a `ContinuousMove` has
+    /// left the adapter, a physical camera is moving, and no amount of dropping the future takes that
+    /// back.
+    async fn commands_the_camera(
+        reached_camera: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<PtzResult> {
+        reached_camera.store(true, std::sync::atomic::Ordering::Release);
+        Ok(PtzResult::Commanded)
+    }
+
+    /// A protocol call that reaches the camera and then takes an hour to answer.
+    ///
+    /// Real ONVIF devices do stall -- a wedged web server, a lost TCP connection with no RST. This is
+    /// that camera.
+    async fn commands_a_camera_that_stalls(
+        reached_camera: Arc<tokio::sync::Notify>,
+    ) -> Result<PtzResult> {
+        reached_camera.notify_one();
+        tokio::time::sleep(Duration::from_secs(3_600)).await;
+        Ok(PtzResult::Commanded)
+    }
+
+    /// A PTZ operation whose caller has already given up must never reach the camera.
+    ///
+    /// The pre-flight check is not redundant with the `select!` that follows it, and the asymmetry is
+    /// the whole point of the bound: cancelling a future only *drops* it. It does not reach across a
+    /// socket to un-issue a protocol call, so a `ContinuousMove` that has already left the adapter has
+    /// already moved a physical camera. The only cancellation that can honestly be honoured is one
+    /// observed BEFORE the call is made -- which is what this arm is, and why it reports the distinct
+    /// "before execution" detail rather than the in-flight one.
+    #[tokio::test]
+    async fn bounded_ptz_refuses_an_already_cancelled_operation_before_it_reaches_the_camera() {
+        let reached_camera = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = bounded_ptz(
+            commands_the_camera(Arc::clone(&reached_camera)),
+            Instant::now() + Duration::from_secs(30),
+            &cancellation,
+        )
+        .await
+        .expect_err("a PTZ operation whose caller has already cancelled must not be run");
+
+        assert_eq!(error.code(), crate::ErrorCode::CaptureCancelled);
+        assert!(
+            error.to_string().contains("before execution"),
+            "the caller must be told the camera was never commanded, not merely that the operation \
+             was cancelled: {error}"
+        );
+        assert!(
+            !reached_camera.load(std::sync::atomic::Ordering::Acquire),
+            "a cancelled PTZ operation that still moves the camera is the failure this guards"
+        );
+    }
+
+    /// A deadline that has already passed is a deadline, not a suggestion.
+    ///
+    /// The actor hands down a deadline that was computed upstream -- it can already be in the past by
+    /// the time a control is popped from a queue it waited in. Issuing the protocol call anyway would
+    /// let a PTZ command run against a budget that no longer exists, holding the camera's only session
+    /// past the point at which the caller stopped waiting for it.
+    #[tokio::test]
+    async fn bounded_ptz_refuses_an_operation_whose_deadline_has_already_passed() {
+        let reached_camera = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let error = bounded_ptz(
+            commands_the_camera(Arc::clone(&reached_camera)),
+            Instant::now() - Duration::from_millis(1),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a PTZ operation with an elapsed deadline must not be run");
+
+        assert_eq!(error.code(), crate::ErrorCode::PtzTimeout);
+        assert!(
+            !reached_camera.load(std::sync::atomic::Ordering::Acquire),
+            "an expired PTZ operation must not still be issued to the camera"
+        );
+    }
+
+    /// A backend that does not cooperate cannot keep its camera actor blocked.
+    ///
+    /// The actor is single-threaded per camera: whatever is awaiting the session holds it, and every
+    /// other capture and control for that camera waits behind it. A protocol call that never returns
+    /// would therefore wedge the camera permanently, which is exactly why the trait has no unbounded
+    /// PTZ variant left to reach for.
+    #[tokio::test]
+    async fn bounded_ptz_cancels_an_operation_that_is_already_in_flight() {
+        let cancellation = CancellationToken::new();
+        let reached_camera = Arc::new(tokio::sync::Notify::new());
+        let stalled = Arc::clone(&reached_camera);
+        let token = cancellation.clone();
+
+        let bounded = tokio::spawn(async move {
+            bounded_ptz(
+                commands_a_camera_that_stalls(stalled),
+                Instant::now() + Duration::from_secs(3_600),
+                &token,
+            )
+            .await
+        });
+
+        reached_camera.notified().await;
+        cancellation.cancel();
+
+        let error = bounded
+            .await
+            .expect("the bounded PTZ task must not panic")
+            .expect_err("a cancelled in-flight PTZ operation must not hang its camera actor");
+        assert_eq!(error.code(), crate::ErrorCode::CaptureCancelled);
+        assert!(
+            !error.to_string().contains("before execution"),
+            "the camera WAS commanded here; reporting otherwise would tell an operator the opposite \
+             of what happened: {error}"
+        );
+    }
+
+    /// The deadline ends a stalled protocol call even when nobody cancels it.
+    ///
+    /// Cancellation needs someone to notice. The deadline does not, and it is the arm that protects
+    /// the camera actor from a backend that is simply never going to answer.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_ptz_times_out_an_operation_that_outlives_its_deadline() {
+        let error = bounded_ptz(
+            commands_a_camera_that_stalls(Arc::new(tokio::sync::Notify::new())),
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a PTZ operation that never returns must be ended by its deadline");
+
+        assert_eq!(error.code(), crate::ErrorCode::PtzTimeout);
+    }
+
+    /// The bound is transparent to an operation that finishes inside it.
+    ///
+    /// This is the case the other four are measured against, and it is not a formality: a wrapper that
+    /// rejected a *slow* PTZ call -- one that is merely slower than a snapshot, and well inside the
+    /// deadline it was given -- would break every camera with a real pan/tilt head on it, while every
+    /// negative test above still passed.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_ptz_returns_the_cameras_own_answer_when_it_arrives_inside_the_bounds() {
+        let cancellation = CancellationToken::new();
+        let reached_camera = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        assert_eq!(
+            bounded_ptz(
+                commands_the_camera(Arc::clone(&reached_camera)),
+                Instant::now() + Duration::from_secs(30),
+                &cancellation,
+            )
+            .await
+            .expect("an operation that answers at once must not be interfered with"),
+            PtzResult::Commanded
+        );
+        assert!(reached_camera.load(std::sync::atomic::Ordering::Acquire));
+
+        assert_eq!(
+            bounded_ptz(
+                commands_a_camera_that_stalls(Arc::new(tokio::sync::Notify::new())),
+                Instant::now() + Duration::from_secs(7_200),
+                &cancellation,
+            )
+            .await
+            .expect("a slow camera inside its deadline is a slow camera, not a failed one"),
+            PtzResult::Commanded,
+            "an hour-long PTZ call given a two-hour deadline must be allowed to finish"
+        );
+    }
+
     #[cfg(feature = "onvif")]
     #[test]
     fn runtime_context_rejects_onvif_secret_references_without_edgecommons_credentials() {

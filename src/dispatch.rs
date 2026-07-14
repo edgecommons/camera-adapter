@@ -411,3 +411,98 @@ pub use crate::admission::CapturePriority as SchedulerPriority;
 
 #[allow(dead_code)]
 const fn _priority_is_used(_: CapturePriority) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fleet queue with no room in it is a component that accepts nothing, silently.
+    ///
+    /// `CaptureScheduler` is the *only* way in for every capture the component will ever run, so a
+    /// zero bound here is not a smaller queue -- it is a component that starts, reports itself
+    /// healthy, publishes heartbeats, and rejects every capture an operator submits with
+    /// `QUEUE_FULL`. The queue refuses to be built at all instead, which turns a silent misconfiguration
+    /// into a startup failure that names the reason.
+    #[test]
+    fn a_fleet_queue_with_no_room_in_it_refuses_to_be_built() {
+        for (limits, bound) in [
+            (
+                LimitsConfig {
+                    max_pending_captures: 0,
+                    ..LimitsConfig::default()
+                },
+                "the fleet-wide bound",
+            ),
+            (
+                LimitsConfig {
+                    max_queued_captures_per_camera: 0,
+                    ..LimitsConfig::default()
+                },
+                "the per-camera bound",
+            ),
+        ] {
+            let error = CaptureScheduler::new(&limits)
+                .err()
+                .unwrap_or_else(|| panic!("{bound} of zero must not produce a usable queue"));
+            assert_eq!(
+                error.code(),
+                ErrorCode::InvalidRequest,
+                "{bound} of zero is a configuration fault, not a runtime rejection"
+            );
+        }
+
+        // The configured default must build, or the two refusals above prove nothing at all.
+        let limits = LimitsConfig::default();
+        let scheduler = CaptureScheduler::new(&limits).expect("the shipped limits must be usable");
+        assert_eq!(scheduler.capacity(), limits.max_pending_captures);
+        assert_eq!(
+            scheduler.capacity_per_camera(),
+            limits.max_queued_captures_per_camera
+        );
+        assert_eq!(scheduler.pending(), 0);
+        assert_eq!(scheduler.pending_for("cam-a"), 0);
+    }
+
+    /// If the scheduler cannot see which cameras are live, no camera is admissible.
+    ///
+    /// `online` is a `std::sync::RwLock`, so a thread that panics while holding it poisons it for the
+    /// rest of the process. The two readers fail *closed* on purpose. A capture that is not admitted
+    /// stays in the queue, holding its slot, and is offered again -- which costs latency and nothing
+    /// else. The alternatives are both worse: unwrapping would panic the one task that drains the
+    /// fleet queue (every camera stops, permanently), and assuming a camera is present would hand a
+    /// descriptor to an actor the scheduler can no longer prove exists, stranding the capture off the
+    /// queue and owned by nobody.
+    #[test]
+    fn a_poisoned_camera_map_makes_every_camera_inadmissible_rather_than_dispatching_blind() {
+        let scheduler =
+            CaptureScheduler::new(&LimitsConfig::default()).expect("the shipped limits are usable");
+
+        let inner = Arc::clone(&scheduler.inner);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoner = std::thread::spawn(move || {
+            let _held = inner.online.write().expect("the map is not yet poisoned");
+            panic!("a thread died holding the online-camera map");
+        })
+        .join();
+        std::panic::set_hook(previous);
+
+        assert!(
+            poisoner.is_err(),
+            "the poisoning thread must actually panic"
+        );
+        assert!(
+            scheduler.inner.online.read().is_err(),
+            "the online-camera map must really be poisoned, or this test proves nothing"
+        );
+
+        assert!(
+            !scheduler.admissible("cam-a"),
+            "a camera the scheduler cannot see must not be handed work"
+        );
+        assert!(
+            scheduler.actor("cam-a").is_none(),
+            "and it must not produce an actor handle it cannot prove is current"
+        );
+    }
+}

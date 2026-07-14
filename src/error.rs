@@ -327,6 +327,46 @@ mod tests {
         );
     }
 
+    /// A parse failure names the component's own internals; an operator gets told none of them.
+    ///
+    /// `serde_json`'s `Display` is written for a developer holding the document -- "expected value at
+    /// line 3 column 17", "unknown field `sha256`" -- and `FailureSummary.message` is broadcast to
+    /// every subscriber on the UNS bus. `Json` is the variant a malformed recovery record and a
+    /// malformed request both arrive as, so it is the one most likely to be carrying the shape of a
+    /// durable row when it lands on the wire.
+    ///
+    /// The counterpart is the other half of the contract, and it is the reason `operator_detail` is a
+    /// match and not a blanket redaction: a `Config` error is a sentence this codebase wrote FOR an
+    /// operator, naming the configuration path they must go and fix. Redacting that would leave them
+    /// with a component that refuses to start and no way to learn why.
+    #[test]
+    fn a_foreign_parse_error_is_generic_while_an_authored_configuration_detail_is_not() {
+        let json = CameraError::Json(
+            serde_json::from_str::<serde_json::Value>(r#"{"expectedSha256": }"#)
+                .expect_err("intentionally malformed JSON"),
+        );
+        let detail = json.operator_detail();
+        assert_eq!(detail, "a request or record could not be parsed");
+        assert!(
+            !detail.contains("column") && !detail.contains("expectedSha256"),
+            "serde's developer-facing detail must not be broadcast to the fleet: {detail}"
+        );
+        assert!(
+            json.to_string().starts_with("JSON error:"),
+            "the log still gets the whole truth -- that is what Display is for"
+        );
+
+        let config = CameraError::Config {
+            path: "component.instances[0].backend".to_owned(),
+            message: "mediaProfile is required".to_owned(),
+        };
+        assert_eq!(
+            config.operator_detail(),
+            "configuration error at component.instances[0].backend: mediaProfile is required",
+            "an operator who must go and fix a configuration path has to be told which one"
+        );
+    }
+
     #[test]
     fn public_codes_and_internal_error_categories_map_stably() {
         assert_eq!(

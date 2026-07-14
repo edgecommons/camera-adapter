@@ -4854,6 +4854,244 @@ mod tests {
         );
     }
 
+    /// A self-signed CA, valid until 2126. Nothing connects to it -- it only has to be a real
+    /// certificate, because the code under test parses it.
+    const TEST_CA_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIIDJTCCAg2gAwIBAgIUXQLMJIHNs1dimp6pKLD7Sh6kAxUwDQYJKoZIhvcNAQEL
+BQAwITEfMB0GA1UEAwwWY2FtZXJhLWFkYXB0ZXItdGVzdC1jYTAgFw0yNjA3MTQw
+NDMyMDRaGA8yMTI2MDYyMDA0MzIwNFowITEfMB0GA1UEAwwWY2FtZXJhLWFkYXB0
+ZXItdGVzdC1jYTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANvNVlGx
+9XyS10ojUtyx0BSYWpx7nwvw0ToiTPvCDKdoeAX12IwY5Zr6Tuj8+Sj8rnzqloYA
+6aJX1ydGy6HjzjygxTUo2o/6V1X7UCk1h0VdRWP1hXqY5pCQdYhfefBIwT4LkoZC
+AgfnO/WoUXRVP+s7dtFEem8mFDZsfW6fNMBlQPeb6a96rrDUHa5aZfDrG2AKq7gF
+MqjSSgEm6oICdopEvM312z3m0L38/UILEWO/HDc8tmqI2jwGmTmqDx6c8yn9TrBy
+cJuZVgmXQS2470yV7jL+nkrAnedw9Et3AdTTYmtfc0xYfyWZp50VqDBDlwP5VeJR
+9NKOd4WEo4Eg6G0CAwEAAaNTMFEwHQYDVR0OBBYEFOoUND3o4j6sQstQHFL9fyJc
+R+9PMB8GA1UdIwQYMBaAFOoUND3o4j6sQstQHFL9fyJcR+9PMA8GA1UdEwEB/wQF
+MAMBAf8wDQYJKoZIhvcNAQELBQADggEBAAs/y4F6013kYX8aeJ9xp63HtAfV4mgM
+8N0LD2CDvF34y5R8nP4D75jMih2N5miI6swfj1dYq+0/wn6Wbnx5R4eOQoGVesb7
+YX1Ehi8lxMiytt80tNAlcgGgPU8NkCZ+ttiY3Y8Y4eXfOy16caZ1Hvqo/2JGVhN0
+IygJCv51DJWcf8KPLIeCdwix8iHgR5EAOZM4BiFPgP6DgXXKIuPA/nr24dkAeXt8
+cvm/OTzEVSowjneTcURg3GfcT41yJ58NIaNmjh+KiziZ6yby70MdBa0+mNY/ZM/j
+KZqUk5o8OZ+5KRGSwv2Fwj0XMp6CIDX/2TflMDHcrGp+USYwJhWXnc4=
+-----END CERTIFICATE-----
+";
+
+    /// A second, unrelated self-signed CA. Different bytes, therefore a different camera trust root.
+    const OTHER_CA_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIIDJzCCAg+gAwIBAgIUH/5w8MMMpIgIvYIDPGmfRZVjnXIwDQYJKoZIhvcNAQEL
+BQAwIjEgMB4GA1UEAwwXY2FtZXJhLWFkYXB0ZXItb3RoZXItY2EwIBcNMjYwNzE0
+MDQ0MjM2WhgPMjEyNjA2MjAwNDQyMzZaMCIxIDAeBgNVBAMMF2NhbWVyYS1hZGFw
+dGVyLW90aGVyLWNhMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyaox
+0TcwrnTCV7E7Tgn6a0bNRxLX0IfAlBs540D+MRunBCyW33cvCEB/p+zk4kF+VX1R
+LoNK6DqZpM9JbJMLUrcX5kEdQw5pNdEmCvmSwVz6tUtH59LEieKbE84mCat2Z5R3
+h/TWl/tm3kfROT0A/cmObasFuLDb2niPt+5qovH+cNgHk646zF+kbEnRD4Wj/Sdp
+dgsXoBHZxAB8AtMMSGGXzWNl5VxGE7ekTyx7v7a4MOhYYCYHigcDl39U9nJh4lfy
+vJD86kijF4Z0aiEE0t49AEvroGXkR3HFC5LWBH3hkbAHI8kAf8ibFa3mpYpQmWgs
++0YcKGCniN7v+iO+QQIDAQABo1MwUTAdBgNVHQ4EFgQUA8vTzPi5uGEhm384HopP
+8quaet8wHwYDVR0jBBgwFoAUA8vTzPi5uGEhm384HopP8quaet8wDwYDVR0TAQH/
+BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAJv7zvtE1kQwEPz67+r26hoLF7zVN
+j0DZr5eyaxayW0DbskIEWQhRzegHWDM/TV/DrlPcgz+nnDbROWsiWfz12e9ooxwv
+ndP7ub6FXCozZjIMOw0GglraaraDTw17h88q7De9HD7eMh9SDD+2IuGlSLRE+GP2
+VgOt+CtnpoCLyVVejBgNIteFmsFfwuSt2HV3TeWbR/05IzBIP/89JQDO9YDtKPBT
+/EXZJ+ZnurKVLVCTZdNH8larh2ThxKvQLw8f74HdFTV2GLDzj+IYb0iY94lTJflj
+wkWsh7u3nnr9fXRpWsamYEAKGzNo0istMB6rD6cMzNfRZCMk4rXuokYWOw==
+-----END CERTIFICATE-----
+";
+
+    fn request_trusting(ca_pem: &[u8]) -> OnvifHttpRequest {
+        let mut request = loopback_http_request(8_443, OnvifHttpMethod::Post, 32);
+        request.tls.ca_pem = Some(Arc::new(SecretBytes::new(ca_pem)));
+        request
+    }
+
+    /// Two cameras behind two private CAs must not end up sharing one client.
+    ///
+    /// The client is what holds the trust decision -- the root store is baked into it at build time.
+    /// If the cache key ignored the CA, the SECOND camera to ask would silently be handed the FIRST
+    /// camera's client, and would then be validated against a certificate authority that has nothing
+    /// to do with it. That is a trust boundary quietly dissolving inside a performance optimisation,
+    /// so the key digests the bundle: same bytes, same client; different bytes, never.
+    ///
+    /// The digest is also why the bundle itself is not kept. It is a secret handle, and a cache of
+    /// them, alive for the life of the process, is exactly what `SecretBytes` exists to prevent.
+    #[tokio::test]
+    async fn two_cameras_that_trust_different_certificate_authorities_never_share_a_client() {
+        let transport = ReqwestOnvifTransport::default();
+        let socket = SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), 8_443);
+
+        let private = request_trusting(TEST_CA_PEM);
+        transport
+            .client(&private, socket)
+            .expect("a private CA bundle must produce a client that trusts it");
+        transport
+            .client(&request_trusting(TEST_CA_PEM), socket)
+            .expect("and the same bundle must reuse it");
+        assert_eq!(
+            transport.clients.lock().unwrap().len(),
+            1,
+            "the same camera and the same trust root must not build a second connection pool"
+        );
+
+        transport
+            .client(&request_trusting(OTHER_CA_PEM), socket)
+            .expect("a different CA bundle is a different camera trust root");
+        assert_eq!(
+            transport.clients.lock().unwrap().len(),
+            2,
+            "a camera behind a different certificate authority must never be validated against \
+             another camera's root store"
+        );
+
+        // The public-roots posture is a third, distinct key: no private CA is not the same trust
+        // decision as some private CA.
+        transport
+            .client(
+                &loopback_http_request(8_443, OnvifHttpMethod::Post, 32),
+                socket,
+            )
+            .expect("a camera with no private CA gets its own client");
+        assert_eq!(transport.clients.lock().unwrap().len(), 3);
+
+        // And the secret itself is never retained -- only its digest.
+        let keys = transport.clients.lock().unwrap();
+        assert_eq!(
+            keys.keys().filter(|key| key.ca_digest.is_some()).count(),
+            2,
+            "a private CA must be remembered as a digest, and the two must not collide"
+        );
+    }
+
+    /// A private CA that cannot be parsed fails the request; it does not fall back to the public roots.
+    ///
+    /// Silently ignoring an unusable `tls.ca` would take a camera an operator has deliberately pinned
+    /// to their own certificate authority and validate it against Mozilla's root store instead. The
+    /// component would keep working, and the trust boundary the operator configured would simply not
+    /// exist -- which is the failure mode this refuses.
+    #[tokio::test]
+    async fn a_private_ca_bundle_that_cannot_be_used_fails_the_request_rather_than_trusting_anything_else()
+     {
+        let transport = ReqwestOnvifTransport::default();
+        let socket = SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), 8_443);
+
+        let empty = transport
+            .client(
+                &request_trusting(b"# a comment, and not one certificate\n"),
+                socket,
+            )
+            .expect_err("a bundle with no certificate in it cannot be a trust root");
+        assert_eq!(empty.code(), ErrorCode::BackendError);
+        assert!(
+            empty.to_string().contains("no certificates"),
+            "an operator must be told their CA bundle is empty, not merely that something failed: \
+             {empty}"
+        );
+
+        let malformed = transport
+            .client(
+                &request_trusting(
+                    b"-----BEGIN CERTIFICATE-----\nAAAAAAAA\n-----END CERTIFICATE-----\n",
+                ),
+                socket,
+            )
+            .expect_err("a PEM block whose contents are not a certificate cannot be a trust root");
+        assert_eq!(malformed.code(), ErrorCode::BackendError);
+
+        assert!(
+            transport.clients.lock().unwrap().is_empty(),
+            "a bundle that was refused must not leave a client cached under its key"
+        );
+    }
+
+    /// A camera whose address keeps moving must not be able to grow the cache without bound.
+    ///
+    /// The address is PINNED into the client (`resolve`), so every address a camera is seen at is a
+    /// new key. A camera on DHCP, or a fleet behind a NAT that renumbers, would otherwise add an
+    /// entry -- and a whole rustls configuration and connection pool -- forever, for the life of the
+    /// process. The bound is deliberately crude: emptying the cache costs one handshake per camera,
+    /// and an unbounded map costs the process.
+    #[tokio::test]
+    async fn the_client_cache_empties_rather_than_growing_without_bound() {
+        let transport = ReqwestOnvifTransport::default();
+        let socket = SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), 8_443);
+        let request = loopback_http_request(8_443, OnvifHttpMethod::Post, 32);
+        let client = transport
+            .client(&request, socket)
+            .expect("one real client to fill the cache with");
+
+        // Stand in for a camera that has been seen at MAX_POOLED_CLIENTS distinct addresses. Building
+        // that many real clients would prove nothing extra and cost a rustls configuration each.
+        {
+            let mut clients = transport.clients.lock().unwrap();
+            for index in 0..u16::try_from(MAX_POOLED_CLIENTS).expect("the bound fits a port") {
+                clients.insert(
+                    HttpClientKey {
+                        host: "127.0.0.1".to_owned(),
+                        socket: SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), index),
+                        verify_hostname: true,
+                        allow_invalid_certificates: false,
+                        ca_digest: None,
+                    },
+                    client.clone(),
+                );
+            }
+            assert!(clients.len() >= MAX_POOLED_CLIENTS);
+        }
+
+        let moved = SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 2]), 8_443);
+        transport
+            .client(&request, moved)
+            .expect("a camera that has moved again must still get a client");
+
+        assert_eq!(
+            transport.clients.lock().unwrap().len(),
+            1,
+            "past the bound the cache is emptied and restarted, not grown"
+        );
+    }
+
+    /// A panic somewhere else in the process must not take the camera transport with it.
+    ///
+    /// `clients` is a `std::sync::Mutex`, so a thread that panics while holding it poisons it
+    /// permanently. `client()` reads it with `if let Ok(..)` rather than `unwrap()` on purpose: the
+    /// cache is an optimisation, and losing it must cost a TLS handshake, not every subsequent ONVIF
+    /// request the component will ever make.
+    #[tokio::test]
+    async fn a_poisoned_client_cache_costs_a_handshake_and_nothing_more() {
+        let transport = Arc::new(ReqwestOnvifTransport::default());
+        let socket = SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), 8_443);
+        let request = loopback_http_request(8_443, OnvifHttpMethod::Post, 32);
+
+        transport
+            .client(&request, socket)
+            .expect("a client is cached first, so the poisoned read has something to lose");
+
+        let poisoner = Arc::clone(&transport);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner
+                .clients
+                .lock()
+                .expect("the cache is not yet poisoned");
+            panic!("a thread died holding the client cache");
+        })
+        .join();
+        std::panic::set_hook(previous);
+        assert!(
+            panicked.is_err(),
+            "the poisoning thread must actually panic"
+        );
+        assert!(
+            transport.clients.lock().is_err(),
+            "the client cache must really be poisoned, or this test proves nothing"
+        );
+
+        transport
+            .client(&request, socket)
+            .expect("a poisoned cache must cost a handshake, not the camera");
+    }
+
     #[tokio::test]
     async fn production_http_transport_uses_pinned_loopback_and_enforces_response_bounds() {
         let transport = ReqwestOnvifTransport::default();

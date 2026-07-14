@@ -626,6 +626,220 @@ mod tests {
         broken.shutdown().await;
     }
 
+    /// One emission as the target saw it: metric name, whether the immediate path was used, values.
+    type Emission = (String, bool, std::collections::HashMap<String, f64>);
+
+    /// A metric target that remembers exactly what it was asked to define and to emit.
+    #[derive(Default)]
+    struct RecordingMetrics {
+        defined: std::sync::Mutex<Vec<edgecommons::metrics::Metric>>,
+        emitted: std::sync::Mutex<Vec<Emission>>,
+        refuse: bool,
+    }
+
+    impl RecordingMetrics {
+        fn last_emission(&self) -> Emission {
+            self.emitted
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("the metric target must have been asked to emit something")
+        }
+
+        fn last_definition(&self) -> edgecommons::metrics::Metric {
+            self.defined
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("the metric must have been defined before it was emitted")
+        }
+
+        fn record(
+            &self,
+            name: &str,
+            immediate: bool,
+            values: std::collections::HashMap<String, f64>,
+        ) -> edgecommons::Result<()> {
+            self.emitted
+                .lock()
+                .unwrap()
+                .push((name.to_owned(), immediate, values));
+            if self.refuse {
+                return Err(edgecommons::EdgeCommonsError::Metrics(
+                    "metric target is unavailable".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl edgecommons::metrics::MetricService for RecordingMetrics {
+        fn define_metric(&self, metric: edgecommons::metrics::Metric) {
+            self.defined.lock().unwrap().push(metric);
+        }
+        fn is_metric_defined(&self, name: &str) -> bool {
+            self.defined
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|metric| metric.get_name() == name)
+        }
+        async fn emit_metric(
+            &self,
+            name: &str,
+            values: std::collections::HashMap<String, f64>,
+        ) -> edgecommons::Result<()> {
+            self.record(name, false, values)
+        }
+        async fn emit_metric_now(
+            &self,
+            name: &str,
+            values: std::collections::HashMap<String, f64>,
+        ) -> edgecommons::Result<()> {
+            self.record(name, true, values)
+        }
+        async fn flush_metrics(&self) -> edgecommons::Result<()> {
+            Ok(())
+        }
+        async fn shutdown(&self) {}
+    }
+
+    /// A latency that has never been observed is absent, not zero.
+    ///
+    /// Zero is a real measurement. Emitting it for a camera that has never answered would publish
+    /// "this camera replies instantly" as the round-trip of a camera that has, in fact, replied
+    /// never -- and `publishLatencyMs`/`pollLatencyMs` are averaged by whatever consumes them, so one
+    /// silent camera would quietly pull a fleet's latency toward zero and hide the outage.
+    ///
+    /// The dimension is asserted here too, because it is the reason this method exists at all: the
+    /// core API keys definitions by name and carries dimensions on the DEFINITION, so a multi-camera
+    /// adapter can only say `instance=camera-a` by redefining immediately before it emits.
+    #[tokio::test]
+    async fn southbound_health_emits_a_latency_it_has_observed_and_omits_one_it_has_not() {
+        let target = Arc::new(RecordingMetrics::default());
+        let metrics = CaptureMetrics::new(
+            Arc::clone(&target) as Arc<dyn edgecommons::metrics::MetricService>
+        );
+
+        metrics
+            .emit_health(
+                "camera-a",
+                &SouthboundHealthSample {
+                    connection_state: 1,
+                    publish_latency_ms: Some(7),
+                    poll_latency_ms: Some(42),
+                    read_errors: 2,
+                    stale_signals: 0,
+                    reconnects: 1,
+                },
+                true,
+            )
+            .await;
+
+        let (name, immediate, values) = target.last_emission();
+        assert_eq!(name, HEALTH_METRIC);
+        assert!(immediate, "`now` must reach the immediate emission path");
+        assert_eq!(values.get("publishLatencyMs"), Some(&7.0));
+        assert_eq!(values.get("pollLatencyMs"), Some(&42.0));
+        assert_eq!(values.get("connectionState"), Some(&1.0));
+        assert_eq!(values.get("readErrors"), Some(&2.0));
+        assert_eq!(values.get("reconnects"), Some(&1.0));
+        assert_eq!(
+            target.last_definition().get_dimensions().get("instance"),
+            Some(&"camera-a".to_owned()),
+            "an un-dimensioned health metric cannot tell an operator WHICH camera is unwell"
+        );
+
+        metrics
+            .emit_health(
+                "camera-b",
+                &SouthboundHealthSample {
+                    connection_state: 0,
+                    publish_latency_ms: None,
+                    poll_latency_ms: None,
+                    read_errors: 0,
+                    stale_signals: 1,
+                    reconnects: 0,
+                },
+                false,
+            )
+            .await;
+
+        let (_, immediate, values) = target.last_emission();
+        assert!(!immediate, "a routine sample must use the buffered path");
+        assert!(
+            !values.contains_key("publishLatencyMs") && !values.contains_key("pollLatencyMs"),
+            "a camera that has never answered must report no latency at all, not a latency of \
+             zero: {values:?}"
+        );
+        assert_eq!(
+            values.get("staleSignals"),
+            Some(&1.0),
+            "the silence itself is what must be reported instead"
+        );
+    }
+
+    /// A metric target that is down must not be able to take the health loop down with it.
+    ///
+    /// `emit_health` is called on a timer for every camera in the fleet. It returns `()` on purpose:
+    /// there is no caller who could do anything useful with an emission failure, and propagating one
+    /// would stop the sweep -- so a metrics backend that is briefly unavailable would stop the
+    /// component reporting on all 256 cameras, including the ones that are genuinely unwell.
+    #[tokio::test]
+    async fn a_health_sample_that_cannot_be_emitted_is_reported_and_survived() {
+        use edgecommons::metrics::MetricService;
+
+        let target = Arc::new(RecordingMetrics {
+            refuse: true,
+            ..RecordingMetrics::default()
+        });
+        let metrics = CaptureMetrics::new(
+            Arc::clone(&target) as Arc<dyn edgecommons::metrics::MetricService>
+        );
+        let sample = SouthboundHealthSample {
+            connection_state: 1,
+            publish_latency_ms: Some(3),
+            poll_latency_ms: Some(4),
+            read_errors: 0,
+            stale_signals: 0,
+            reconnects: 0,
+        };
+
+        // Neither call may panic or propagate, and the second must still be attempted after the
+        // first has failed: an emission failure is not sticky.
+        metrics.emit_health("camera-a", &sample, true).await;
+        metrics.emit_health("camera-b", &sample, false).await;
+
+        {
+            let attempted = target.emitted.lock().unwrap();
+            assert_eq!(
+                attempted.len(),
+                2,
+                "both cameras must have been offered to the failing target: {attempted:?}"
+            );
+            assert!(
+                attempted.iter().all(|(name, ..)| name == HEALTH_METRIC),
+                "the failure being survived here must be the health emission's own"
+            );
+        }
+
+        // The target is a faithful stand-in for one that is merely unable to ship: it accepted the
+        // definitions and it is still usable. If it had refused the definitions too, the failure
+        // survived above would be a different failure from the one production sees.
+        assert!(
+            target.is_metric_defined(HEALTH_METRIC),
+            "the health metric must be defined even when its emission cannot be shipped"
+        );
+        target
+            .flush_metrics()
+            .await
+            .expect("a target that refuses an emission may still be flushed");
+        target.shutdown().await;
+    }
+
     use super::*;
 
     fn ready() -> ReadinessSnapshot {

@@ -3041,4 +3041,123 @@ mod tests {
         assert!(bounded.len() <= MAX_TERMINAL_DETAIL_BYTES);
         assert!(bounded.is_char_boundary(bounded.len()));
     }
+
+    /// A capture that is already over must not be terminalized a second time.
+    ///
+    /// Startup recovery walks every non-terminal row it finds, and a terminal message is published as
+    /// part of retiring one. Interrupting a job that has already reached a terminal state would put a
+    /// SECOND terminal for one capture on the bus -- and a waiter that has already been settled by the
+    /// first would be settled again, with a different outcome. A capture the installer owns is refused
+    /// for the mirror-image reason: only the targeted install recovery can know whether the file
+    /// actually landed, so a generic "interrupted" would be a guess published as a fact.
+    #[tokio::test]
+    async fn interruption_recovery_refuses_a_capture_that_is_over_or_owned_by_the_installer() {
+        let (engine, _directory) = engine().await;
+        let now = Utc::now().timestamp_millis();
+        engine
+            .catalog
+            .accept_job(command_submission("cap-twice", now).job)
+            .await
+            .unwrap();
+        let accepted = engine.catalog.job("cap-twice").await.unwrap().unwrap();
+
+        let interrupted = engine
+            .interrupt_recovered(accepted.clone())
+            .await
+            .expect("a non-terminal capture is exactly what interruption recovery is for");
+        assert_eq!(interrupted.state, JobState::Interrupted);
+        assert!(interrupted.state.is_terminal());
+
+        let twice = engine
+            .interrupt_recovered(interrupted)
+            .await
+            .expect_err("a capture that has already been retired must not be retired again");
+        assert!(matches!(twice, CameraError::Catalog(_)));
+        assert!(
+            twice.to_string().contains("non-terminal"),
+            "the refusal must name the invariant it is protecting: {twice}"
+        );
+
+        let mut installing = accepted;
+        installing.state = JobState::Persisting;
+        installing.install_started = true;
+        let owned = engine
+            .interrupt_recovered(installing)
+            .await
+            .expect_err("only install recovery can decide the outcome of an installed artifact");
+        assert!(matches!(owned, CameraError::Catalog(_)));
+        assert!(owned.to_string().contains("install-owned"));
+
+        // Exactly one terminal reached the outbox, which is the invariant all of the above protects.
+        assert_eq!(
+            engine
+                .catalog
+                .pending_outbox(Utc::now().timestamp_millis() + 1_000, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// A durable row the component cannot read is a catalog error, never a panic.
+    ///
+    /// Recovery rehydrates a `CaptureJobSpec` from JSON that was written by a possibly-older build of
+    /// this component and has since been sitting on disk. Every one of these fields is therefore
+    /// *untrusted input* at read time, however it got there -- a schema that moved, a disk that lied,
+    /// a row an operator edited. Unwrapping any of them would turn one unreadable row into a crash
+    /// loop at startup, which is the one failure an adapter cannot recover from on its own: it would
+    /// never reach the point of quarantining the row that is killing it.
+    #[tokio::test]
+    async fn a_recovery_record_the_component_cannot_read_is_refused_field_by_field() {
+        let (engine, _directory) = engine().await;
+        let now = Utc::now().timestamp_millis();
+        engine
+            .catalog
+            .accept_job(command_submission("cap-corrupt", now).job)
+            .await
+            .unwrap();
+        let accepted = engine.catalog.job("cap-corrupt").await.unwrap().unwrap();
+
+        spec_from_record(&accepted, None, None)
+            .expect("a row this component wrote itself must rehydrate");
+
+        /// One way a durable row can be unreadable by the time recovery reaches it.
+        type Corruption = fn(&mut JobRecord);
+
+        let corruptions: [(Corruption, &str); 4] = [
+            (
+                |record| record.effective_profile = json!("not a profile"),
+                "invalid effective profile",
+            ),
+            (
+                |record| record.trigger = json!({"type": "telepathy"}),
+                "invalid capture trigger",
+            ),
+            (
+                |record| record.canonical_request = json!({"metadata": 7}),
+                "invalid capture metadata",
+            ),
+            (
+                |record| record.intended_output = json!({"relativePath": "camera-a/cap.jpg"}),
+                "valid backend kind",
+            ),
+        ];
+
+        for (corrupt, expected) in corruptions {
+            let mut record = accepted.clone();
+            corrupt(&mut record);
+            let error = spec_from_record(&record, None, None)
+                .expect_err("an unreadable durable field must not be unwrapped");
+            assert!(
+                matches!(error, CameraError::Catalog(_)),
+                "an unreadable row is a catalog fault, not a rejection an operator can retry: \
+                 {error}"
+            );
+            assert!(
+                error.to_string().contains(expected),
+                "the refusal must name the field that could not be read; got: {error}"
+            );
+        }
+    }
 }
