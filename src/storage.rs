@@ -213,6 +213,35 @@ struct StoragePolicy {
     file_mode: u32,
 }
 
+/// Observation points inside the capability's install path.
+///
+/// The windows this seam exposes -- between creating a partial and the parent it was resolved
+/// against, and between proving a destination absent and publishing it -- are only reachable from
+/// inside the capability, and a race test that cannot reach them proves nothing. The seam is
+/// therefore compiled into every build: production installs [`NoopInstallObserver`] and a test
+/// installs one that swaps the parent out from under the capability, but both run the same
+/// syscalls in the same order. A `cfg(test)`-only hook would have made the shipped install path a
+/// path no test had ever executed.
+pub trait InstallObserver: Send + Sync {
+    /// Fires immediately before a partial is exclusively created, with the parent already resolved.
+    ///
+    /// `partial` names the entry as the backend addresses it: relative to the descriptor the Linux
+    /// backend creates it from, absolute on the portable backend.
+    fn before_partial_open(&self, _partial: &Path) {}
+
+    /// Fires inside the no-clobber install window -- after the parent has been revalidated (Linux)
+    /// or the destination proven absent (portable), and before the link that publishes it.
+    ///
+    /// `destination` follows the same naming convention as `partial` above.
+    fn before_install_link(&self, _destination: &Path) {}
+}
+
+/// The observer every production root installs: it watches the install path and does nothing.
+#[derive(Debug, Default)]
+pub struct NoopInstallObserver;
+
+impl InstallObserver for NoopInstallObserver {}
+
 /// Open capability for one canonical output root.
 #[derive(Clone)]
 pub struct StorageRoot {
@@ -239,6 +268,18 @@ impl StorageRoot {
     /// The root itself is canonicalized once, then all descendant work is capability-relative.
     /// Unsupported platforms/filesystems are rejected at startup.
     pub fn open(output: &OutputConfig) -> Result<Self> {
+        Self::open_with_observer(output, Arc::new(NoopInstallObserver))
+    }
+
+    /// Opens the same root under a caller-supplied [`InstallObserver`].
+    ///
+    /// Same validation, same capability, same install syscalls in the same order as
+    /// [`StorageRoot::open`] -- the observer only watches. It is how a race test reaches an install
+    /// window that is otherwise unreachable from outside the capability.
+    pub fn open_with_observer(
+        output: &OutputConfig,
+        observer: Arc<dyn InstallObserver>,
+    ) -> Result<Self> {
         let configured = Path::new(&output.root_directory);
         if !configured.is_absolute() {
             return storage_error("output rootDirectory must be absolute");
@@ -269,17 +310,19 @@ impl StorageRoot {
                 &canonical_root,
                 policy.directory_mode,
                 policy.file_mode,
+                observer,
             )?);
             Ok(Self { policy, capability })
         }
         #[cfg(windows)]
         {
-            let capability = Arc::new(portable::RootCapability::open(&canonical_root)?);
+            let capability = Arc::new(portable::RootCapability::open(&canonical_root, observer)?);
             Ok(Self { policy, capability })
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = policy;
+            let _ = observer;
             storage_error(
                 "this platform has no enabled handle-relative no-follow/no-clobber backend; output root rejected",
             )
@@ -1209,15 +1252,14 @@ mod linux {
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::path::{Path, PathBuf};
-    #[cfg(test)]
-    use std::sync::Mutex;
+    use std::sync::Arc;
 
     use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags};
     use rustix::io::Errno;
     use serde_json::Value;
     use tokio_util::sync::CancellationToken;
 
-    use super::{MAX_SIDECAR_BYTES, cancelled, storage_error};
+    use super::{InstallObserver, MAX_SIDECAR_BYTES, cancelled, storage_error};
     use crate::{CameraError, Result};
 
     const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
@@ -1231,14 +1273,16 @@ mod linux {
         device: u64,
         directory_mode: Mode,
         file_mode: Mode,
-        #[cfg(test)]
-        before_partial_open: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-        #[cfg(test)]
-        before_install_link: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        observer: Arc<dyn InstallObserver>,
     }
 
     impl RootCapability {
-        pub(super) fn open(canonical: &Path, directory_mode: u32, file_mode: u32) -> Result<Self> {
+        pub(super) fn open(
+            canonical: &Path,
+            directory_mode: u32,
+            file_mode: u32,
+            observer: Arc<dyn InstallObserver>,
+        ) -> Result<Self> {
             let fd = rustix::fs::open(
                 canonical,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -1271,10 +1315,7 @@ mod linux {
                 device: stat.st_dev,
                 directory_mode: Mode::from_raw_mode(directory_mode),
                 file_mode: Mode::from_raw_mode(file_mode),
-                #[cfg(test)]
-                before_partial_open: Mutex::new(None),
-                #[cfg(test)]
-                before_install_link: Mutex::new(None),
+                observer,
             })
         }
 
@@ -1357,10 +1398,7 @@ mod linux {
                 .map(String::as_str)
                 .chain(std::iter::once(name))
                 .collect::<PathBuf>();
-            #[cfg(test)]
-            if let Some(hook) = self.before_partial_open.lock().unwrap().take() {
-                hook();
-            }
+            self.observer.before_partial_open(&path);
             rustix::fs::openat2(
                 &self.fd,
                 &path,
@@ -1375,16 +1413,6 @@ mod linux {
             })
         }
 
-        #[cfg(test)]
-        pub(super) fn set_before_partial_open(&self, hook: impl FnOnce() + Send + 'static) {
-            *self.before_partial_open.lock().unwrap() = Some(Box::new(hook));
-        }
-
-        #[cfg(test)]
-        pub(super) fn set_before_install_link(&self, hook: impl FnOnce() + Send + 'static) {
-            *self.before_install_link.lock().unwrap() = Some(Box::new(hook));
-        }
-
         pub(super) fn install_no_clobber(
             &self,
             parent: &OwnedFd,
@@ -1393,10 +1421,7 @@ mod linux {
             final_name: &str,
         ) -> Result<()> {
             self.revalidate_parent_at(parent, parent_components)?;
-            #[cfg(test)]
-            if let Some(hook) = self.before_install_link.lock().unwrap().take() {
-                hook();
-            }
+            self.observer.before_install_link(Path::new(final_name));
             rustix::fs::linkat(parent, partial, parent, final_name, AtFlags::empty()).map_err(
                 |error| {
                     CameraError::Storage(format!(
@@ -1607,28 +1632,27 @@ mod portable {
     use std::fs::{self, File, OpenOptions};
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     use serde_json::Value;
     use tokio_util::sync::CancellationToken;
 
-    use super::{MAX_SIDECAR_BYTES, cancelled, storage_error};
+    use super::{InstallObserver, MAX_SIDECAR_BYTES, cancelled, storage_error};
     use crate::{CameraError, Result};
-
-    #[cfg(test)]
-    type AfterAbsentCheckHook = Box<dyn FnOnce(&Path) + Send>;
 
     pub(super) struct RootCapability {
         canonical_root: PathBuf,
-        #[cfg(test)]
-        after_absent_check_hook: std::sync::Mutex<Option<AfterAbsentCheckHook>>,
+        observer: Arc<dyn InstallObserver>,
     }
 
     impl RootCapability {
-        pub(super) fn open(canonical_root: &Path) -> Result<Self> {
+        pub(super) fn open(
+            canonical_root: &Path,
+            observer: Arc<dyn InstallObserver>,
+        ) -> Result<Self> {
             Ok(Self {
                 canonical_root: canonical_root.to_path_buf(),
-                #[cfg(test)]
-                after_absent_check_hook: std::sync::Mutex::new(None),
+                observer,
             })
         }
 
@@ -1680,12 +1704,13 @@ mod portable {
         }
 
         pub(super) fn create_partial(&self, parent: &Path, name: &str) -> Result<File> {
-            let _ = self;
+            let partial = parent.join(name);
+            self.observer.before_partial_open(&partial);
             OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create_new(true)
-                .open(parent.join(name))
+                .open(&partial)
                 .map_err(|error| {
                     CameraError::Storage(format!(
                         "cannot exclusively create partial '{name}': {error}"
@@ -1700,34 +1725,11 @@ mod portable {
             final_name: &str,
         ) -> Result<()> {
             ensure_absent(parent, final_name, "final image")?;
-            #[cfg(test)]
-            self.run_after_absent_check_hook(parent, final_name);
+            // The gap this observation point names is the one the portable profile cannot close:
+            // between the absence proof above and the link below, a local actor can create the
+            // destination. `complete_no_overwrite` is what has to refuse it.
+            self.observer.before_install_link(&parent.join(final_name));
             complete_no_overwrite(parent, partial, final_name, "final image")
-        }
-
-        #[cfg(test)]
-        pub(super) fn set_after_absent_check_hook(
-            &self,
-            hook: impl FnOnce(&Path) + Send + 'static,
-        ) {
-            let mut slot = self
-                .after_absent_check_hook
-                .lock()
-                .expect("portable install test hook mutex is available");
-            assert!(
-                slot.is_none(),
-                "portable install test hook is already configured"
-            );
-            *slot = Some(Box::new(hook));
-        }
-
-        #[cfg(test)]
-        fn run_after_absent_check_hook(&self, parent: &Path, final_name: &str) {
-            if let Ok(mut hook) = self.after_absent_check_hook.lock() {
-                if let Some(hook) = hook.take() {
-                    hook(&parent.join(final_name));
-                }
-            }
         }
     }
 
@@ -2202,6 +2204,45 @@ mod tests {
             }
         }
 
+        /// Runs one filesystem race at one of the capability's install-window observation points.
+        ///
+        /// The race fires once and once only: a second swap on a later install would be a different
+        /// experiment than the one the test claims to run.
+        struct RaceObserver {
+            partial_open: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+            install_link: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        }
+
+        impl RaceObserver {
+            fn on_partial_open(race: impl FnOnce() + Send + 'static) -> Arc<Self> {
+                Arc::new(Self {
+                    partial_open: Mutex::new(Some(Box::new(race))),
+                    install_link: Mutex::new(None),
+                })
+            }
+
+            fn on_install_link(race: impl FnOnce() + Send + 'static) -> Arc<Self> {
+                Arc::new(Self {
+                    partial_open: Mutex::new(None),
+                    install_link: Mutex::new(Some(Box::new(race))),
+                })
+            }
+        }
+
+        impl InstallObserver for RaceObserver {
+            fn before_partial_open(&self, _partial: &Path) {
+                if let Some(race) = self.partial_open.lock().unwrap().take() {
+                    race();
+                }
+            }
+
+            fn before_install_link(&self, _destination: &Path) {
+                if let Some(race) = self.install_link.lock().unwrap().take() {
+                    race();
+                }
+            }
+        }
+
         fn partials(root: &Path) -> Vec<PathBuf> {
             fn visit(path: &Path, found: &mut Vec<PathBuf>) {
                 for entry in fs::read_dir(path).unwrap() {
@@ -2437,14 +2478,17 @@ mod tests {
             let mut config = output(root_dir.path(), false);
             config.camera_directory_template = "camera".to_string();
             fs::create_dir(root_dir.path().join("camera")).unwrap();
-            let root = StorageRoot::open(&config).unwrap();
             let original = root_dir.path().join("camera");
             let moved = outside.path().join("moved-parent");
             let replacement_target = outside.path().to_path_buf();
-            root.capability.set_before_partial_open(move || {
-                fs::rename(&original, &moved).unwrap();
-                symlink(&replacement_target, &original).unwrap();
-            });
+            let root = StorageRoot::open_with_observer(
+                &config,
+                RaceObserver::on_partial_open(move || {
+                    fs::rename(&original, &moved).unwrap();
+                    symlink(&replacement_target, &original).unwrap();
+                }),
+            )
+            .unwrap();
 
             let error = root
                 .prepare_capture(
@@ -2463,7 +2507,18 @@ mod tests {
             let outside = tempfile::tempdir().unwrap();
             let mut config = output(root_dir.path(), false);
             config.camera_directory_template = "camera".to_string();
-            let root = StorageRoot::open(&config).unwrap();
+            let original = root_dir.path().join("camera");
+            let moved = outside.path().join("moved-parent");
+            let original_for_race = original.clone();
+            let moved_for_race = moved.clone();
+            let root = StorageRoot::open_with_observer(
+                &config,
+                RaceObserver::on_install_link(move || {
+                    fs::rename(&original_for_race, &moved_for_race).unwrap();
+                    fs::create_dir(&original_for_race).unwrap();
+                }),
+            )
+            .unwrap();
             let cancellation = CancellationToken::new();
             let prepared = root
                 .prepare_capture(
@@ -2475,14 +2530,6 @@ mod tests {
                 .file_name()
                 .unwrap()
                 .to_owned();
-            let original = root_dir.path().join("camera");
-            let moved = outside.path().join("moved-parent");
-            let original_for_hook = original.clone();
-            let moved_for_hook = moved.clone();
-            root.capability.set_before_install_link(move || {
-                fs::rename(&original_for_hook, &moved_for_hook).unwrap();
-                fs::create_dir(&original_for_hook).unwrap();
-            });
 
             let error = prepared
                 .install(&Gate::new(InstallDecision::Started), 1, None, &cancellation)
@@ -2700,8 +2747,30 @@ mod tests {
     #[cfg(windows)]
     mod windows_tests {
         use std::fs;
+        use std::sync::Mutex;
 
         use super::*;
+
+        /// Creates the destination inside the portable install window, and records where it did it.
+        ///
+        /// This is the collision the portable profile cannot prevent -- only refuse -- so the test
+        /// has to create it in the one instant the capability believes the destination is free.
+        #[derive(Default)]
+        struct LateCollisionObserver {
+            observed: Mutex<Option<PathBuf>>,
+        }
+
+        impl InstallObserver for LateCollisionObserver {
+            fn before_install_link(&self, destination: &Path) {
+                *self
+                    .observed
+                    .lock()
+                    .expect("the observed destination is writable") =
+                    Some(destination.to_path_buf());
+                fs::write(destination, b"foreign image")
+                    .expect("foreign final created after preflight");
+            }
+        }
 
         struct Gate;
 
@@ -2812,7 +2881,12 @@ mod tests {
         async fn portable_profile_does_not_overwrite_a_final_that_appears_after_preflight() {
             let temp = tempfile::tempdir().expect("temporary output root");
             let config = output(temp.path(), false);
-            let root = StorageRoot::open(&config).expect("portable root opens");
+            let race = Arc::new(LateCollisionObserver::default());
+            let root = StorageRoot::open_with_observer(
+                &config,
+                Arc::clone(&race) as Arc<dyn InstallObserver>,
+            )
+            .expect("portable root opens");
             let cancellation = CancellationToken::new();
             let prepared = root
                 .prepare_capture(
@@ -2821,17 +2895,20 @@ mod tests {
                 )
                 .expect("exclusive partial is prepared");
             let final_path = PathBuf::from(&prepared.artifact().absolute_path);
-            let expected_hook_path = final_path.clone();
-            root.capability.set_after_absent_check_hook(move |path| {
-                assert_eq!(path, expected_hook_path.as_path());
-                fs::write(path, b"foreign image").expect("foreign final created after preflight");
-            });
 
             let error = prepared
                 .install(&Gate, 1, None, &cancellation)
                 .await
                 .expect_err("late collision must not overwrite the foreign final image");
 
+            assert_eq!(
+                race.observed
+                    .lock()
+                    .expect("the observed destination is readable")
+                    .as_deref(),
+                Some(final_path.as_path()),
+                "the install window must be driven at the destination the capture announced"
+            );
             assert_eq!(error.code(), ErrorCode::PersistenceFailed);
             assert_eq!(
                 fs::read(&final_path).expect("foreign final remains"),
