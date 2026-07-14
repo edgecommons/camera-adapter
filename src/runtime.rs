@@ -644,6 +644,26 @@ fn selector_value_matches(
     })
 }
 
+/// Everything a capture resolves out of the configuration before it becomes a durable job.
+///
+/// This was ~90 lines copied verbatim between `submit_capture` and `build_group_submission` -- profile
+/// defaulting, deadline arithmetic, capture-mode inference, the camera summary, output-path rendering.
+/// The highest-churn logic in the crate, duplicated, which is the arrangement in which a fix lands in
+/// one copy and not the other and nobody finds out until the two disagree in the field.
+struct ResolvedCapture {
+    camera: Arc<crate::config::CameraConfig>,
+    snapshot: crate::registry::CameraSnapshot,
+    profile_name: String,
+    profile: crate::jobs::JobProfileSnapshot,
+    camera_summary: crate::messages::CameraSummary,
+    capture_id: String,
+    accepted_at_ms: i64,
+    /// The effective terminal budget: the request's, else the profile's, else the global default.
+    terminal_ms: u64,
+    deadlines: crate::catalog::JobDeadlines,
+    relative_path: crate::storage::RelativeOutputPath,
+}
+
 /// Builds the slot map from a roster's engines and whatever event facades go with them.
 ///
 /// The engine is what makes a camera exist; the facade is attached to it. `start` requires a facade for
@@ -1546,229 +1566,19 @@ impl CameraRuntime {
         Ok(self.scheduler.clone())
     }
 
-    /// Resolves and durably accepts one single-camera capture before exposing it to the persistent
-    /// supervisor queue.  The returned catalog outcome is safe to use for both direct and
-    /// submitted command semantics; duplicate keys never re-resolve a changed profile.
-    #[allow(clippy::too_many_arguments)] // Stable command fields are intentionally explicit at this boundary.
-    pub async fn submit_capture(
-        &self,
-        instance: String,
-        request_id: String,
-        requested_profile: Option<String>,
-        timeout_ms: Option<u64>,
-        metadata: serde_json::Map<String, serde_json::Value>,
-        correlation_id: String,
-        verb: &str,
-        priority: crate::admission::CapturePriority,
-    ) -> Result<crate::catalog::AcceptJobOutcome> {
-        // Idempotency is deliberately based on caller-owned immutable arguments, before any
-        // config defaults, generated identifiers, deadlines, or output paths are resolved.
-        // An exact retry after a reload must return the original durable job rather than compare
-        // a new resolution against its first acceptance.
-        let mut canonical_arguments = serde_json::Map::new();
-        canonical_arguments.insert(
-            "instance".to_string(),
-            serde_json::Value::String(instance.clone()),
-        );
-        canonical_arguments.insert(
-            "requestId".to_string(),
-            serde_json::Value::String(request_id.clone()),
-        );
-        if let Some(profile) = requested_profile.as_ref() {
-            canonical_arguments.insert(
-                "captureProfile".to_string(),
-                serde_json::Value::String(profile.clone()),
-            );
-        }
-        if let Some(timeout_ms) = timeout_ms {
-            canonical_arguments.insert("timeoutMs".to_string(), timeout_ms.into());
-        }
-        canonical_arguments.insert(
-            "metadata".to_string(),
-            serde_json::Value::Object(metadata.clone()),
-        );
-        let canonical = serde_json::Value::Object(canonical_arguments);
-        let request_hash = crate::idempotency::canonical_request_hash(&canonical, false)?;
-        let ledger_key =
-            crate::catalog::LedgerKey::new(instance.clone(), verb, request_id.clone())?;
-        if let Some(existing) = self.catalog.job_by_ledger(ledger_key.clone()).await? {
-            return Ok(if existing.request_hash == request_hash {
-                crate::catalog::AcceptJobOutcome::Existing(existing)
-            } else {
-                crate::catalog::AcceptJobOutcome::Conflict
-            });
-        }
-
-        let config = self.config_snapshot()?;
-        let camera = self.registry.camera_config(&instance)?;
-        let profile_name =
-            requested_profile.unwrap_or_else(|| camera.default_capture_profile.clone());
-        let profile = camera
-            .capture_profiles
-            .get(&profile_name)
-            .cloned()
-            .ok_or_else(|| {
-                crate::CameraError::rejected(
-                    crate::ErrorCode::UnknownCaptureProfile,
-                    "capture profile is not configured",
-                )
-            })?;
-        let accepted_at_ms = chrono::Utc::now().timestamp_millis();
-        let terminal_ms = timeout_ms
-            .or(profile.timeout_ms)
-            .unwrap_or(config.global.timeouts.job_terminal_ms);
-        let capture_mode = profile
-            .capture_mode
-            .unwrap_or_else(|| match &camera.backend {
-                crate::config::BackendConfig::Sim(_) => crate::model::CaptureMode::Simulated,
-                crate::config::BackendConfig::GenicamAravis(_) => {
-                    crate::model::CaptureMode::SoftwareTrigger
-                }
-                crate::config::BackendConfig::OnvifRtsp(config) => config.capture_mode,
-            });
-        let snapshot = self.registry.snapshot(&instance)?;
-        let camera_summary = crate::messages::CameraSummary {
-            backend: snapshot.backend,
-            vendor: snapshot
-                .capabilities
-                .as_ref()
-                .and_then(|caps| caps.vendor.clone()),
-            model: snapshot
-                .capabilities
-                .as_ref()
-                .and_then(|caps| caps.model.clone()),
-            firmware: snapshot
-                .capabilities
-                .as_ref()
-                .and_then(|caps| caps.firmware.clone()),
-            serial: snapshot
-                .capabilities
-                .as_ref()
-                .and_then(|caps| caps.serial.clone()),
-        };
-        let capture_id = format!("cap_{}", uuid::Uuid::now_v7());
-        let deadlines = crate::catalog::JobDeadlines {
-            terminal_at_ms: accepted_at_ms
-                .saturating_add(i64::try_from(terminal_ms).unwrap_or(i64::MAX)),
-            queue_at_ms: profile.queue_expiry_ms.map(|duration| {
-                accepted_at_ms.saturating_add(i64::try_from(duration).unwrap_or(i64::MAX))
-            }),
-            capture_at_ms: accepted_at_ms.saturating_add(
-                i64::try_from(config.global.timeouts.capture_ms).unwrap_or(i64::MAX),
-            ),
-            encode_at_ms: accepted_at_ms.saturating_add(
-                i64::try_from(config.global.timeouts.encode_ms).unwrap_or(i64::MAX),
-            ),
-            persist_at_ms: accepted_at_ms.saturating_add(
-                i64::try_from(config.global.timeouts.persist_ms).unwrap_or(i64::MAX),
-            ),
-        };
-        let relative_path = crate::storage::render_output_path(
-            &config.global.output,
-            crate::storage::OutputPathVariables {
-                camera_id: &instance,
-                capture_id: &capture_id,
-                timestamp: chrono::Utc::now(),
-            },
-            profile.output.encoding,
-        )?;
-        let offline_policy = profile
-            .offline_policy
-            .unwrap_or(crate::config::OfflinePolicy::WaitUntilDeadline);
-        let profile_snapshot = crate::jobs::JobProfileSnapshot {
-            name: profile_name.clone(),
-            capture: profile.clone(),
-            offline_policy,
-            maximum_frame_bytes: profile
-                .maximum_frame_bytes
-                .unwrap_or(config.global.limits.max_frame_bytes_per_camera),
-            capture_mode,
-            capture_interlock: profile
-                .capture_interlock
-                .unwrap_or(camera.ptz.capture_interlock),
-            settle_ms: camera.ptz.settle_ms,
-        };
-        let trigger = crate::messages::CaptureTrigger::Command {
-            request_id: request_id.clone(),
-        };
-        if let Err(error) = self.ensure_storage_capacity().await {
-            if error.code() == crate::ErrorCode::StoragePressure {
-                if let Some(existing) = self.catalog.job_by_ledger(ledger_key.clone()).await? {
-                    return Ok(if existing.request_hash == request_hash {
-                        crate::catalog::AcceptJobOutcome::Existing(existing)
-                    } else {
-                        crate::catalog::AcceptJobOutcome::Conflict
-                    });
-                }
-            }
-            return Err(error);
-        }
-        let job = crate::catalog::NewJob {
-            capture_id: capture_id.clone(),
-            instance: instance.clone(),
-            ledger_key: Some(ledger_key),
-            request_hash,
-            canonical_request: canonical,
-            effective_profile: serde_json::to_value(&profile_snapshot)?,
-            deadlines: deadlines.clone(),
-            trigger: serde_json::to_value(&trigger)?,
-            origin_correlation_id: Some(correlation_id.clone()),
-            intended_output: serde_json::json!({ "relativePath": relative_path.as_wire_path(), "backend": snapshot.backend.as_str() }),
-            accepted_at_ms,
-            group_id: None,
-        };
-        let submission = crate::jobs::JobSubmission {
-            job,
-            spec: crate::jobs::CaptureJobSpec {
-                capture_id,
-                instance: instance.clone(),
-                profile: profile_snapshot,
-                resource_group: camera.resource_group.clone(),
-                relative_path,
-                deadlines,
-                accepted_at_ms,
-                trigger,
-                correlation_id,
-                metadata,
-                camera: camera_summary,
-                group_size: None,
-            },
-            priority,
-        };
-        let dispatcher = self.dispatcher(&instance)?;
-        self.engine(&instance)?
-            .accept_and_queue(&dispatcher, submission)
-            .await
-    }
-
-    #[allow(clippy::too_many_arguments)] // The group builder preserves each immutable acceptance fact.
-    /// Builds one member of a synchronised group capture.
+    /// Resolves one capture against the live configuration and registry.
     ///
-    /// `group_size` is the member count, and it is a PARAMETER because the builder cannot derive it
-    /// and must not invent it. It used to return `Some(2)` -- a value picked to satisfy the `size >= 2`
-    /// check the durable layer applies -- and rely on the caller to overwrite it with the true count.
-    /// That is a lie the type system was happy to carry: a second caller, or a reordering that pushed
-    /// the submission before the fix-up line, ships a five-camera group as a two-member group, and the
-    /// durable layer accepts it without complaint because two is a legal size.
-    async fn build_group_submission(
+    /// Deliberately does NOT enforce `enabled`: both entry points already resolve their instance
+    /// through `registry.resolve_actuation_instance`, which does. Putting a second check here would
+    /// look like the load-bearing one and is not.
+    fn resolve_capture(
         &self,
         instance: &str,
-        group_size: usize,
-        request_id: &str,
-        capture_group_id: &str,
         requested_profile: Option<&str>,
         timeout_ms: Option<u64>,
-        metadata: serde_json::Map<String, serde_json::Value>,
-        correlation_id: String,
-    ) -> Result<crate::jobs::JobSubmission> {
+    ) -> Result<ResolvedCapture> {
         let config = self.config_snapshot()?;
         let camera = self.registry.camera_config(instance)?;
-        if !camera.enabled {
-            return Err(crate::CameraError::rejected(
-                crate::ErrorCode::CameraDisabled,
-                "camera is disabled",
-            ));
-        }
         let profile_name = requested_profile
             .map(str::to_owned)
             .unwrap_or_else(|| camera.default_capture_profile.clone());
@@ -1856,6 +1666,176 @@ impl CameraRuntime {
                 .unwrap_or(camera.ptz.capture_interlock),
             settle_ms: camera.ptz.settle_ms,
         };
+        Ok(ResolvedCapture {
+            camera,
+            snapshot,
+            profile_name,
+            profile: profile_snapshot,
+            camera_summary,
+            capture_id,
+            accepted_at_ms,
+            terminal_ms,
+            deadlines,
+            relative_path,
+        })
+    }
+
+    /// Resolves and durably accepts one single-camera capture before exposing it to the persistent
+    /// supervisor queue.  The returned catalog outcome is safe to use for both direct and
+    /// submitted command semantics; duplicate keys never re-resolve a changed profile.
+    #[allow(clippy::too_many_arguments)] // Stable command fields are intentionally explicit at this boundary.
+    pub async fn submit_capture(
+        &self,
+        instance: String,
+        request_id: String,
+        requested_profile: Option<String>,
+        timeout_ms: Option<u64>,
+        metadata: serde_json::Map<String, serde_json::Value>,
+        correlation_id: String,
+        verb: &str,
+        priority: crate::admission::CapturePriority,
+    ) -> Result<crate::catalog::AcceptJobOutcome> {
+        // Idempotency is deliberately based on caller-owned immutable arguments, before any
+        // config defaults, generated identifiers, deadlines, or output paths are resolved.
+        // An exact retry after a reload must return the original durable job rather than compare
+        // a new resolution against its first acceptance.
+        let mut canonical_arguments = serde_json::Map::new();
+        canonical_arguments.insert(
+            "instance".to_string(),
+            serde_json::Value::String(instance.clone()),
+        );
+        canonical_arguments.insert(
+            "requestId".to_string(),
+            serde_json::Value::String(request_id.clone()),
+        );
+        if let Some(profile) = requested_profile.as_ref() {
+            canonical_arguments.insert(
+                "captureProfile".to_string(),
+                serde_json::Value::String(profile.clone()),
+            );
+        }
+        if let Some(timeout_ms) = timeout_ms {
+            canonical_arguments.insert("timeoutMs".to_string(), timeout_ms.into());
+        }
+        canonical_arguments.insert(
+            "metadata".to_string(),
+            serde_json::Value::Object(metadata.clone()),
+        );
+        let canonical = serde_json::Value::Object(canonical_arguments);
+        let request_hash = crate::idempotency::canonical_request_hash(&canonical, false)?;
+        let ledger_key =
+            crate::catalog::LedgerKey::new(instance.clone(), verb, request_id.clone())?;
+        if let Some(existing) = self.catalog.job_by_ledger(ledger_key.clone()).await? {
+            return Ok(if existing.request_hash == request_hash {
+                crate::catalog::AcceptJobOutcome::Existing(existing)
+            } else {
+                crate::catalog::AcceptJobOutcome::Conflict
+            });
+        }
+
+        let ResolvedCapture {
+            camera,
+            snapshot,
+            profile: profile_snapshot,
+            camera_summary,
+            capture_id,
+            accepted_at_ms,
+            deadlines,
+            relative_path,
+            ..
+        } = self.resolve_capture(&instance, requested_profile.as_deref(), timeout_ms)?;
+        let trigger = crate::messages::CaptureTrigger::Command {
+            request_id: request_id.clone(),
+        };
+        if let Err(error) = self.ensure_storage_capacity().await {
+            if error.code() == crate::ErrorCode::StoragePressure {
+                if let Some(existing) = self.catalog.job_by_ledger(ledger_key.clone()).await? {
+                    return Ok(if existing.request_hash == request_hash {
+                        crate::catalog::AcceptJobOutcome::Existing(existing)
+                    } else {
+                        crate::catalog::AcceptJobOutcome::Conflict
+                    });
+                }
+            }
+            return Err(error);
+        }
+        let job = crate::catalog::NewJob {
+            capture_id: capture_id.clone(),
+            instance: instance.clone(),
+            ledger_key: Some(ledger_key),
+            request_hash,
+            canonical_request: canonical,
+            effective_profile: serde_json::to_value(&profile_snapshot)?,
+            deadlines: deadlines.clone(),
+            trigger: serde_json::to_value(&trigger)?,
+            origin_correlation_id: Some(correlation_id.clone()),
+            intended_output: serde_json::json!({ "relativePath": relative_path.as_wire_path(), "backend": snapshot.backend.as_str() }),
+            accepted_at_ms,
+            group_id: None,
+        };
+        let submission = crate::jobs::JobSubmission {
+            job,
+            spec: crate::jobs::CaptureJobSpec {
+                capture_id,
+                instance: instance.clone(),
+                profile: profile_snapshot,
+                resource_group: camera.resource_group.clone(),
+                relative_path,
+                deadlines,
+                accepted_at_ms,
+                trigger,
+                correlation_id,
+                metadata,
+                camera: camera_summary,
+                group_size: None,
+            },
+            priority,
+        };
+        let dispatcher = self.dispatcher(&instance)?;
+        self.engine(&instance)?
+            .accept_and_queue(&dispatcher, submission)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // The group builder preserves each immutable acceptance fact.
+    /// Builds one member of a synchronised group capture.
+    ///
+    /// `group_size` is the member count, and it is a PARAMETER because the builder cannot derive it
+    /// and must not invent it. It used to return `Some(2)` -- a value picked to satisfy the `size >= 2`
+    /// check the durable layer applies -- and rely on the caller to overwrite it with the true count.
+    /// That is a lie the type system was happy to carry: a second caller, or a reordering that pushed
+    /// the submission before the fix-up line, ships a five-camera group as a two-member group, and the
+    /// durable layer accepts it without complaint because two is a legal size.
+    async fn build_group_submission(
+        &self,
+        instance: &str,
+        group_size: usize,
+        request_id: &str,
+        capture_group_id: &str,
+        requested_profile: Option<&str>,
+        timeout_ms: Option<u64>,
+        metadata: serde_json::Map<String, serde_json::Value>,
+        correlation_id: String,
+    ) -> Result<crate::jobs::JobSubmission> {
+        let camera = self.registry.camera_config(instance)?;
+        if !camera.enabled {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::CameraDisabled,
+                "camera is disabled",
+            ));
+        }
+        let ResolvedCapture {
+            camera,
+            snapshot,
+            profile_name,
+            profile: profile_snapshot,
+            camera_summary,
+            capture_id,
+            accepted_at_ms,
+            terminal_ms,
+            deadlines,
+            relative_path,
+        } = self.resolve_capture(instance, requested_profile, timeout_ms)?;
         let trigger = crate::messages::CaptureTrigger::GroupCommand {
             request_id: request_id.to_owned(),
             capture_group_id: capture_group_id.to_owned(),
