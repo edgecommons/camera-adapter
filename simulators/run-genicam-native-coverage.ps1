@@ -87,10 +87,48 @@ $targetMount = "${targetVolume}:/coverage-target"
 $registryMount = "${registryVolume}:/usr/local/cargo/registry"
 $gitMount = "${gitVolume}:/usr/local/cargo/git"
 $artifactMount = "${coverageRoot}:/coverage-artifacts"
+# THE LOCKFILE. `Cargo.lock` is untracked and gitignored, so a clean checkout has none -- and the runs
+# below pass `--locked`, which REFUSES to create one ("cannot create the lock file ... because
+# --locked was passed"). Dropping `--locked` does not rescue it either: the source is mounted `:ro` on
+# purpose and cargo writes the lock next to the workspace Cargo.toml (CARGO_TARGET_DIR does not move
+# it), so cargo would then die on "Read-only file system (os error 30)". Two walls, one behind the
+# other.
+#
+# So the lock is bind-mounted as a single FILE from OUTSIDE the source tree, generated once by the
+# networked prep run below. The source tree is never written to -- the immutability this script
+# depends on holds exactly -- and `--locked` goes back to asserting something true.
+$lockRoot = Join-Path $coverageRoot 'lock'
+New-Item -ItemType Directory -Force -Path $lockRoot | Out-Null
+$lockFile = Join-Path $lockRoot 'Cargo.lock'
+if (-not (Test-Path -LiteralPath $lockFile)) {
+    # Docker creates a DIRECTORY at a bind source that does not exist; the file must be there first.
+    New-Item -ItemType File -Path $lockFile | Out-Null
+}
+$lockMountRw = "${lockFile}:/edgecommons/camera-adapter/Cargo.lock"
+$lockMount = "${lockFile}:/edgecommons/camera-adapter/Cargo.lock:ro"
+
+# The one step with a network and a writable lock. Everything after it is hardened and `--locked`.
+Invoke-Docker -Arguments @(
+    'run', '--rm', '--network', 'bridge', '--read-only', '--tmpfs', '/tmp:size=64m,mode=1777',
+    '-v', $sourceMount,
+    '-v', $lockMountRw,
+    '-v', $targetMount,
+    '-v', $registryMount,
+    '-v', $gitMount,
+    '-w', '/edgecommons/camera-adapter',
+    '-e', 'CARGO_TARGET_DIR=/coverage-target',
+    $Image,
+    '+1.87.0', 'generate-lockfile'
+)
+if ((Get-Item -LiteralPath $lockFile).Length -eq 0) {
+    throw "the prep run did not produce a Cargo.lock at $lockFile"
+}
+
 $artifact = '/coverage-artifacts/genicam-fake-gv-mono8.lcov'
 $commonRunArguments = @(
     'run', '--rm', '--network', 'host', '--read-only', '--tmpfs', '/tmp:size=64m,mode=1777',
     '-v', $sourceMount,
+    '-v', $lockMount,
     '-v', $targetMount,
     '-v', $registryMount,
     '-v', $gitMount,

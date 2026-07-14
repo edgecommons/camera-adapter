@@ -132,6 +132,38 @@ for volume in "$target_volume" "$registry_volume" "$git_volume"; do
     docker volume create "$volume" >/dev/null
 done
 
+# THE LOCKFILE. `Cargo.lock` is untracked and gitignored, so a clean checkout has none -- and every
+# cargo run below passes `--locked`, which REFUSES to create one ("cannot create the lock file ...
+# because --locked was passed"). Dropping `--locked` does not rescue it either: the source is mounted
+# `:ro` on purpose and cargo writes the lock next to the workspace Cargo.toml (CARGO_TARGET_DIR does
+# not move it), so cargo would then die on "Read-only file system (os error 30)". Two walls, one
+# behind the other.
+#
+# So the lock is bind-mounted as a single FILE from OUTSIDE the source tree, generated once by the
+# networked prep run below. The source tree is never written to -- the immutability this script
+# depends on holds exactly -- and `--locked` goes back to asserting something true. Generating it in
+# the container also keeps the lockfile version within what the pinned toolchain can read.
+lock_root="${TMPDIR:-/tmp}/camera-adapter-genicam-lock"
+mkdir -p -- "$lock_root"
+lock_file="$lock_root/Cargo.lock"
+# Docker creates a DIRECTORY at a bind source that does not exist; the file must exist first.
+[[ -f $lock_file ]] || : > "$lock_file"
+lock_mount_ro="$lock_file:/edgecommons/camera-adapter/Cargo.lock:ro"
+lock_mount_rw="$lock_file:/edgecommons/camera-adapter/Cargo.lock"
+
+# The one step with a network and a writable lock. Everything after it is hardened and `--locked`.
+docker run --rm --network bridge --read-only --tmpfs /tmp:size=64m,mode=1777 \
+    --cap-drop ALL --security-opt no-new-privileges:true \
+    -v "$workspace_root:/edgecommons:ro" \
+    -v "$lock_mount_rw" \
+    -v "$target_volume:/coverage-target" \
+    -v "$registry_volume:/usr/local/cargo/registry" \
+    -v "$git_volume:/usr/local/cargo/git" \
+    -w /edgecommons/camera-adapter \
+    -e CARGO_TARGET_DIR=/coverage-target \
+    "$image" +1.87.0 generate-lockfile
+[[ -s $lock_file ]] || { echo "the prep run did not produce a Cargo.lock at $lock_file" >&2; exit 1; }
+
 run_coverage_command() {
     local tmpfs_size=$1
     shift
@@ -139,6 +171,7 @@ run_coverage_command() {
         docker run --rm --network "$network_mode" --read-only "--tmpfs=/tmp:size=$tmpfs_size,mode=1777"
         --cap-drop ALL --security-opt no-new-privileges:true
         -v "$workspace_root:/edgecommons:ro"
+        -v "$lock_mount_ro"
         -v "$target_volume:/coverage-target"
         -v "$registry_volume:/usr/local/cargo/registry"
         -v "$git_volume:/usr/local/cargo/git"
