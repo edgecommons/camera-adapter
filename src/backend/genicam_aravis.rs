@@ -44,6 +44,26 @@ const MAX_HELPER_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_HELPER_STDERR_BYTES: u64 = 16 * 1024;
 const MAX_NATIVE_FIELD_BYTES: usize = 1_024;
 const NO_GIGE_INTERFACE: &str = "camera-adapter-no-gige-interface";
+
+/// Native connects that may be in flight at once.
+///
+/// `connect` spawns an OS thread and, inside it, calls straight into Aravis -- which resolves the
+/// camera behind `with_scoped_aravis`, a PROCESS-WIDE lock that is not cancellable and not deadline
+/// aware. A thread that gets there while the lock is held blocks until it is free, and nothing about
+/// the caller giving up reaches it.
+///
+/// The async side, meanwhile, DOES give up: it races the connect against the deadline and returns a
+/// timeout. The thread it left behind does not stop existing. So a camera that has gone dark -- the
+/// exact condition that produces retries -- had every retry spawn another thread, pile it onto the
+/// same lock, and abandon it. Threads accumulated for as long as the camera stayed dark, which is to
+/// say without bound, and an OS thread is a megabyte of stack that no amount of care elsewhere in the
+/// component gets back.
+///
+/// Discovery had admission control from the start (`discovery_permit`). Connect never did. It does
+/// now, and the permit is held by the THREAD rather than the future, because the thread is what
+/// outlives the timeout. A connect that cannot get a permit before its deadline fails in async-land,
+/// having spawned nothing.
+const MAX_CONCURRENT_CONNECTS: usize = 4;
 const TIMESTAMP_REFRESH_NS: u64 = 60_000_000_000;
 
 static ARAVIS_TOKEN: Mutex<Option<aravis::Aravis>> = Mutex::new(None);
@@ -53,6 +73,7 @@ static ARAVIS_TOKEN: Mutex<Option<aravis::Aravis>> = Mutex::new(None);
 pub struct GenicamAravisBackendFactory {
     native: Arc<dyn NativeBackend>,
     discovery_permit: Arc<Semaphore>,
+    connect_permit: Arc<Semaphore>,
 }
 
 impl Default for GenicamAravisBackendFactory {
@@ -60,6 +81,7 @@ impl Default for GenicamAravisBackendFactory {
         Self {
             native: Arc::new(ProductionNativeBackend),
             discovery_permit: Arc::new(Semaphore::new(1)),
+            connect_permit: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTS)),
         }
     }
 }
@@ -70,6 +92,7 @@ impl GenicamAravisBackendFactory {
         Self {
             native,
             discovery_permit: Arc::new(Semaphore::new(1)),
+            connect_permit: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTS)),
         }
     }
 }
@@ -124,6 +147,21 @@ impl CameraBackendFactory for GenicamAravisBackendFactory {
             );
         };
         let deadline = Instant::now() + request.timeout;
+
+        // Admission FIRST, and the thread only if it is granted. A connect that cannot get a permit
+        // before its deadline gives up here, in async-land, having spawned nothing -- which is the
+        // whole point: the thread is the resource that leaks, so the bound has to sit in front of it.
+        let permit = tokio::select! {
+            biased;
+            _ = request.cancellation.cancelled() => return cancelled("before GenICam connect"),
+            _ = tokio::time::sleep_until(deadline.into()) => {
+                return timeout("waiting for GenICam connect admission");
+            }
+            permit = self.connect_permit.clone().acquire_owned() => {
+                permit.map_err(|_| backend_error("connect admission is closed"))?
+            }
+        };
+
         let (sender, receiver) = mpsc::sync_channel(WORKER_QUEUE_CAPACITY);
         let (initial_sender, initial_receiver) = oneshot::channel();
         let native = self.native.clone();
@@ -134,13 +172,22 @@ impl CameraBackendFactory for GenicamAravisBackendFactory {
                 bounded_thread_label(&request.instance_id)
             ))
             .spawn(move || {
-                let mut session = match native.connect(&config, deadline, &cancellation) {
+                let connected = native.connect(&config, deadline, &cancellation);
+
+                // The permit covers the CONNECT, not the session. It is released the moment the native
+                // call returns -- including the slow, lock-bound failure this exists to contain -- so a
+                // camera that is merely connected costs no admission, and the number of cameras a
+                // component can hold open is not quietly capped at the number of connects it may
+                // attempt at once. Those are different resources and they get different bounds.
+                let mut session = match connected {
                     Ok(session) => session,
                     Err(error) => {
+                        drop(permit);
                         let _ = initial_sender.send(Err(error));
                         return;
                     }
                 };
+                drop(permit);
                 let capabilities = session.capabilities().clone();
                 if initial_sender.send(Ok(capabilities)).is_err() {
                     let _ = session.close();
@@ -1872,7 +1919,7 @@ fn backend_error(message: impl Into<String>) -> CameraError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
     use crate::config::{CaptureInterlock, GenicamSelector, OfflinePolicy, ProfileOutputConfig};
@@ -1895,6 +1942,96 @@ mod tests {
             serial: Some("serial-1".to_owned()),
             warnings: Vec::new(),
         }
+    }
+
+    /// A camera that has gone dark cannot make the component spawn threads without bound.
+    ///
+    /// `connect` spawns an OS thread that calls into Aravis behind a PROCESS-WIDE, non-cancellable
+    /// lock, and the async side abandons that thread when the deadline passes. Retrying a dark camera
+    /// -- the exact condition that produces retries -- therefore piled up one abandoned, parked thread
+    /// per attempt, for as long as the camera stayed dark.
+    ///
+    /// Here twelve connects race a native backend that blocks, as the real one does when the lock is
+    /// held. At most `MAX_CONCURRENT_CONNECTS` may be inside the native call at once, and the ones that
+    /// cannot get in must fail WITHOUT having started a thread.
+    #[tokio::test]
+    async fn a_dark_camera_cannot_spawn_threads_without_bound() {
+        struct BlockingNative {
+            in_flight: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+            entered: Arc<AtomicUsize>,
+        }
+
+        impl NativeBackend for BlockingNative {
+            fn discover(
+                &self,
+                _interfaces: &[String],
+                _maximum: usize,
+                _deadline: Instant,
+                _cancellation: &CancellationToken,
+            ) -> Result<Vec<WireDevice>> {
+                Ok(Vec::new())
+            }
+
+            fn connect(
+                &self,
+                _config: &GenicamBackendConfig,
+                _deadline: Instant,
+                _cancellation: &CancellationToken,
+            ) -> Result<Box<dyn NativeSession>> {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(current, Ordering::SeqCst);
+                // Aravis, holding the process-wide scope lock. Deadline and cancellation reach nothing
+                // here -- that is the whole reason the bound has to sit in front of the thread.
+                std::thread::sleep(Duration::from_millis(400));
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Err(backend_error("the camera is dark"))
+            }
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(GenicamAravisBackendFactory::with_native(Arc::new(
+            BlockingNative {
+                in_flight: in_flight.clone(),
+                peak: peak.clone(),
+                entered: entered.clone(),
+            },
+        )));
+
+        let attempts = (0..12).map(|index| {
+            let factory = factory.clone();
+            tokio::spawn(async move {
+                factory
+                    .connect(ConnectRequest {
+                        instance_id: format!("camera-{index}"),
+                        backend: BackendConfig::GenicamAravis(backend_config()),
+                        timeout: Duration::from_millis(500),
+                        cancellation: CancellationToken::new(),
+                    })
+                    .await
+            })
+        });
+        let outcomes = futures::future::join_all(attempts).await;
+
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.as_ref().unwrap().is_err()),
+            "a dark camera connects to nobody"
+        );
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= MAX_CONCURRENT_CONNECTS,
+            "{peak} native connects were in flight at once against a bound of              {MAX_CONCURRENT_CONNECTS}; every one of them is an abandoned OS thread parked on a              process-wide lock, and a camera that stays dark keeps producing them"
+        );
+        let entered = entered.load(Ordering::SeqCst);
+        assert!(
+            entered < 12,
+            "all twelve attempts reached the native call, so admission admitted everything; the              attempts that cannot get a permit before their deadline must fail without starting a              thread at all"
+        );
     }
 
     struct ThreadAffineNative {
