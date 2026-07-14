@@ -840,9 +840,29 @@ impl AccessUnitAssembler {
         }
         self.timestamp.get_or_insert(packet.timestamp);
         self.expected_sequence = Some(packet.sequence.wrapping_add(1));
-        match self.codec {
-            RtspCodec::H264 => self.push_h264(packet)?,
-            RtspCodec::H265 => self.push_h265(packet)?,
+        let assembled = match self.codec {
+            RtspCodec::H264 => self.push_h264(packet),
+            RtspCodec::H265 => self.push_h265(packet),
+        };
+        if let Err(error) = assembled {
+            // An access unit larger than `maximumFrameBytes` is unusable -- exactly as unusable as one
+            // that lost a packet, which this assembler already survives by discarding it, counting it,
+            // and resynchronising on the next unit. Only the oversized case killed the worker, and
+            // that asymmetry is plainly unintended: it means a camera whose keyframes exceed the bound
+            // fails on EVERY keyframe, and each failure tears the session down and reconnects. The
+            // frame is lost either way; the session need not be.
+            //
+            // The bound itself still holds -- the bytes are dropped, not kept -- which is the whole
+            // point of it.
+            if error.code() == ErrorCode::ResourceLimit {
+                tracing::debug!(
+                    maximum_bytes = self.maximum_bytes,
+                    "an RTSP access unit exceeded the configured frame bound and was discarded"
+                );
+                self.discard_incomplete();
+                return Ok(None);
+            }
+            return Err(error);
         }
         if !packet.marker {
             return Ok(None);
@@ -2748,28 +2768,66 @@ impl RtspWorkerHandle {
         self.interest.send_replace(now);
     }
 
+    /// Stops the worker, giving it long enough to say goodbye to the camera.
+    ///
+    /// The worker ends with a TEARDOWN: cancel it, and on its way out it tells the camera the session
+    /// is over. `abort()` kills the task before it reaches that line, and this used to abort outright
+    /// whenever the deadline had already passed -- which is PRECISELY the OnDemand success path, where
+    /// the capture has consumed its budget by definition. So the common case was the one that skipped
+    /// the goodbye.
+    ///
+    /// Cameras cap concurrent RTSP sessions at two to ten. A session leaked per capture does not look
+    /// like a bug for a day or so; it looks like a camera that has "stopped answering" and needs a
+    /// power cycle. The teardown is therefore given its own small budget rather than the caller's --
+    /// the caller's is spent, and that is not the camera's fault.
     async fn stop(&mut self, deadline: Instant) {
         self.cancellation.cancel();
         let Some(mut join) = self.join.take() else {
             return;
         };
-        if deadline <= Instant::now() {
-            join.abort();
-            return;
-        }
+        let farewell = deadline.max(Instant::now() + TEARDOWN_GRACE);
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => join.abort(),
+            _ = tokio::time::sleep_until(farewell) => join.abort(),
             _ = &mut join => {},
         }
     }
 }
 
+/// How long a cancelled RTSP worker is given to tell the camera the session is over.
+///
+/// The worker's own TEARDOWN carries a one-second deadline; this is the outer bound on waiting for it.
+#[cfg(feature = "rtsp")]
+const TEARDOWN_GRACE: Duration = Duration::from_millis(1_500);
+
 #[cfg(feature = "rtsp")]
 impl Drop for RtspWorkerHandle {
+    /// Cancels the worker and lets it finish saying goodbye.
+    ///
+    /// Dropping used to cancel and then immediately `abort()`, so the TEARDOWN the worker performs on
+    /// its way out never ran -- on every path that drops a session without awaiting it: a config
+    /// reload, a reconnect, an actor tearing down. The graceful path tore down correctly; only the
+    /// abort paths did not, which is the shape of a bug that never shows up in a test and shows up on
+    /// day three in the field as a camera that refuses new sessions.
+    ///
+    /// A `Drop` cannot await, so the goodbye is handed to a task that can -- bounded, so a worker that
+    /// hangs on a camera that has gone dark cannot outlive its usefulness. Outside a Tokio runtime
+    /// (a plain test, or teardown after the runtime is gone) there is nothing to hand it to, and
+    /// aborting is all that is left.
     fn drop(&mut self) {
         self.cancellation.cancel();
-        if let Some(join) = self.join.take() {
-            join.abort();
+        let Some(mut join) = self.join.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    tokio::select! {
+                        _ = tokio::time::sleep(TEARDOWN_GRACE) => join.abort(),
+                        _ = &mut join => {},
+                    }
+                });
+            }
+            Err(_) => join.abort(),
         }
     }
 }
@@ -3802,6 +3860,46 @@ mod tests {
         );
     }
 
+    /// A frame too big for the bound costs a frame, not the camera.
+    ///
+    /// The assembler already survives a lost packet: it discards the half-built unit, counts it, and
+    /// resynchronises on the next one. An access unit that exceeded `maximumFrameBytes` did NOT get
+    /// that treatment -- it returned an error, which killed the worker, which tore the session down and
+    /// reconnected. So a camera whose keyframes are larger than the configured bound failed on EVERY
+    /// keyframe and reconnected on every one of them, forever. The frame is lost either way; the
+    /// session need not be.
+    ///
+    /// The bound still holds: the bytes are dropped, not kept.
+    #[test]
+    fn an_oversized_access_unit_costs_a_frame_and_not_the_session() {
+        // Room for a small unit, and nowhere near enough for the one below.
+        let mut assembler = AccessUnitAssembler::new(&track(RtspCodec::H264), 64).unwrap();
+
+        let huge = vec![0x41_u8; 200];
+        let mut payload = vec![0x41];
+        payload.extend_from_slice(&huge);
+        let oversized = rtp(1, 10, true, 96, &payload);
+        assert!(
+            assembler
+                .push(parse_rtp_packet(&oversized).unwrap())
+                .expect("an oversized unit is a lost frame, not a broken session")
+                .is_none(),
+            "it must not be delivered either -- the bound is a bound"
+        );
+        assert_eq!(
+            assembler.incomplete_units, 1,
+            "and it is counted, exactly as a unit that lost a packet is counted"
+        );
+
+        // The session survives, and the very next frame decodes.
+        let good = rtp(2, 20, true, 96, &[0x65, 1, 2, 3]);
+        let unit = assembler
+            .push(parse_rtp_packet(&good).unwrap())
+            .expect("the assembler resynchronises")
+            .expect("the next access unit is delivered");
+        assert_eq!(unit.rtp_timestamp, 20);
+    }
+
     #[test]
     fn h264_fu_a_requires_complete_contiguous_frame() {
         let mut assembler = AccessUnitAssembler::new(&track(RtspCodec::H264), 4096).unwrap();
@@ -3839,8 +3937,19 @@ mod tests {
         assert_eq!(unit.bytes.as_ref(), &[0, 0, 0, 1, 19 << 1, 1, 9, 8]);
         assert_eq!(unit.compressed_bytes, 8);
 
+        // The bound holds: a unit that does not fit is dropped and counted, and is never delivered.
+        // It used to be FATAL, which killed the worker and tore the session down -- so a camera whose
+        // keyframes exceeded the bound reconnected on every keyframe. Enforcing a bound and surviving
+        // it are not in tension.
         let mut bounded = AccessUnitAssembler::new(&track(RtspCodec::H265), 6).unwrap();
-        assert!(bounded.push(parse_rtp_packet(&start).unwrap()).is_err());
+        assert!(
+            bounded
+                .push(parse_rtp_packet(&start).unwrap())
+                .expect("an oversized unit costs a frame, not the session")
+                .is_none(),
+            "and it is certainly not delivered"
+        );
+        assert_eq!(bounded.incomplete_units, 1);
     }
 
     #[test]
