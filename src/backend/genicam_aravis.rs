@@ -430,7 +430,13 @@ impl CameraSession for GenicamSessionProxy {
         }
     }
 
-    async fn ptz(&mut self, _request: PtzRequest) -> Result<PtzResult> {
+    async fn ptz_bounded(
+        &mut self,
+        _request: PtzRequest,
+        _deadline: tokio::time::Instant,
+        _cancellation: &CancellationToken,
+    ) -> Result<PtzResult> {
+        // Refusing takes no time, so there is no deadline to honour and nothing to cancel.
         rejected(
             ErrorCode::UnsupportedCapability,
             "GenICam PTZ is not configured or supported",
@@ -1919,6 +1925,30 @@ fn backend_error(message: impl Into<String>) -> CameraError {
 
 #[cfg(test)]
 mod tests {
+    /// A generously-bounded PTZ call, for tests that are not about the bound.
+    ///
+    /// `CameraSession` deliberately offers only `ptz_bounded`: an unbounded variant is an invitation to
+    /// fabricate the deadline and the cancellation token, which is precisely what the old required
+    /// `ptz` drove `OnvifSession` to do. Tests that are exercising PTZ BEHAVIOUR still want to say
+    /// `session.ptz(request)` without inventing a deadline in every line, so they say it here, once,
+    /// where the deadline is obviously a test's and not a protocol's.
+    #[async_trait]
+    trait GenerouslyBoundedPtz {
+        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult>;
+    }
+
+    #[async_trait]
+    impl<T: CameraSession + ?Sized> GenerouslyBoundedPtz for T {
+        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
+            self.ptz_bounded(
+                request,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+        }
+    }
+
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;

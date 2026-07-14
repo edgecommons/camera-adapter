@@ -3655,15 +3655,6 @@ impl CameraSession for OnvifSession {
         }
     }
 
-    async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
-        self.ptz_call(
-            &request,
-            Instant::now() + DEFAULT_PTZ_REQUEST_TIMEOUT,
-            &CancellationToken::new(),
-        )
-        .await
-    }
-
     async fn ptz_bounded(
         &mut self,
         request: PtzRequest,
@@ -4290,6 +4281,30 @@ fn cancelled_error(stage: &'static str) -> CameraError {
 
 #[cfg(test)]
 mod tests {
+    /// A generously-bounded PTZ call, for tests that are not about the bound.
+    ///
+    /// `CameraSession` deliberately offers only `ptz_bounded`: an unbounded variant is an invitation to
+    /// fabricate the deadline and the cancellation token, which is precisely what the old required
+    /// `ptz` drove `OnvifSession` to do. Tests that are exercising PTZ BEHAVIOUR still want to say
+    /// `session.ptz(request)` without inventing a deadline in every line, so they say it here, once,
+    /// where the deadline is obviously a test's and not a protocol's.
+    #[async_trait]
+    trait GenerouslyBoundedPtz {
+        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult>;
+    }
+
+    #[async_trait]
+    impl<T: CameraSession + ?Sized> GenerouslyBoundedPtz for T {
+        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
+            self.ptz_bounded(
+                request,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+        }
+    }
+
     use std::collections::{BTreeMap, VecDeque};
     use std::net::IpAddr;
     use std::str::FromStr;

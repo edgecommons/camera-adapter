@@ -9,6 +9,8 @@ use std::io::Cursor;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use bytes::Bytes;
 use chrono::Utc;
 use image::ExtendedColorType;
@@ -269,7 +271,25 @@ impl CameraSession for SimSession {
         })
     }
 
-    async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
+    async fn ptz_bounded(
+        &mut self,
+        request: PtzRequest,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<PtzResult> {
+        crate::backend::bounded_ptz(self.apply_ptz(request), deadline, cancellation).await
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        self.moving = false;
+        self.closed = true;
+        Ok(())
+    }
+}
+
+impl SimSession {
+    /// The simulated PTZ state machine. Entirely in memory, so it cannot outrun a deadline.
+    async fn apply_ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
         self.ensure_ptz()?;
         match request {
             PtzRequest::Continuous { velocity, .. } => {
@@ -396,11 +416,6 @@ impl CameraSession for SimSession {
         }
     }
 
-    async fn close(&mut self) -> Result<()> {
-        self.moving = false;
-        self.closed = true;
-        Ok(())
-    }
 }
 
 fn stable_seed(value: &str) -> u64 {
@@ -482,6 +497,30 @@ fn pixel(
 
 #[cfg(test)]
 mod tests {
+    /// A generously-bounded PTZ call, for tests that are not about the bound.
+    ///
+    /// `CameraSession` deliberately offers only `ptz_bounded`: an unbounded variant is an invitation to
+    /// fabricate the deadline and the cancellation token, which is precisely what the old required
+    /// `ptz` drove `OnvifSession` to do. Tests that are exercising PTZ BEHAVIOUR still want to say
+    /// `session.ptz(request)` without inventing a deadline in every line, so they say it here, once,
+    /// where the deadline is obviously a test's and not a protocol's.
+    #[async_trait]
+    trait GenerouslyBoundedPtz {
+        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult>;
+    }
+
+    #[async_trait]
+    impl<T: CameraSession + ?Sized> GenerouslyBoundedPtz for T {
+        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
+            self.ptz_bounded(
+                request,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+        }
+    }
+
     use super::*;
     use crate::config::CaptureProfile;
     use serde_json::json;

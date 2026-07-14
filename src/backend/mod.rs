@@ -131,50 +131,74 @@ pub trait CameraSession: Send + 'static {
     async fn capture(&mut self, request: CaptureRequest) -> Result<CaptureFrame>;
 
     /// Executes or observes a capability-gated PTZ operation.
-    async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult>;
-
-    /// Executes a PTZ operation with a caller-owned deadline and cancellation signal.
+    /// Executes a PTZ operation under the caller's deadline and cancellation signal.
     ///
-    /// The default preserves the legacy [`Self::ptz`] implementation contract for simple backends
-    /// while ensuring a non-cooperative implementation cannot keep its owning camera actor blocked
-    /// past the caller's bound. Protocol backends should override this method to pass the same
-    /// deadline and cancellation into their transport layer.
+    /// There is no unbounded variant, deliberately. The trait used to REQUIRE one -- a bare
+    /// `ptz(&mut self, request)` with no deadline and no cancellation -- and default `ptz_bounded` on
+    /// top of it. Production never called the bare one, so every backend had to implement a method
+    /// nothing invoked, and `OnvifSession`'s implementation of it did what a backend does when handed
+    /// an obligation with no information: it INVENTED the missing arguments, fabricating a
+    /// `CancellationToken::new()` that no one holds and therefore no one can ever cancel, and a
+    /// timeout of its own choosing in place of the caller's.
+    ///
+    /// Dead code, and a loaded gun: the first caller to reach for the obvious-looking `session.ptz()`
+    /// would have got an uncancellable protocol call against a made-up deadline. The obligation is gone.
+    /// A backend that wants the old wrapping behaviour asks for it explicitly, with [`bounded_ptz`].
     async fn ptz_bounded(
         &mut self,
         request: PtzRequest,
         deadline: Instant,
         cancellation: &CancellationToken,
-    ) -> Result<PtzResult> {
-        if cancellation.is_cancelled() {
-            return Err(crate::CameraError::rejected(
-                crate::ErrorCode::CaptureCancelled,
-                "PTZ operation was cancelled before execution",
-            ));
-        }
-        if deadline <= Instant::now() {
-            return Err(crate::CameraError::rejected(
-                crate::ErrorCode::PtzTimeout,
-                "PTZ operation exceeded its deadline",
-            ));
-        }
-        let operation = self.ptz(request);
-        tokio::pin!(operation);
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => Err(crate::CameraError::rejected(
-                crate::ErrorCode::CaptureCancelled,
-                "PTZ operation was cancelled",
-            )),
-            _ = tokio::time::sleep_until(deadline) => Err(crate::CameraError::rejected(
-                crate::ErrorCode::PtzTimeout,
-                "PTZ operation exceeded its deadline",
-            )),
-            result = &mut operation => result,
-        }
-    }
+    ) -> Result<PtzResult>;
 
     /// Best-effort protocol close. It must be idempotent.
     async fn close(&mut self) -> Result<()>;
+}
+
+/// Runs an unbounded protocol call under a caller-owned deadline and cancellation signal.
+///
+/// This is the body that used to be the default `ptz_bounded`. It is a free function now rather than a
+/// default method, because a default silently applies to a backend that never thought about the bound,
+/// and being explicit is the point: a non-cooperative implementation cannot keep its owning camera actor
+/// blocked past the caller's deadline, and the backend has to say that it wants that guarantee.
+///
+/// A backend whose transport can take the deadline and the token directly (ONVIF does) should pass them
+/// down instead of wrapping, because cancelling a future only drops it -- it does not reach across a
+/// socket or a native worker thread.
+///
+/// # Errors
+/// `CAPTURE_CANCELLED` if the token is or becomes cancelled, `PTZ_TIMEOUT` if the deadline passes, and
+/// whatever the operation itself returns otherwise.
+pub async fn bounded_ptz(
+    operation: impl std::future::Future<Output = Result<PtzResult>>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<PtzResult> {
+    if cancellation.is_cancelled() {
+        return Err(crate::CameraError::rejected(
+            crate::ErrorCode::CaptureCancelled,
+            "PTZ operation was cancelled before execution",
+        ));
+    }
+    if deadline <= Instant::now() {
+        return Err(crate::CameraError::rejected(
+            crate::ErrorCode::PtzTimeout,
+            "PTZ operation exceeded its deadline",
+        ));
+    }
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(crate::CameraError::rejected(
+            crate::ErrorCode::CaptureCancelled,
+            "PTZ operation was cancelled",
+        )),
+        () = tokio::time::sleep_until(deadline) => Err(crate::CameraError::rejected(
+            crate::ErrorCode::PtzTimeout,
+            "PTZ operation exceeded its deadline",
+        )),
+        result = &mut operation => result,
+    }
 }
 
 /// Runtime-owned services required to construct protocol backends safely.

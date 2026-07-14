@@ -14239,9 +14239,11 @@ mod tests {
                 unreachable!("the shutdown teardown test never captures")
             }
 
-            async fn ptz(
+            async fn ptz_bounded(
                 &mut self,
                 request: crate::model::PtzRequest,
+                _deadline: tokio::time::Instant,
+                _cancellation: &CancellationToken,
             ) -> Result<crate::model::PtzResult> {
                 self.stops.lock().unwrap().push(request);
                 Ok(crate::model::PtzResult::Commanded)

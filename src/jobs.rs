@@ -2093,9 +2093,19 @@ mod tests {
             unreachable!("the interlock must finish before capture")
         }
 
-        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
-            lock(&self.calls).push(request);
-            std::future::pending().await
+        async fn ptz_bounded(
+            &mut self,
+            request: PtzRequest,
+            deadline: Instant,
+            cancellation: &CancellationToken,
+        ) -> Result<PtzResult> {
+            // Hangs forever on purpose. The bound is what must end it -- which is the whole reason the
+            // trait no longer lets a backend skip one.
+            let operation = async move {
+                lock(&self.calls).push(request);
+                std::future::pending().await
+            };
+            crate::backend::bounded_ptz(operation, deadline, cancellation).await
         }
 
         async fn close(&mut self) -> Result<()> {
@@ -2123,7 +2133,12 @@ mod tests {
             unreachable!("the interlock must finish before capture")
         }
 
-        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
+        async fn ptz_bounded(
+            &mut self,
+            request: PtzRequest,
+            _deadline: Instant,
+            _cancellation: &CancellationToken,
+        ) -> Result<PtzResult> {
             lock(&self.calls).push(request.clone());
             match request {
                 PtzRequest::Status => Err(CameraError::rejected(

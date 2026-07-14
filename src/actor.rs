@@ -675,7 +675,12 @@ mod tests {
             panic!("injected backend panic")
         }
 
-        async fn ptz(&mut self, _request: PtzRequest) -> Result<PtzResult> {
+        async fn ptz_bounded(
+            &mut self,
+            _request: PtzRequest,
+            _deadline: Instant,
+            _cancellation: &CancellationToken,
+        ) -> Result<PtzResult> {
             Ok(PtzResult::Commanded)
         }
 
@@ -704,18 +709,27 @@ mod tests {
             unreachable!("the control-lane regression test does not capture")
         }
 
-        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
-            match request {
-                PtzRequest::Continuous { .. } => {
-                    self.ordinary_started.store(true, Ordering::Release);
-                    std::future::pending().await
+        async fn ptz_bounded(
+            &mut self,
+            request: PtzRequest,
+            deadline: Instant,
+            cancellation: &CancellationToken,
+        ) -> Result<PtzResult> {
+            // The continuous move hangs forever on purpose. The bound is what must end it.
+            let operation = async move {
+                match request {
+                    PtzRequest::Continuous { .. } => {
+                        self.ordinary_started.store(true, Ordering::Release);
+                        std::future::pending().await
+                    }
+                    PtzRequest::Stop { .. } => {
+                        self.safety_stops.fetch_add(1, Ordering::AcqRel);
+                        Ok(PtzResult::Commanded)
+                    }
+                    _ => unreachable!("the control-lane regression test only moves then stops"),
                 }
-                PtzRequest::Stop { .. } => {
-                    self.safety_stops.fetch_add(1, Ordering::AcqRel);
-                    Ok(PtzResult::Commanded)
-                }
-                _ => unreachable!("the control-lane regression test only moves then stops"),
-            }
+            };
+            crate::backend::bounded_ptz(operation, deadline, cancellation).await
         }
 
         async fn close(&mut self) -> Result<()> {
