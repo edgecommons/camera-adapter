@@ -2756,4 +2756,654 @@ mod tests {
             ErrorCode::CaptureTimeout
         );
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // The frame path.
+    //
+    // An adapter whose whole purpose is to deliver the picture a camera took must deliver THAT
+    // picture. Everything below exists to prove that the bytes the sensor exposed are the bytes the
+    // caller is handed -- across the native conversion, across the worker thread, and across the
+    // bound that is allowed to refuse a frame but never to shorten one.
+    // ---------------------------------------------------------------------------------------------
+
+    /// Register addresses of the Aravis fake camera, from `arvfakecamera.h`.
+    ///
+    /// Writing them is how a test tells the fake camera which picture to take.
+    const FAKE_REGISTER_WIDTH: u32 = 0x100;
+    const FAKE_REGISTER_HEIGHT: u32 = 0x104;
+    const FAKE_REGISTER_GAIN_RAW: u32 = 0x110;
+    const FAKE_REGISTER_EXPOSURE_TIME_US: u32 = 0x120;
+    const FAKE_REGISTER_PIXEL_FORMAT: u32 = 0x128;
+
+    /// The exposure at which the fake camera's fill pattern has a scale of exactly 1.0.
+    const FAKE_EXPOSURE_TIME_US: u32 = 10_000;
+
+    /// A real, camera-filled `ArvBuffer` -- the exact thing [`frame_from_buffer`] is handed on a live
+    /// link, produced without a camera and without a network.
+    ///
+    /// `arv_fake_camera_fill_buffer` is the same call Aravis' own stream makes when a device delivers
+    /// a frame: it stamps the buffer's status, payload type, geometry, pixel format and padding, and
+    /// then writes the pixels through the camera's fill-pattern callback. The production conversion
+    /// therefore runs against a genuine acquisition buffer rather than a mock of the type it consumes.
+    fn camera_filled_buffer(
+        width: u32,
+        height: u32,
+        pixel_format: aravis::PixelFormat,
+        allocated_bytes: usize,
+    ) -> aravis::Buffer {
+        // The fake camera's serial lives in a GVBS register and must stay under 16 bytes.
+        let camera = aravis::FakeCamera::new("ec-frame-01");
+        for (address, value) in [
+            (FAKE_REGISTER_WIDTH, width),
+            (FAKE_REGISTER_HEIGHT, height),
+            (FAKE_REGISTER_PIXEL_FORMAT, pixel_format.raw()),
+            // Gain 0 at the default exposure makes the ramp's scale exactly 1.0, so the picture the
+            // camera takes is precisely the one `expected_diagonal_ramp` predicts.
+            (FAKE_REGISTER_GAIN_RAW, 0),
+            (FAKE_REGISTER_EXPOSURE_TIME_US, FAKE_EXPOSURE_TIME_US),
+        ] {
+            assert!(
+                camera.write_register(address, value),
+                "the fake camera must accept register 0x{address:x}"
+            );
+        }
+        let buffer = aravis::Buffer::new_allocate(allocated_bytes);
+        camera.fill_buffer(&buffer);
+        buffer
+    }
+
+    /// The exact picture the fake camera is documented to take, computed independently of it.
+    ///
+    /// `arv_fake_camera_diagonal_ramp` writes one byte per pixel, row-major, with the value
+    /// `(x + frameId + y) % 255` multiplied by `1 + gain + log10(exposure / 10000)` -- which
+    /// [`camera_filled_buffer`] pins to exactly 1.0. This is a MODEL of the image, derived from the
+    /// camera's contract; it is not read back out of the buffer the code under test read. Comparing a
+    /// delivered frame against the buffer it was built from would prove nothing, because a corruption
+    /// in the conversion would corrupt both sides of that comparison equally.
+    fn expected_diagonal_ramp(width: u32, height: u32, frame_id: u64) -> Vec<u8> {
+        (0..u64::from(height))
+            .flat_map(|y| {
+                (0..u64::from(width))
+                    .map(move |x| u8::try_from((x + y + frame_id) % 255).unwrap_or(u8::MAX))
+            })
+            .collect()
+    }
+
+    /// Byte-for-byte image equality, whose failure names the first pixel that was corrupted.
+    #[track_caller]
+    fn assert_pixels_identical(delivered: &[u8], exposed: &[u8], what: &str) {
+        assert_eq!(
+            delivered.len(),
+            exposed.len(),
+            "{what}: the camera exposed {} bytes and the adapter delivered {} -- an image that \
+             changes length between the sensor and the caller has been truncated, padded, or \
+             re-packed, and the picture that arrives is not the picture that was taken",
+            exposed.len(),
+            delivered.len()
+        );
+        if let Some((index, (delivered_byte, exposed_byte))) = delivered
+            .iter()
+            .zip(exposed)
+            .enumerate()
+            .find(|(_, (delivered, exposed))| delivered != exposed)
+        {
+            panic!(
+                "{what}: byte {index} of the delivered image is 0x{delivered_byte:02x} where the \
+                 camera exposed 0x{exposed_byte:02x} -- the image that was delivered is not the \
+                 image the camera took"
+            );
+        }
+    }
+
+    /// The image the adapter delivers IS the image the GenICam camera took -- byte for byte.
+    ///
+    /// This is the backend's entire purpose, and nothing pinned it. `frame_from_buffer` lifts the
+    /// pixels out of a native acquisition buffer into a `CaptureFrame`, and a truncation, a re-pack,
+    /// or a stride mistake there yields a frame that is internally perfectly consistent -- correct
+    /// length, correct geometry, a digest that verifies against itself downstream -- while showing a
+    /// DIFFERENT picture than the sensor exposed. Nothing inside the frame can reveal that; the only
+    /// defence is an independent model of what the camera put on the wire, which is what the fake
+    /// camera's documented diagonal ramp provides.
+    #[test]
+    fn the_image_that_is_delivered_is_the_image_the_genicam_camera_took() {
+        const WIDTH: u32 = 512;
+        const HEIGHT: u32 = 512;
+        let payload = usize::try_from(WIDTH * HEIGHT).expect("a 512x512 Mono8 payload fits a usize");
+
+        let buffer = camera_filled_buffer(WIDTH, HEIGHT, aravis::PixelFormat::MONO_8, payload);
+        assert_eq!(
+            buffer.status(),
+            aravis::BufferStatus::Success,
+            "the fake camera must have completed the frame, or this test proves nothing"
+        );
+        let exposed = expected_diagonal_ramp(WIDTH, HEIGHT, buffer.frame_id());
+
+        let frame = frame_from_buffer(
+            &buffer,
+            u64::try_from(payload).expect("the payload fits a u64"),
+            WireTransport::GigeVision,
+            &mut TimestampCalibration::default(),
+        )
+        .expect("a complete Mono8 buffer that the camera filled must become a frame");
+
+        assert_pixels_identical(frame.bytes.as_ref(), &exposed, "a 512x512 Mono8 frame");
+        assert_eq!(
+            (frame.width, frame.height),
+            (WIDTH, HEIGHT),
+            "an image delivered with the wrong geometry is a corrupted image, however intact its \
+             bytes are: every consumer reads those bytes through the width it was told"
+        );
+        assert_eq!(
+            frame.pixel_format,
+            PixelFormat::Mono8,
+            "and the format is how those bytes are interpreted at all"
+        );
+        assert_eq!(
+            u64::try_from(frame.bytes.len()).expect("the frame length fits a u64"),
+            PixelFormat::Mono8
+                .uncompressed_len(frame.width, frame.height)
+                .expect("Mono8 is uncompressed"),
+            "the delivered image must hold exactly one byte per pixel of the geometry it declares"
+        );
+        assert_eq!(frame.capture_mode, CaptureMode::SoftwareTrigger);
+        assert_eq!(
+            frame.backend_metadata.get("frameId"),
+            Some(&json!(buffer.frame_id())),
+            "the frame must carry the camera's own identifier for the picture it is"
+        );
+        assert_eq!(
+            frame.backend_metadata.get("transport"),
+            Some(&json!(WireTransport::GigeVision))
+        );
+    }
+
+    /// A delivered row is exactly `width` bytes: no stride padding is added, and none is dropped.
+    ///
+    /// Cameras and imaging libraries routinely align rows to 4- or 8-byte boundaries. A conversion
+    /// that introduced such a stride -- or that stripped one a camera had sent -- would shift every
+    /// row after the first, producing a sheared picture whose byte count still looks plausible. The
+    /// geometry here is deliberately hostile to that mistake: 61 is odd and prime, so a padded row
+    /// cannot coincide with an unpadded one at any alignment.
+    #[test]
+    fn a_delivered_row_is_exactly_its_width_with_no_stride_padding() {
+        const WIDTH: u32 = 61;
+        const HEIGHT: u32 = 37;
+        let payload = usize::try_from(WIDTH * HEIGHT).expect("a 61x37 Mono8 payload fits a usize");
+
+        let buffer = camera_filled_buffer(WIDTH, HEIGHT, aravis::PixelFormat::MONO_8, payload);
+        assert_eq!(buffer.status(), aravis::BufferStatus::Success);
+        assert_eq!(
+            buffer.image_padding(),
+            (0, 0),
+            "the camera sent an unpadded image, which is the case this test is about"
+        );
+        let exposed = expected_diagonal_ramp(WIDTH, HEIGHT, buffer.frame_id());
+
+        let frame = frame_from_buffer(
+            &buffer,
+            u64::try_from(payload).expect("the payload fits a u64"),
+            WireTransport::GigeVision,
+            &mut TimestampCalibration::default(),
+        )
+        .expect("an odd-width Mono8 frame is still a frame");
+
+        assert_pixels_identical(frame.bytes.as_ref(), &exposed, "a 61x37 Mono8 frame");
+        assert_eq!(
+            frame.bytes.len(),
+            payload,
+            "a 61-byte row must stay a 61-byte row"
+        );
+        let four_byte_aligned_rows =
+            usize::try_from(HEIGHT).expect("the height fits a usize") * 64_usize;
+        assert_ne!(
+            frame.bytes.len(),
+            four_byte_aligned_rows,
+            "a conversion that padded each row out to a 4-byte alignment would have delivered \
+             {four_byte_aligned_rows} bytes of sheared image, and every assertion about the frame's \
+             own fields would still have passed"
+        );
+    }
+
+    /// A pixel format the adapter cannot read is REFUSED, never relabelled as one it can.
+    ///
+    /// The trap is Bayer: a Bayer BG8 frame carries exactly one byte per pixel -- the same byte count
+    /// as the Mono8 frame of the same geometry. Every length check in the path passes for it. Only
+    /// the pixel-format mapping stands between a colour-filter mosaic and its delivery as a
+    /// greyscale photograph, at full confidence, with a digest that verifies. Mono16 is the same
+    /// hazard with the bytes doubled.
+    #[test]
+    fn a_pixel_format_the_adapter_cannot_read_is_refused_rather_than_relabelled() {
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 48;
+        let mono8_bytes = usize::try_from(WIDTH * HEIGHT).expect("a 64x48 payload fits a usize");
+
+        let bayer =
+            camera_filled_buffer(WIDTH, HEIGHT, aravis::PixelFormat::BAYER_BG_8, mono8_bytes);
+        assert_eq!(bayer.status(), aravis::BufferStatus::Success);
+        assert_eq!(
+            bayer.image_data().len(),
+            mono8_bytes,
+            "the hazard this test exists for: a Bayer frame is byte-for-byte the same SIZE as the \
+             Mono8 frame it must never be mistaken for"
+        );
+        assert_eq!(
+            frame_from_buffer(
+                &bayer,
+                u64::try_from(mono8_bytes).expect("the payload fits a u64"),
+                WireTransport::GigeVision,
+                &mut TimestampCalibration::default(),
+            )
+            .expect_err("a Bayer mosaic must never be delivered as a greyscale image")
+            .code(),
+            ErrorCode::UnsupportedPixelFormat,
+            "a format the adapter cannot read is refused; it is not quietly reinterpreted as one it \
+             can"
+        );
+
+        let mono16_bytes = 2 * mono8_bytes;
+        let mono16 =
+            camera_filled_buffer(WIDTH, HEIGHT, aravis::PixelFormat::MONO_16, mono16_bytes);
+        assert_eq!(mono16.status(), aravis::BufferStatus::Success);
+        assert_eq!(
+            frame_from_buffer(
+                &mono16,
+                u64::try_from(mono16_bytes).expect("the payload fits a u64"),
+                WireTransport::GigeVision,
+                &mut TimestampCalibration::default(),
+            )
+            .expect_err("a 16-bit image must never be delivered as an 8-bit one")
+            .code(),
+            ErrorCode::UnsupportedPixelFormat,
+            "delivering Mono16 bytes under a Mono8 label would show a consumer half a picture of \
+             noise"
+        );
+
+        // The formats the adapter DOES read map to themselves and back, so a frame is labelled with
+        // the format the camera actually sent -- an RGB image delivered as BGR is a colour-swapped
+        // picture that no length check can catch.
+        for (native, mapped) in [
+            (aravis::PixelFormat::MONO_8, PixelFormat::Mono8),
+            (aravis::PixelFormat::RGB_8_PACKED, PixelFormat::Rgb8),
+            (aravis::PixelFormat::BGR_8_PACKED, PixelFormat::Bgr8),
+        ] {
+            assert_eq!(
+                from_aravis_pixel_format(native).expect("a supported native format"),
+                mapped,
+                "the native format the camera reported must map to the format the frame declares"
+            );
+            assert_eq!(
+                to_aravis_pixel_format(mapped),
+                Some(native),
+                "and the format the adapter asks the camera for must be the same one it reads back"
+            );
+        }
+    }
+
+    /// A frame larger than its reservation is REFUSED -- it is never truncated to fit.
+    ///
+    /// The reservation exists to bound memory, and the tempting way to honour it is to take what
+    /// fits. That silently delivers the top of a picture as though it were the picture. The refusal
+    /// is the only correct answer, and the same buffer at exactly its reservation must still arrive
+    /// whole -- which is what proves the refusal was the bound doing its job rather than the frame
+    /// being damaged.
+    #[test]
+    fn a_frame_larger_than_its_reservation_is_refused_and_never_truncated() {
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 48;
+        let payload = u64::from(WIDTH) * u64::from(HEIGHT);
+
+        let buffer = camera_filled_buffer(
+            WIDTH,
+            HEIGHT,
+            aravis::PixelFormat::MONO_8,
+            usize::try_from(payload).expect("the payload fits a usize"),
+        );
+        assert_eq!(buffer.status(), aravis::BufferStatus::Success);
+        let exposed = expected_diagonal_ramp(WIDTH, HEIGHT, buffer.frame_id());
+
+        assert_eq!(
+            frame_from_buffer(
+                &buffer,
+                payload - 1,
+                WireTransport::GigeVision,
+                &mut TimestampCalibration::default(),
+            )
+            .expect_err("a frame one byte over its reservation must be refused")
+            .code(),
+            ErrorCode::ResourceLimit,
+            "an over-large frame is refused whole; a bound that truncated instead would hand the \
+             caller the top of the image and call it the image"
+        );
+
+        let frame = frame_from_buffer(
+            &buffer,
+            payload,
+            WireTransport::GigeVision,
+            &mut TimestampCalibration::default(),
+        )
+        .expect("the very same frame, at exactly its reservation, is delivered");
+        assert_pixels_identical(
+            frame.bytes.as_ref(),
+            &exposed,
+            "a frame at exactly its reservation",
+        );
+    }
+
+    /// A buffer the camera never completed is refused, not delivered as a picture.
+    ///
+    /// An acquisition buffer carries its own verdict. One that was never filled still holds whatever
+    /// its allocation happened to contain, and one the camera could not fit its image into holds a
+    /// partial image; delivering either produces a photograph of nothing that is indistinguishable,
+    /// downstream, from a real one.
+    #[test]
+    fn a_buffer_the_camera_never_completed_is_refused_rather_than_delivered() {
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 48;
+        let payload = usize::try_from(WIDTH * HEIGHT).expect("a 64x48 payload fits a usize");
+        let reservation = u64::try_from(payload).expect("the payload fits a u64");
+
+        let never_filled = aravis::Buffer::new_allocate(payload);
+        assert_ne!(
+            never_filled.status(),
+            aravis::BufferStatus::Success,
+            "a buffer no camera ever wrote to has not succeeded at anything"
+        );
+        let error = frame_from_buffer(
+            &never_filled,
+            reservation,
+            WireTransport::GigeVision,
+            &mut TimestampCalibration::default(),
+        )
+        .expect_err("an unfilled buffer must never be delivered as an image");
+        assert_eq!(error.code(), ErrorCode::BackendError);
+        assert!(
+            error.to_string().contains("incomplete acquisition buffer"),
+            "the refusal must say the buffer was incomplete, got: {error}"
+        );
+
+        // The camera could not fit its picture into this one, and says so. The bytes that ARE in it
+        // are a fragment; the adapter must refuse rather than deliver the fragment.
+        let short = camera_filled_buffer(WIDTH, HEIGHT, aravis::PixelFormat::MONO_8, payload - 1);
+        assert_eq!(
+            short.status(),
+            aravis::BufferStatus::SizeMismatch,
+            "the camera must have refused to fit its image into the short buffer"
+        );
+        assert_eq!(
+            frame_from_buffer(
+                &short,
+                reservation,
+                WireTransport::GigeVision,
+                &mut TimestampCalibration::default(),
+            )
+            .expect_err("a partial frame is not a frame")
+            .code(),
+            ErrorCode::BackendError,
+            "a frame the camera could not complete must be refused, not delivered short"
+        );
+    }
+
+    /// What the native worker was actually asked to photograph.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SeenCaptureRequest {
+        capture_id: String,
+        maximum_frame_bytes: u64,
+        width: Option<u32>,
+        height: Option<u32>,
+        pixel_format: Option<PixelFormat>,
+    }
+
+    /// A native backend whose session hands back one pinned, known picture.
+    struct PinnedFrameNative {
+        frame: CaptureFrame,
+        refusal: Option<ErrorCode>,
+        seen: Arc<Mutex<Vec<SeenCaptureRequest>>>,
+    }
+
+    impl NativeBackend for PinnedFrameNative {
+        fn discover(
+            &self,
+            _interfaces: &[String],
+            _maximum: usize,
+            _deadline: Instant,
+            _cancellation: &CancellationToken,
+        ) -> Result<Vec<WireDevice>> {
+            Ok(Vec::new())
+        }
+
+        fn connect(
+            &self,
+            _config: &GenicamBackendConfig,
+            _deadline: Instant,
+            _cancellation: &CancellationToken,
+        ) -> Result<Box<dyn NativeSession>> {
+            Ok(Box::new(PinnedFrameSession {
+                frame: self.frame.clone(),
+                refusal: self.refusal,
+                seen: self.seen.clone(),
+                capabilities: capabilities(),
+            }))
+        }
+    }
+
+    struct PinnedFrameSession {
+        frame: CaptureFrame,
+        refusal: Option<ErrorCode>,
+        seen: Arc<Mutex<Vec<SeenCaptureRequest>>>,
+        capabilities: CameraCapabilities,
+    }
+
+    impl NativeSession for PinnedFrameSession {
+        fn capabilities(&self) -> &CameraCapabilities {
+            &self.capabilities
+        }
+
+        fn status(
+            &mut self,
+            _deadline: Instant,
+            _cancellation: &CancellationToken,
+        ) -> Result<CameraStatus> {
+            Ok(CameraStatus {
+                online: true,
+                connection_generation: 1,
+                ptz: None,
+                backend: json!({}),
+            })
+        }
+
+        fn capture(&mut self, request: CaptureRequest, _deadline: Instant) -> Result<CaptureFrame> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(SeenCaptureRequest {
+                    capture_id: request.capture_id.clone(),
+                    maximum_frame_bytes: request.maximum_frame_bytes,
+                    width: request.profile.width,
+                    height: request.profile.height,
+                    pixel_format: request.profile.pixel_format,
+                });
+            match self.refusal {
+                Some(code) => rejected(code, "GenICam frame exceeds the accepted byte reservation"),
+                None => Ok(self.frame.clone()),
+            }
+        }
+
+        fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A picture with a byte at every extreme, so that any mutation of it shows.
+    ///
+    /// The pattern is aperiodic across rows and contains `0x00` and `0xff`, so a truncation, a
+    /// dropped or duplicated row, a flipped bit, and a re-pack all change it.
+    fn pinned_picture(width: u32, height: u32, pixel_format: PixelFormat) -> CaptureFrame {
+        let length = usize::try_from(
+            pixel_format
+                .uncompressed_len(width, height)
+                .expect("the pinned picture is uncompressed"),
+        )
+        .expect("the pinned picture fits a usize");
+        let bytes = (0..length)
+            .map(|index| match index % 4 {
+                0 => 0x00,
+                1 => 0xff,
+                2 => u8::try_from(index % 251).unwrap_or(u8::MAX),
+                _ => u8::try_from((index * 7) % 253).unwrap_or(u8::MAX),
+            })
+            .collect::<Vec<u8>>();
+        CaptureFrame {
+            bytes: Bytes::from(bytes),
+            width,
+            height,
+            pixel_format,
+            capture_mode: CaptureMode::SoftwareTrigger,
+            source_timestamp: DateTime::from_timestamp(1_700_000_000, 123_456_789),
+            timestamp_quality: FrameTimestampQuality::Camera,
+            backend_metadata: BTreeMap::from([("frameId".to_owned(), json!(7_u64))]),
+        }
+    }
+
+    /// The pixels the native camera produced cross the worker thread and the channel UNCHANGED.
+    ///
+    /// The GenICam session is a proxy: the native session lives on its own OS thread, and every frame
+    /// it produces is carried back to the async caller over a channel. That hand-off is a seam where
+    /// a truncation, a re-pack, or a stride mistake would substitute a different picture in silence,
+    /// and nothing tested it.
+    ///
+    /// The request is checked in the same breath, because it is half of the same property: the native
+    /// layer enforces the byte bound with the `maximum_frame_bytes` it is handed and configures the
+    /// camera's region with the profile's geometry. A proxy that rewrote either on the way IN would
+    /// corrupt the image just as thoroughly as one that rewrote it on the way out.
+    #[tokio::test]
+    async fn the_pixels_the_native_camera_produced_cross_the_worker_thread_unchanged() {
+        for (width, height, pixel_format) in [
+            (8_u32, 4_u32, PixelFormat::Mono8),
+            (5, 3, PixelFormat::Rgb8),
+            (5, 3, PixelFormat::Bgr8),
+        ] {
+            let exposed = pinned_picture(width, height, pixel_format);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let factory = GenicamAravisBackendFactory::with_native(Arc::new(PinnedFrameNative {
+                frame: exposed.clone(),
+                refusal: None,
+                seen: seen.clone(),
+            }));
+            let mut session = factory
+                .connect(ConnectRequest {
+                    instance_id: "camera-a".to_owned(),
+                    backend: BackendConfig::GenicamAravis(backend_config()),
+                    timeout: Duration::from_secs(5),
+                    cancellation: CancellationToken::new(),
+                })
+                .await
+                .expect("the pinned native camera must connect");
+
+            let maximum_frame_bytes =
+                u64::try_from(exposed.bytes.len()).expect("the picture fits a u64");
+            let mut requested = profile();
+            requested.width = Some(width);
+            requested.height = Some(height);
+            requested.pixel_format = Some(pixel_format);
+            requested.maximum_frame_bytes = Some(maximum_frame_bytes);
+            let frame = session
+                .capture(CaptureRequest {
+                    capture_id: "cap-frame-fidelity".to_owned(),
+                    profile: requested,
+                    maximum_frame_bytes,
+                    timeout: Duration::from_secs(5),
+                    cancellation: CancellationToken::new(),
+                })
+                .await
+                .expect("the worker must deliver the frame its native session produced");
+
+            let what = format!("a {width}x{height} {pixel_format:?} frame across the worker");
+            assert_pixels_identical(frame.bytes.as_ref(), exposed.bytes.as_ref(), &what);
+            assert_eq!(
+                (frame.width, frame.height),
+                (width, height),
+                "{what}: the geometry every consumer reads those bytes through must survive the \
+                 hand-off too"
+            );
+            assert_eq!(
+                frame.pixel_format, pixel_format,
+                "{what}: and so must the format that says what the bytes MEAN"
+            );
+            assert_eq!(frame.capture_mode, exposed.capture_mode);
+            assert_eq!(
+                frame.source_timestamp, exposed.source_timestamp,
+                "{what}: an image delivered with somebody else's timestamp is evidence of the wrong \
+                 moment"
+            );
+            assert_eq!(frame.timestamp_quality, exposed.timestamp_quality);
+            assert_eq!(
+                frame.backend_metadata, exposed.backend_metadata,
+                "{what}: including the camera's own identifier for the picture this is"
+            );
+
+            let recorded = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            assert_eq!(
+                recorded,
+                vec![SeenCaptureRequest {
+                    capture_id: "cap-frame-fidelity".to_owned(),
+                    maximum_frame_bytes,
+                    width: Some(width),
+                    height: Some(height),
+                    pixel_format: Some(pixel_format),
+                }],
+                "{what}: the native layer must have been asked for exactly what the caller asked \
+                 for -- a rewritten bound or geometry corrupts the image before it is ever taken"
+            );
+            session.close().await.expect("the session must close");
+        }
+    }
+
+    /// A frame the native layer refused stays refused at the caller.
+    ///
+    /// The bound lives on the far side of the worker thread, so its refusal has to travel back across
+    /// the same channel a frame would. A proxy that lost or softened it would leave the caller
+    /// holding whatever the proxy chose to answer with instead -- and the one thing it must never
+    /// answer with is a picture.
+    #[tokio::test]
+    async fn a_frame_the_native_layer_refused_is_never_delivered_as_a_partial_picture() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let factory = GenicamAravisBackendFactory::with_native(Arc::new(PinnedFrameNative {
+            frame: pinned_picture(8, 4, PixelFormat::Mono8),
+            refusal: Some(ErrorCode::ResourceLimit),
+            seen: seen.clone(),
+        }));
+        let mut session = factory
+            .connect(ConnectRequest {
+                instance_id: "camera-a".to_owned(),
+                backend: BackendConfig::GenicamAravis(backend_config()),
+                timeout: Duration::from_secs(5),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("the pinned native camera must connect");
+
+        let error = session
+            .capture(CaptureRequest {
+                capture_id: "cap-over-bound".to_owned(),
+                profile: profile(),
+                maximum_frame_bytes: 1,
+                timeout: Duration::from_secs(5),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect_err("a frame the bound refused must not reach the caller as a frame");
+        assert_eq!(
+            error.code(),
+            ErrorCode::ResourceLimit,
+            "the refusal must arrive as a refusal; a caller that received a frame here would have \
+             received a truncated image"
+        );
+        assert_eq!(
+            seen.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            1,
+            "and it must be the NATIVE layer's refusal -- the proxy did reach it, rather than \
+             inventing an answer of its own"
+        );
+        session.close().await.expect("the session must close");
+    }
 }

@@ -3731,6 +3731,34 @@ async fn decode_snapshot_at_safe_boundary(
     }
 }
 
+/// Whether an encoded image actually carries a whole picture.
+///
+/// Decoding is NOT this check, and that is the trap. `image`'s JPEG decoder is lenient about a
+/// truncated entropy-coded scan: it returns the rows it managed to reconstruct rather than failing. And
+/// `snapshot_to_frame` only ever used the decode as a dimension/format sanity check before passing the
+/// ORIGINAL body through as the frame -- so a snapshot whose scan simply stopped arriving decoded to the
+/// declared dimensions, passed every guard, and was DELIVERED. A half-picture, structurally valid,
+/// reported as a success, and self-consistent with its own digest at every link downstream.
+///
+/// The only thing that caught a mid-scan cut was HTTP framing. A camera or middlebox that truncates
+/// without breaking `Content-Length` was invisible.
+///
+/// A container that never wrote its terminal marker never finished writing the picture:
+///
+/// * **JPEG** ends at `FF D9` (End Of Image). This is exact rather than heuristic -- inside
+///   entropy-coded data every `0xFF` is byte-stuffed as `FF 00`, so a genuine `FF D9` CANNOT occur
+///   within the scan. Trailing padding after it (which some cameras append) is fine: the marker is
+///   searched for, not required to be the final byte.
+/// * **PNG** ends with the `IEND` chunk.
+fn image_carries_a_whole_picture(body: &[u8], format: ImageFormat) -> bool {
+    match format {
+        ImageFormat::Jpeg => body.windows(2).any(|pair| pair == [0xFF, 0xD9]),
+        ImageFormat::Png => body.windows(4).any(|chunk| chunk == b"IEND"),
+        // Any other format is rejected on its own terms further down; do not veto it here.
+        _ => true,
+    }
+}
+
 fn snapshot_to_frame(
     response: OnvifHttpResponse,
     maximum_bytes: u64,
@@ -3815,6 +3843,14 @@ fn snapshot_to_frame(
             ErrorCode::ResourceLimit,
             "decoded snapshot exceeds the decompression-ratio bound",
         )));
+    }
+    // The picture must be WHOLE, not merely decodable. A scan that stopped arriving still decodes to the
+    // declared dimensions, and used to be delivered as a success.
+    if !image_carries_a_whole_picture(&response.body, declared_format) {
+        return Err(SnapshotAttemptFailure::fallback(
+            SnapshotFallbackReason::CorruptImage,
+            backend_error("snapshot ended before the image did; the picture is incomplete"),
+        ));
     }
     let decoded =
         image::load_from_memory_with_format(&response.body, declared_format).map_err(|_| {
@@ -7250,5 +7286,424 @@ wkWsh7u3nnr9fXRpWsamYEAKGzNo0istMB6rD6cMzNfRZCMk4rXuokYWOw==
             vec![CaptureMode::RtspFrame]
         );
         assert!(onvif_capture_modes(false, false).is_empty());
+    }
+
+    /// A JPEG the "camera" will serve. Distinct per pixel, so a reordered or padded frame cannot
+    /// accidentally compare equal to the original.
+    fn jpeg(width: u32, height: u32) -> Vec<u8> {
+        let image = RgbImage::from_fn(width, height, |x, y| {
+            Rgb([
+                (x % 251) as u8,
+                (y % 241) as u8,
+                ((x * 7 + y * 13) % 233) as u8,
+            ])
+        });
+        let mut output = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut output, ImageFormat::Jpeg)
+            .expect("encode test JPEG");
+        output.into_inner()
+    }
+
+    /// A well-framed HTTP/1.1 200 carrying exactly `body` under `content_type`.
+    ///
+    /// The Content-Length is the length of what is actually written, so a truncated image is a
+    /// truncated IMAGE on an otherwise perfectly valid HTTP response -- which is the defect that
+    /// matters here, not a broken socket.
+    fn http_image_response(content_type: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    /// A protocol client whose snapshot endpoint is a real loopback socket, reached through the real
+    /// `ReqwestOnvifTransport`.
+    ///
+    /// The camera is `camera.test` -- the pinned-DNS answer is `127.0.0.1`, so the production
+    /// address-pinning path (`resolve` + the endpoint-address allowance) is what puts the request on
+    /// the fixture's socket. Nothing about the HTTP client is mocked.
+    async fn loopback_snapshot_client(port: u16) -> (OnvifProtocolClient, PinnedUri) {
+        let config = test_config(Some(&format!("http://camera.test:{port}/snapshot")));
+        test_client(
+            Arc::new(SequenceResolver::new(&[(
+                "camera.test",
+                port,
+                &["127.0.0.1"],
+            )])),
+            Arc::new(ReqwestOnvifTransport::default()),
+            &config,
+            None,
+            SecurityConfig::default(),
+        )
+        .await
+    }
+
+    /// A snapshot-only ONVIF session over `client`, whose snapshot URI is `endpoint`.
+    fn snapshot_session(client: OnvifProtocolClient, endpoint: PinnedUri) -> OnvifSession {
+        OnvifSession {
+            instance_id: "camera-a".to_owned(),
+            client,
+            media_endpoint: endpoint.clone(),
+            media_version: MediaVersion::Media1,
+            media_profile_token: "main".to_owned(),
+            snapshot_endpoint: Some(endpoint),
+            #[cfg(feature = "rtsp")]
+            snapshot_unavailable: None,
+            max_snapshot_bytes: 1_048_576,
+            #[cfg(feature = "rtsp")]
+            rtsp: None,
+            ptz_endpoint: None,
+            ptz_ranges: None,
+            ptz_home: false,
+            capabilities: CameraCapabilities {
+                capture_modes: vec![CaptureMode::SnapshotUri],
+                pixel_formats: vec![PixelFormat::Jpeg],
+                software_trigger: false,
+                snapshot_uri: true,
+                rtsp: false,
+                ptz: false,
+                ptz_status: false,
+                presets: false,
+                preset_mutation: false,
+                vendor: None,
+                model: None,
+                firmware: None,
+                serial: None,
+                warnings: Vec::new(),
+            },
+            closed: false,
+        }
+    }
+
+    /// A snapshot capture request with room to spare, so nothing here is about a bound.
+    fn snapshot_capture_request() -> CaptureRequest {
+        let profile: CaptureProfile = serde_json::from_value(json!({
+            "captureMode": "snapshot-uri",
+            "output": { "encoding": "jpeg" }
+        }))
+        .expect("capture profile");
+        CaptureRequest {
+            capture_id: "byte-fidelity".to_owned(),
+            profile,
+            maximum_frame_bytes: 1_048_576,
+            timeout: Duration::from_secs(5),
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    /// The JPEG the frame carries is the JPEG the camera put on the wire. Byte for byte.
+    ///
+    /// Nothing proved this for the ONVIF path. Downstream, storage computes the artifact's SHA-256 by
+    /// RE-READING the file it just wrote and then verifies the file against that same digest -- every
+    /// link checks the bytes against themselves, and not one checks them against the CAMERA. A frame
+    /// truncated, padded, reordered or swapped anywhere between the HTTP body and `CaptureFrame` would
+    /// produce a perfectly self-consistent digest OF THE WRONG IMAGE, and the whole suite would stay
+    /// green. For an adapter whose entire purpose is to deliver the picture the camera took, this is
+    /// the property worth pinning.
+    ///
+    /// For JPEG the claim is exact rather than approximate: `snapshot_to_frame` hands the frame
+    /// `Bytes::from(response.body)` -- the camera's ORIGINAL bytes -- and decodes only to sanity-check
+    /// the dimensions and the declared format. So the delivered bytes must equal the served bytes
+    /// EXACTLY, and their digests must agree.
+    ///
+    /// The camera here is a real `TcpListener` reached through the real `ReqwestOnvifTransport` and
+    /// the real `fetch_snapshot` + decode path: a mock transport handing back a `Vec<u8>` it was given
+    /// could not see a body mangled by the HTTP client, and that is exactly where a frame can rot.
+    #[tokio::test]
+    async fn the_jpeg_frame_delivered_over_real_http_is_the_jpeg_the_camera_served() {
+        use sha2::Digest as _;
+
+        let served = jpeg(64, 48);
+        let (port, server) = serve_loopback_http(http_image_response("image/jpeg", &served)).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let cancellation = CancellationToken::new();
+        let (response, target) = client
+            .fetch_snapshot(endpoint, 1_048_576, deadline, &cancellation)
+            .await
+            .expect("the loopback camera must serve its snapshot over real HTTP");
+        let frame = decode_snapshot_at_safe_boundary(
+            response,
+            1_048_576,
+            SecurityConfig::default().max_decompression_ratio,
+            FixedClock.now(),
+            target.host().to_owned(),
+            deadline,
+            &cancellation,
+        )
+        .await
+        .expect("a well-formed JPEG snapshot must become a frame");
+
+        let request =
+            String::from_utf8(server.await.expect("HTTP server task")).expect("HTTP request text");
+        assert!(
+            request.starts_with("GET /snapshot HTTP/1.1\r\n"),
+            "the frame must have come from a real HTTP GET against the camera, not from thin air: \
+             {request:?}"
+        );
+
+        assert_eq!(
+            frame.bytes.len(),
+            served.len(),
+            "the delivered frame is a different SIZE from the JPEG the camera served"
+        );
+        assert!(
+            frame.bytes.as_ref() == served.as_slice(),
+            "the delivered frame is not the image the camera served -- same length, different bytes, \
+             which is precisely the corruption a self-referential digest cannot see"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(frame.bytes.as_ref())),
+            hex::encode(Sha256::digest(&served)),
+            "the digest of the frame must be the digest of the CAMERA'S bytes; a digest recomputed \
+             from whatever was carried forward would agree with a corrupted frame just as happily"
+        );
+        assert_eq!(
+            (frame.pixel_format, frame.width, frame.height),
+            (PixelFormat::Jpeg, 64, 48),
+            "a JPEG snapshot is delivered as the camera's own JPEG at the camera's own dimensions"
+        );
+        assert_eq!(
+            frame.capture_mode,
+            CaptureMode::SnapshotUri,
+            "and it must say it came from the snapshot URI"
+        );
+    }
+
+    /// The same claim, end to end through `OnvifSession::capture`: what a caller of the backend gets
+    /// back is the camera's own JPEG, byte for byte.
+    ///
+    /// The transport-level test above pins the fetch/decode pair. This one pins the surface the rest of
+    /// the adapter actually calls, with the bounds, the deadline, the capture-mode dispatch and the
+    /// fallback plumbing of `capture()` in the way. A regression that mangled a frame anywhere in that
+    /// wrapping -- re-encoding it, copying it through a fixed-size buffer, truncating it to the
+    /// declared bound -- would leave every existing ONVIF test green and this one red.
+    #[tokio::test]
+    async fn session_capture_delivers_the_exact_jpeg_bytes_the_camera_put_on_the_wire() {
+        use sha2::Digest as _;
+
+        let served = jpeg(80, 60);
+        let (port, server) = serve_loopback_http(http_image_response("image/jpeg", &served)).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+        let mut session = snapshot_session(client, endpoint);
+
+        let frame = session
+            .capture(snapshot_capture_request())
+            .await
+            .expect("a snapshot capture against a healthy camera must succeed");
+        let _ = server.await.expect("HTTP server task");
+
+        assert_eq!(
+            frame.bytes.len(),
+            served.len(),
+            "capture() delivered a frame of a different SIZE from the JPEG the camera served"
+        );
+        assert!(
+            frame.bytes.as_ref() == served.as_slice(),
+            "capture() did not deliver the image the camera took -- the bytes handed to the caller \
+             differ from the bytes the camera served over HTTP"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(frame.bytes.as_ref())),
+            hex::encode(Sha256::digest(&served)),
+            "the digest of the captured frame must be the digest of the camera's served JPEG"
+        );
+        assert_eq!(
+            frame.backend_metadata.get("sourceEncoding"),
+            Some(&Value::String("jpeg".to_owned())),
+            "and the frame must declare the encoding it is actually carrying"
+        );
+    }
+
+    /// For PNG the frame is NOT the file: `snapshot_to_frame` carries `decoded.to_rgb8().into_raw()`.
+    /// So the property is that the delivered raster is exactly the raster an INDEPENDENT decode of the
+    /// same PNG produces -- pinned here against `image`'s own decoder, run outside the capture path.
+    ///
+    /// Asserting byte equality with the PNG file would be asserting the wrong thing and would fail on
+    /// correct code. Asserting only "some RGB8 bytes of the right length arrived" would be asserting
+    /// nothing: a raster with two rows swapped, a channel rotated, or a stale buffer reused has exactly
+    /// the right length. This asserts the pixels.
+    #[tokio::test]
+    async fn session_capture_of_a_png_delivers_the_raster_an_independent_decode_produces() {
+        let served = png(32, 24);
+        let expected = image::load_from_memory_with_format(&served, ImageFormat::Png)
+            .expect("the fixture PNG must decode independently of the capture path")
+            .to_rgb8()
+            .into_raw();
+
+        let (port, server) = serve_loopback_http(http_image_response("image/png", &served)).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+        let mut session = snapshot_session(client, endpoint);
+
+        let frame = session
+            .capture(snapshot_capture_request())
+            .await
+            .expect("a PNG snapshot capture must succeed");
+        let _ = server.await.expect("HTTP server task");
+
+        assert_eq!(
+            (frame.pixel_format, frame.width, frame.height),
+            (PixelFormat::Rgb8, 32, 24),
+            "a PNG snapshot is delivered as an RGB8 raster at the camera's dimensions"
+        );
+        assert_eq!(
+            frame.bytes.len(),
+            expected.len(),
+            "the delivered raster is a different SIZE from the raster the served PNG decodes to"
+        );
+        assert!(
+            frame.bytes.as_ref() == expected.as_slice(),
+            "the delivered raster is not the picture the camera sent -- same length, different \
+             pixels, which is exactly what a swapped, shifted or stale buffer looks like"
+        );
+        assert!(
+            frame.bytes.as_ref() != served.as_slice(),
+            "and the PNG claim really is about the DECODED raster, not the file: if the frame were \
+             the file's bytes, this test would be pinning the wrong property"
+        );
+    }
+
+    /// The offset of the JPEG Start-of-Scan marker: everything before it is header, everything after
+    /// it is the picture itself.
+    fn start_of_scan(jpeg: &[u8]) -> usize {
+        jpeg.windows(2)
+            .position(|window| window == [0xFF, 0xDA])
+            .expect("a JPEG the encoder produced must contain a Start-of-Scan marker")
+    }
+
+    /// A snapshot that never carried a whole picture must be REFUSED, not delivered.
+    ///
+    /// Three ways the wire lies, and the adapter must call all three:
+    ///
+    /// * the HTTP body stops short of its declared `Content-Length` -- a camera or a middlebox that
+    ///   drops the connection mid-response. The bytes that DID arrive are a valid JPEG prefix; nothing
+    ///   downstream would ever notice, because storage digests whatever it is handed and then verifies
+    ///   that digest against itself.
+    /// * the image data never arrived at all: the headers are complete, the dimensions read cleanly,
+    ///   but the entropy-coded scan is absent. A decoder that shrugged and returned a blank frame would
+    ///   hand the operator a picture the camera never took.
+    /// * the `Content-Type` disagrees with the bytes (a PNG served as `image/jpeg`). That header is what
+    ///   decides whether the ORIGINAL bytes are passed through (JPEG) or re-decoded to a raster (PNG),
+    ///   so believing a camera that lies about it means delivering bytes that are not what they claim.
+    ///
+    /// Producing a frame at all in any of these cases is the failure.
+    #[tokio::test]
+    async fn a_snapshot_that_never_carried_a_whole_picture_is_refused_rather_than_delivered() {
+        let whole = jpeg(64, 48);
+
+        // The camera promises a whole JPEG and then hangs up half way through it.
+        let mut short_body = http_image_response("image/jpeg", &whole);
+        short_body.truncate(short_body.len() - (whole.len() / 2));
+        let (port, server) = serve_loopback_http(short_body).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+        let mut session = snapshot_session(client, endpoint);
+        let error = session
+            .capture(snapshot_capture_request())
+            .await
+            .expect_err(
+                "a body that stops short of its declared Content-Length must not become a frame",
+            );
+        let _ = server.await.expect("short-body server task");
+        assert_eq!(
+            error.code(),
+            ErrorCode::BackendError,
+            "an HTTP body cut short of its own Content-Length is a transport failure and must be \
+             reported as one, never silently delivered as a picture -- got {error}"
+        );
+
+        // Complete headers -- the dimensions read perfectly -- and no picture behind them.
+        let headers_only = whole[..start_of_scan(&whole)].to_vec();
+        let (port, server) =
+            serve_loopback_http(http_image_response("image/jpeg", &headers_only)).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+        let mut session = snapshot_session(client, endpoint);
+        let error = session
+            .capture(snapshot_capture_request())
+            .await
+            .expect_err("a JPEG whose scan data never arrived must not become a frame");
+        let _ = server.await.expect("headers-only server task");
+        assert_eq!(
+            error.code(),
+            ErrorCode::UnsupportedCapability,
+            "a corrupt snapshot is a fallback-eligible failure; with no RTSP stream configured the \
+             capture must fail rather than deliver a picture the camera never sent -- got {error}"
+        );
+
+        // A PNG wearing a JPEG's Content-Type.
+        let served = png(32, 24);
+        let (port, server) = serve_loopback_http(http_image_response("image/jpeg", &served)).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+        let mut session = snapshot_session(client, endpoint);
+        let error = session
+            .capture(snapshot_capture_request())
+            .await
+            .expect_err("bytes that disagree with their Content-Type must never become a frame");
+        let _ = server.await.expect("mislabelled-snapshot server task");
+        assert!(
+            error
+                .to_string()
+                .contains("snapshot Content-Type does not match its bytes"),
+            "the refusal must name the lie -- the camera's Content-Type disagreed with its bytes -- \
+             got {error}"
+        );
+    }
+
+    /// A picture that stopped arriving is refused, not delivered.
+    ///
+    /// This test used to assert the opposite, because the adapter used to do the opposite. Once the
+    /// entropy-coded scan has begun, `image`'s JPEG decoder is deliberately lenient: a truncated scan
+    /// does not error, it yields the rows it could reconstruct. `snapshot_to_frame` consulted that
+    /// decode only as a dimension/format sanity check and then passed the ORIGINAL body through -- so
+    /// the frame reaching the caller was a partial picture, with valid JPEG structure, the right
+    /// dimensions, and a digest that verified against itself at every downstream link. A half-image,
+    /// reported as a success.
+    ///
+    /// The only thing standing between the operator and that half-image was HTTP framing, which fires
+    /// only when `Content-Length` disagrees. A camera that hangs up mid-scan, or a middlebox that
+    /// truncates a chunked body without breaking framing, was invisible.
+    ///
+    /// A JPEG that never wrote its `FF D9` end-of-image marker never finished writing the picture, and
+    /// that test is exact rather than heuristic: inside entropy-coded data every `0xFF` is byte-stuffed
+    /// as `FF 00`, so a genuine `FF D9` cannot occur within the scan. It is now refused, and refusal on
+    /// a snapshot is not a dead end -- `CorruptImage` is the fallback reason that sends the capture down
+    /// the RTSP path instead.
+    #[tokio::test]
+    async fn a_picture_that_stopped_arriving_is_refused_rather_than_delivered_half_finished() {
+        let whole = jpeg(64, 48);
+        let scan = start_of_scan(&whole);
+        // Well inside the picture data: every header is intact, half the picture is missing.
+        let truncated = whole[..(scan + (whole.len() - scan) / 2)].to_vec();
+        assert!(
+            truncated.len() < whole.len(),
+            "the fixture must actually be missing picture data"
+        );
+        assert!(
+            !truncated.windows(2).any(|pair| pair == [0xFF, 0xD9]),
+            "and it must be missing its end-of-image marker, which is what makes it detectable"
+        );
+
+        let (port, server) =
+            serve_loopback_http(http_image_response("image/jpeg", &truncated)).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+        let mut session = snapshot_session(client, endpoint);
+        let outcome = session.capture(snapshot_capture_request()).await;
+        let _ = server.await.expect("mid-scan-truncation server task");
+
+        let error = outcome.expect_err(
+            "a picture whose scan never finished arriving must not be delivered as a success",
+        );
+        // `CorruptImage` is a FALLBACK reason, not a dead end: it retires the snapshot and sends the
+        // capture down the RTSP path. This session has no RTSP, so the capture fails there -- which is
+        // the correct outcome. What matters is that no half-picture reached the caller.
+        assert_eq!(
+            error.code(),
+            ErrorCode::UnsupportedCapability,
+            "the snapshot is retired as corrupt and the capture falls through to RTSP, which this              camera does not have; what must NOT happen is a half-picture delivered as a success"
+        );
     }
 }
