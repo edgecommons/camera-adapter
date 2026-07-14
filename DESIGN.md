@@ -1874,6 +1874,23 @@ first because a terminal job or group is eligible only once its own retained mes
 sweep is issued in bounded batches with a pause between them, so a large backlog never saturates the
 two-worker catalog pool that also carries the capture path, and it logs the counts it reclaimed.
 
+A catalog that cannot be read — SQLite reports it as not a database or as corrupt, or it fails
+`PRAGMA integrity_check` — is quarantined rather than fatal. It is renamed to
+`camera-adapter.sqlite3.corrupt` (taking its `-wal` and `-shm` sidecars with it, or a stale log would be
+recovered into the replacement), an error naming the file is logged, and the adapter starts on a new,
+empty catalog. One quarantined copy is retained; a later corruption replaces it, so the evidence cannot
+itself grow without bound.
+
+This is an availability trade, taken deliberately: **an unattended edge device that stops capturing until
+a human is dispatched is a worse outcome than losing the unpublished contents of a database that is
+already unreadable.** The cost is stated rather than hidden — capture results in the quarantined file that
+had not yet reached the broker are not recoverable by the adapter.
+
+A schema version *newer* than `SCHEMA_VERSION` is **not** corruption and is never quarantined. Those rows
+are intact and the component that wrote them can still read every one; discarding them to work around a
+rollback would destroy good data to solve a problem nobody has. A downgrade fails closed, and the file is
+left exactly as it was found.
+
 At startup:
 
 1. Validate and open the catalog before accepting commands.

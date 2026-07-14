@@ -27,6 +27,13 @@ use crate::model::JobState;
 use crate::{CameraError, Result};
 
 const DATABASE_NAME: &str = "camera-adapter.sqlite3";
+
+/// The one integrity failure that means the FILE is bad rather than the environment.
+///
+/// It is a constant because `open_verified` matches on it to decide whether to quarantine, and
+/// deciding that by string comparison against a literal typed in two places is how the wrong file
+/// gets deleted.
+const INTEGRITY_CHECK_FAILED: &str = "SQLite integrity_check did not return ok";
 const LOCK_NAME: &str = "camera-adapter.lock";
 const SCHEMA_VERSION: i64 = 4;
 const DEFAULT_WORKERS: usize = 2;
@@ -1796,6 +1803,127 @@ fn validate_options(options: &CatalogOptions) -> Result<()> {
     Ok(())
 }
 
+/// Why a catalog file could not be opened.
+///
+/// The distinction is the whole point. **Corruption is recoverable and a downgrade is not** -- and
+/// treating them alike in either direction destroys something. A database written by a NEWER component
+/// is not damaged: its data is intact and the version that wrote it can still read every row. Deleting
+/// it to work around a rollback would throw away good, unpublished results to solve a problem nobody
+/// has. So a future schema version stays fail-closed, and only a file that is genuinely unreadable is
+/// quarantined.
+enum OpenFailure {
+    /// The file is not a usable database: unreadable, or failing its own integrity check.
+    Corrupt(String),
+    /// Anything else, including a schema version from the future. Not something a restart can fix.
+    Fatal(CameraError),
+}
+
+impl From<OpenFailure> for CameraError {
+    fn from(failure: OpenFailure) -> Self {
+        match failure {
+            OpenFailure::Corrupt(reason) => Self::Catalog(reason),
+            OpenFailure::Fatal(error) => error,
+        }
+    }
+}
+
+/// Whether a SQLite error means the bytes on disk are not a database we can use.
+fn is_corruption(error: &CameraError) -> bool {
+    let CameraError::Sqlite(rusqlite::Error::SqliteFailure(failure, _)) = error else {
+        return false;
+    };
+    matches!(
+        failure.code,
+        rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+    )
+}
+
+/// Opens every worker connection, migrates, and verifies -- classifying the failure if it fails.
+fn open_verified(
+    database_path: &Path,
+    worker_count: usize,
+) -> std::result::Result<Vec<Connection>, OpenFailure> {
+    let mut connections = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        match open_connection(database_path) {
+            Ok(connection) => connections.push(connection),
+            Err(error) if is_corruption(&error) => {
+                return Err(OpenFailure::Corrupt(error.to_string()));
+            }
+            Err(error) => return Err(OpenFailure::Fatal(error)),
+        }
+    }
+    match migrate(&mut connections[0]) {
+        Ok(()) => {}
+        // A migration that trips over damaged pages is corruption. A migration that refuses to
+        // DOWNGRADE is not -- and that is the case this must not swallow.
+        Err(error) if is_corruption(&error) => {
+            return Err(OpenFailure::Corrupt(error.to_string()));
+        }
+        Err(error) => return Err(OpenFailure::Fatal(error)),
+    }
+    for connection in &connections {
+        match verify_connection(connection) {
+            Ok(()) => {}
+            Err(error) if is_corruption(&error) => {
+                return Err(OpenFailure::Corrupt(error.to_string()));
+            }
+            Err(CameraError::Catalog(reason)) if reason == INTEGRITY_CHECK_FAILED => {
+                return Err(OpenFailure::Corrupt(reason));
+            }
+            Err(error) => return Err(OpenFailure::Fatal(error)),
+        }
+    }
+    Ok(connections)
+}
+
+/// Moves a corrupt catalog aside so the component can start on a clean one.
+///
+/// The WAL and shared-memory sidecars move WITH it. Leaving them beside the new database would be
+/// worse than useless: SQLite would try to recover the new file from the old file's write-ahead log.
+///
+/// One quarantine slot, overwritten each time. Evidence is worth keeping; evidence that accumulates
+/// without bound on an edge box is just a second way to fill the disk, which is the failure this
+/// component already has a whole retention subsystem to avoid.
+fn quarantine_corrupt_catalog(database_path: &Path, reason: &str) -> Result<()> {
+    let mut quarantine = database_path.as_os_str().to_owned();
+    quarantine.push(".corrupt");
+    let quarantine = PathBuf::from(quarantine);
+
+    for (from, to) in [
+        (database_path.to_path_buf(), quarantine.clone()),
+        (sidecar(database_path, "-wal"), sidecar(&quarantine, "-wal")),
+        (sidecar(database_path, "-shm"), sidecar(&quarantine, "-shm")),
+    ] {
+        if !from.exists() {
+            continue;
+        }
+        std::fs::rename(&from, &to).map_err(|error| {
+            CameraError::Catalog(format!(
+                "the catalog at {} is corrupt and could not be moved aside: {error}",
+                from.display()
+            ))
+        })?;
+    }
+
+    tracing::error!(
+        catalog = %database_path.display(),
+        quarantined_to = %quarantine.display(),
+        reason = %reason,
+        "the catalog was corrupt and has been quarantined; the component is starting on a new, empty \
+         catalog. Any capture results it had not yet published are in the quarantined file and are \
+         NOT recoverable by this component."
+    );
+    Ok(())
+}
+
+/// The path of a SQLite sidecar (`-wal`, `-shm`) beside a database.
+fn sidecar(database_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = database_path.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
 fn open_blocking(options: CatalogOptions) -> Result<Catalog> {
     let state_directory = Arc::new(create_secure_directory(&options.state_directory)?);
     #[cfg(windows)]
@@ -1804,15 +1932,26 @@ fn open_blocking(options: CatalogOptions) -> Result<Catalog> {
     let database_path = options.state_directory.join(DATABASE_NAME);
     create_secure_file(&database_path)?;
 
-    let mut connections = Vec::with_capacity(options.worker_count);
-    for _ in 0..options.worker_count {
-        let connection = open_connection(&database_path)?;
-        connections.push(connection);
-    }
-    migrate(&mut connections[0])?;
-    for connection in &connections {
-        verify_connection(connection)?;
-    }
+    // A corrupt catalog used to be a PERMANENT UNATTENDED CRASH-LOOP: fail closed, preserve the
+    // evidence, and never run again until a human is dispatched. That is a fine trade on a machine
+    // someone can walk up to. On a Greengrass edge box it means a camera adapter that has stopped
+    // capturing, forever, because of a bad flush on a power cut -- and the evidence it so carefully
+    // preserved is of no use to anyone who is not standing next to it.
+    //
+    // Availability wins. The corrupt file is moved aside, not deleted, and the component starts on a
+    // clean catalog. What that costs is stated plainly rather than hidden: any results in the corrupt
+    // file that had not yet been published are gone as far as this component is concerned.
+    let connections = match open_verified(&database_path, options.worker_count) {
+        Ok(connections) => connections,
+        Err(OpenFailure::Fatal(error)) => return Err(error),
+        Err(OpenFailure::Corrupt(reason)) => {
+            quarantine_corrupt_catalog(&database_path, &reason)?;
+            create_secure_file(&database_path)?;
+            // A freshly created file that is STILL unusable is not corruption -- it is an environment
+            // that cannot host a catalog at all, and starting over again would be a loop.
+            open_verified(&database_path, options.worker_count).map_err(CameraError::from)?
+        }
+    };
     secure_sqlite_sidecars(&database_path)?;
 
     let (sender, receiver) = mpsc::channel::<Work>(options.queue_capacity);
@@ -1914,9 +2053,7 @@ fn verify_connection(connection: &Connection) -> Result<()> {
         )));
     }
     if !health.integrity_ok {
-        return Err(CameraError::Catalog(
-            "SQLite integrity_check did not return ok".to_owned(),
-        ));
+        return Err(CameraError::Catalog(INTEGRITY_CHECK_FAILED.to_owned()));
     }
     Ok(())
 }
@@ -5183,18 +5320,83 @@ mod tests {
         assert!(catalog.job("kept-a").await.unwrap().is_some());
     }
 
+    /// The write-ahead log and shared-memory file move WITH the database they belong to.
+    ///
+    /// Leaving a stale `-wal` beside the fresh database would be worse than useless: SQLite would try
+    /// to recover the NEW file from the OLD file's log. (In practice SQLite usually reclaims its own log
+    /// when the failed connection closes, which is exactly why this is tested here, directly, rather
+    /// than left to whether that happened to occur.)
+    #[test]
+    fn quarantine_takes_the_sidecars_with_it() {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join(DATABASE_NAME);
+        fs::write(&database, b"corrupt").unwrap();
+        fs::write(directory.path().join("camera-adapter.sqlite3-wal"), b"log").unwrap();
+        fs::write(directory.path().join("camera-adapter.sqlite3-shm"), b"shm").unwrap();
+
+        quarantine_corrupt_catalog(&database, "not a database").unwrap();
+
+        assert!(!database.exists(), "the corrupt database is moved aside");
+        assert!(
+            !directory.path().join("camera-adapter.sqlite3-wal").exists(),
+            "a stale log left behind would be recovered INTO the new database"
+        );
+        assert!(!directory.path().join("camera-adapter.sqlite3-shm").exists());
+
+        assert_eq!(
+            fs::read(directory.path().join("camera-adapter.sqlite3.corrupt")).unwrap(),
+            b"corrupt"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("camera-adapter.sqlite3.corrupt-wal")).unwrap(),
+            b"log"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("camera-adapter.sqlite3.corrupt-shm")).unwrap(),
+            b"shm"
+        );
+    }
+
+    /// A corrupt catalog is moved aside and the component runs. A DOWNGRADE is not touched.
+    ///
+    /// These two used to be one behaviour -- fail closed, preserve the evidence, never run again -- and
+    /// on a Greengrass edge box that made a bad flush on a power cut into a camera adapter that stopped
+    /// capturing FOREVER, until a human was dispatched. The evidence it so carefully preserved was of no
+    /// use to anyone not standing next to it. Availability wins: the file is quarantined, not deleted,
+    /// and the component starts on a clean catalog.
+    ///
+    /// But a database written by a NEWER component is not damaged. Its rows are intact and the version
+    /// that wrote them can still read them. Quarantining THAT would throw away good, unpublished results
+    /// to work around a rollback -- so it stays fail-closed, and this test is what keeps the two apart.
     #[cfg(not(windows))]
     #[tokio::test]
-    async fn corrupt_or_future_catalog_is_rejected_without_recreation_or_downgrade() {
+    async fn a_corrupt_catalog_is_quarantined_and_a_downgrade_is_still_refused() {
         let corrupt_directory = TempDir::new().unwrap();
         let corrupt_options = options(&corrupt_directory);
         fs::create_dir_all(&corrupt_options.state_directory).unwrap();
         let corrupt_path = corrupt_options.state_directory.join(DATABASE_NAME);
-        let corrupt_bytes = b"not a sqlite database; retain this evidence";
+        let corrupt_bytes = b"not a sqlite database; this is the evidence";
         fs::write(&corrupt_path, corrupt_bytes).unwrap();
-        assert!(Catalog::open(corrupt_options).await.is_err());
-        assert_eq!(fs::read(corrupt_path).unwrap(), corrupt_bytes);
 
+        let catalog = Catalog::open(corrupt_options)
+            .await
+            .expect("a corrupt catalog must not stop the component from running");
+
+        // It runs, and it is usable.
+        assert!(catalog.job("nothing-here").await.unwrap().is_none());
+
+        // The evidence is beside it, not destroyed.
+        let quarantined = corrupt_directory
+            .path()
+            .join("state")
+            .join("camera-adapter.sqlite3.corrupt");
+        assert_eq!(
+            fs::read(&quarantined).unwrap(),
+            corrupt_bytes,
+            "the corrupt file must be preserved for whoever eventually looks"
+        );
+
+        // A schema version from the FUTURE is a downgrade, not corruption. Hands off.
         let future_directory = TempDir::new().unwrap();
         let future_options = options(&future_directory);
         fs::create_dir_all(&future_options.state_directory).unwrap();
@@ -5202,13 +5404,22 @@ mod tests {
         let connection = Connection::open(&future_path).unwrap();
         connection.pragma_update(None, "user_version", 999).unwrap();
         drop(connection);
-        assert!(Catalog::open(future_options).await.is_err());
-        let connection = Connection::open(future_path).unwrap();
+        assert!(
+            Catalog::open(future_options).await.is_err(),
+            "a database written by a newer component is intact; refusing to run is the right answer"
+        );
+        let connection = Connection::open(&future_path).unwrap();
         assert_eq!(
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            999
+            999,
+            "and it must be left exactly as it was found"
+        );
+        assert!(
+            !future_path.with_extension("sqlite3.corrupt").exists(),
+            "a downgrade must never be quarantined -- that would delete good rows to work around a \
+             rollback"
         );
     }
 
