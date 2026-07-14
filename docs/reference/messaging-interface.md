@@ -107,6 +107,8 @@ The public error `code` is one of `INSTANCE_REQUIRED`, `UNKNOWN_INSTANCE`, `CAME
 `PERSISTENCE_FAILED`, `PTZ_DISABLED`, `PTZ_RANGE_ERROR`, `PTZ_TIMEOUT`, `COMPONENT_STOPPING`, or
 `BACKEND_ERROR`. Clients should branch on `code`, not the sanitized human-readable message.
 
+`RESOURCE_LIMIT` on a capture submission means the component is shedding load: its outbox backlog has escalated, so it is refusing new captures until it can publish the results it already owes. It accepts work again as soon as the backlog drains.
+
 ## Operator events
 
 `schedule-skipped` is a warning event emitted for a scheduled capture skipped because the camera is

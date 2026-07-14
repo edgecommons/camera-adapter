@@ -2299,6 +2299,16 @@ GenICam/Aravis:
 - Validate discovery and explicit selector binding.
 - Capture every initially supported pixel format and output encoding.
 - Inject packet loss and incomplete buffers; assert no corrupted success files.
+- An encoded snapshot is accepted only if it carries its terminal marker (JPEG `FF D9`, PNG `IEND`).
+  Decoding is not this check: `image` is lenient about a truncated entropy-coded scan and returns the rows
+  it could reconstruct, so a snapshot cut mid-scan decodes to the declared dimensions and would otherwise be
+  delivered as a success. The JPEG test is exact rather than heuristic — inside entropy-coded data every
+  `0xFF` is byte-stuffed as `FF 00`, so a genuine `FF D9` cannot occur within the scan, and trailing padding
+  after it is tolerated. An incomplete snapshot is a `CorruptImage` fallback, so a camera with
+  `rtspFallback: true` retries on the stream.
+- Image fidelity is asserted against the camera, not against the file: the digest a capture reports is
+  computed from the bytes written, so it agrees with a corrupted file just as readily. Tests regenerate the
+  frame independently of the pipeline that carried it and compare byte for byte.
 - Exercise reconnect while other simulated cameras continue capturing.
 
 ONVIF/RTSP:

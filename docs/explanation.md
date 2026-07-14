@@ -29,6 +29,18 @@ been published are lost. A catalog whose schema version is *newer* than the runn
 case: its rows are intact, so the adapter refuses to start rather than discard them, and the file is left
 untouched.
 
+The image a capture delivers is the image the camera produced. A snapshot is passed through unchanged
+where the camera's encoding is already the requested output, and the digest reported with a result is the
+digest of those bytes. An encoded image that arrives incomplete — a JPEG or PNG whose data ends before the
+picture does — is refused rather than delivered: a partial image still decodes to the declared dimensions,
+so completeness is checked directly. On an ONVIF camera with `rtspFallback: true`, an incomplete snapshot
+falls back to the RTSP stream; otherwise the capture fails and says why.
+
+A component that cannot publish results as fast as it is asked to produce them stops accepting new work.
+When the outbox backlog escalates, capture submission is rejected with `RESOURCE_LIMIT` until it drains.
+Durable results are never dropped to relieve the backlog — a capture nobody can be told about is not a
+capture — so the backpressure is applied where work is admitted.
+
 `sim` is deterministic and supports logic testing. `onvif-rtsp` uses strict ONVIF service/profile selection
 and can use GStreamer RTSP extraction when compiled. `genicam-aravis` is an optional Linux-native backend.
 Simulator evidence establishes the implemented protocol paths; it does not certify physical models, NICs,

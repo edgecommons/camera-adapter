@@ -77,7 +77,8 @@ mislabeled as RGB.
 An ONVIF backend defaults to `captureMode: "snapshot-uri"`, `rtspFallback: false`,
 `rtspSessionPolicy: "on-demand"`, `mediaService: "auto"`, and `authenticationMode: "auto"`.
 `maxSoapBytes`, `maxSnapshotBytes`, and `maxXmlDepth` default to 1 MiB, 64 MiB, and 64. `allowInsecure`
-defaults to false. Use `allowedUriHosts` and `allowedUriCidrs` only for deliberate additional endpoint
+defaults to false. A snapshot whose image data ends before the picture does is treated as a corrupt
+snapshot: with `rtspFallback: true` the capture falls back to the RTSP stream, and otherwise it fails. Use `allowedUriHosts` and `allowedUriCidrs` only for deliberate additional endpoint
 authority; they do not disable per-connection address validation.
 
 `ptz` defaults to `enabled: false`, `maximumContinuousMoveMs: 10000`, `captureInterlock: "reject"`,
