@@ -77,6 +77,25 @@ offset/exposure/gain, and motion interlock. The profile's `captureInterlock` is 
 or `allow`. Unsupported Bayer/PFNC input is rejected as `UNSUPPORTED_PIXEL_FORMAT`; raw bytes are never
 mislabeled as RGB.
 
+A capture profile may also ask for a thumbnail. It is off unless the profile carries a `thumbnail`
+object:
+
+```json
+"captureProfiles": {
+  "inspection": {
+    "output": { "encoding": "jpeg" },
+    "thumbnail": { "size": "medium" }
+  }
+}
+```
+
+`size` is `small`, `medium`, or `large`, bounding the thumbnail's **longest edge** at 160, 320, or 640
+pixels. The aspect ratio is preserved and a frame smaller than the bound is carried at its own size,
+never enlarged. The thumbnail is always JPEG, whatever the profile's own output encoding, and it travels
+with the published capture result — it is not written to disk and not stored in the catalog. A thumbnail
+that cannot be rendered, or that will not fit the message's byte ceiling, is left out of the result; the
+capture still succeeds and its image is still installed.
+
 An ONVIF backend defaults to `captureMode: "snapshot-uri"`, `rtspFallback: false`,
 `rtspSessionPolicy: "on-demand"`, `mediaService: "auto"`, and `authenticationMode: "auto"`.
 `maxSoapBytes`, `maxSnapshotBytes`, and `maxXmlDepth` default to 1 MiB, 64 MiB, and 64. `allowInsecure`

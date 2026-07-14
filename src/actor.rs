@@ -862,6 +862,7 @@ mod tests {
                     encoding,
                     jpeg_quality: 90,
                 },
+                thumbnail: None,
                 capture_interlock: Some(CaptureInterlock::Allow),
             },
             offline_policy: OfflinePolicy::WaitUntilDeadline,

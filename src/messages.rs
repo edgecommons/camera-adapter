@@ -2,7 +2,26 @@
 //!
 //! A terminal message is a kind (which fixes the header name and the `app/` channel) plus one
 //! validated schema-v1 body document. The body document is what the catalog commits as the durable
-//! terminal result and what the best-effort announcement carries, so the two can never disagree.
+//! terminal result and what the best-effort announcement carries, so the two can never disagree
+//! about anything the capture actually IS.
+//!
+//! # The one thing the announcement may add
+//!
+//! The announcement is the committed body PLUS an optional, volatile, derived preview: the
+//! [`Thumbnail`], attached at publish time by [`TerminalMessage::with_thumbnail`] and never written
+//! anywhere durable. This is a deliberate relaxation of "the two are the same document", and it is
+//! the ONLY one -- nothing else may use it.
+//!
+//! The reason is the reason the durable outbox was deleted: a capture must not pay to store an
+//! envelope. A thumbnail is a lossy, derived, disposable convenience, and putting one in the durable
+//! record would put ~64 KB of base64 into the catalog's terminal result for every capture, the same
+//! again into the on-disk metadata sidecar, and N times over into a group reply. So the durable
+//! body, the sidecar, and the deferred/group reply bodies carry NO thumbnail -- only the message on
+//! the wire does.
+//!
+//! The consequence is intended: an announcement REBUILT from the durable body in a later process
+//! (crash-window install recovery, restart interruption) carries no preview. The frame it would have
+//! been made from is long gone, and a preview is not a thing to reconstruct.
 
 use std::collections::BTreeMap;
 
@@ -145,6 +164,89 @@ pub struct ImageArtifact {
     /// Installed metadata sidecar relative path, when enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_sidecar_relative_path: Option<String>,
+}
+
+/// The thumbnail's only encoding.
+///
+/// A thumbnail exists to be looked at, and JPEG is the format every consumer can render -- whatever
+/// the artifact beside it was encoded as. There is deliberately no second option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThumbnailEncoding {
+    /// JPEG.
+    Jpeg,
+}
+
+/// An optional, lossy preview of the captured frame, carried as native protobuf bytes.
+///
+/// # It carries no digest, and that is deliberate
+///
+/// The thumbnail is a **lossy re-encode** of the same [`CaptureFrame`](crate::model::CaptureFrame)
+/// the artifact was made from, downscaled and re-compressed. It is not the artifact and cannot be
+/// checked against it. A `sha256` here would be a digest OF THE THUMBNAIL, and its only effect would
+/// be to invite a consumer to believe the preview is verifiable against the image whose `sha256`
+/// sits a few keys away -- which it is not, and cannot be. The one claim made for a thumbnail is
+/// that it was derived from the same frame; the artifact's digest remains the only verifiable one.
+///
+/// # It may be absent even when a profile configures it
+///
+/// A frame that could not be rendered, or a preview that would not fit the announcement's byte
+/// ceiling, is announced WITHOUT a thumbnail (and counted). A thumbnail never fails a capture.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Thumbnail {
+    /// Always `jpeg`.
+    pub encoding: ThumbnailEncoding,
+    /// Pixel width of the JPEG carried in `data`.
+    pub width: u32,
+    /// Pixel height of the JPEG carried in `data`.
+    pub height: u32,
+    /// Exact length of `data`, in bytes.
+    pub bytes: u64,
+    /// The JPEG itself, as the library's binary marker.
+    ///
+    /// This is what makes the picture land on the wire as a native protobuf `EcValue.bytes_value`
+    /// rather than as a base64 string inside the JSON body.
+    pub data: Value,
+}
+
+impl Thumbnail {
+    /// Wraps one encoded JPEG as the announced thumbnail.
+    ///
+    /// # Errors
+    /// Returns [`CameraError::Messaging`] when the messaging library refuses the bytes as a binary
+    /// value -- which it does above `MAX_BINARY_BODY_BYTES` (64 KiB). The renderer never offers
+    /// bytes that large ([`crate::thumbnail::MAX_THUMBNAIL_BYTES`] is 48 KiB), so this is the
+    /// belt-and-braces path: a thumbnail must never be able to fail an announcement's construction.
+    pub fn new(width: u32, height: u32, jpeg: &[u8]) -> Result<Self> {
+        let data = edgecommons::messaging::message::binary_value(jpeg)
+            .map_err(|error| CameraError::Messaging(error.to_string()))?;
+        Ok(Self {
+            encoding: ThumbnailEncoding::Jpeg,
+            width,
+            height,
+            bytes: jpeg.len() as u64,
+            data,
+        })
+    }
+
+    /// The JPEG bytes carried in `data`, read back through the library's own marker contract.
+    ///
+    /// # Errors
+    /// Returns [`CameraError::Messaging`] when `data` is not a well-formed binary marker.
+    pub fn data_bytes(&self) -> Result<Vec<u8>> {
+        // The library owns the marker format, so the bytes are read back through it rather than by
+        // re-implementing base64 here -- a second implementation is a second thing to get wrong.
+        let carrier: edgecommons::messaging::Message =
+            serde_json::from_value(serde_json::json!({ "body": self.data.clone() }))
+                .map_err(CameraError::from)?;
+        carrier
+            .binary_body()
+            .map_err(|error| CameraError::Messaging(error.to_string()))?
+            .ok_or_else(|| {
+                CameraError::Messaging("thumbnail data is not a binary marker".to_string())
+            })
+    }
 }
 
 /// Captured frame facts.
@@ -378,6 +480,27 @@ impl TerminalMessage {
             self.correlation_id(),
         )
         .map_err(|error| CameraError::Messaging(error.to_string()))
+    }
+
+    /// Attaches the volatile preview to the body of THIS message, and to nothing else.
+    ///
+    /// The thumbnail exists only on the wire. It is added here, to an announcement already built
+    /// from the durably committed body, so that no caller can accidentally route it into the
+    /// catalog, the metadata sidecar, or a deferred/group reply -- all of which are made from the
+    /// committed body, which never has one. See the module docs.
+    ///
+    /// # Errors
+    /// Returns [`CameraError::Messaging`] if the body is somehow not a JSON object; construction
+    /// already guarantees it is, so this cannot happen in practice and is not worth a panic.
+    pub fn with_thumbnail(mut self, thumbnail: &Thumbnail) -> Result<Self> {
+        let value = serde_json::to_value(thumbnail).map_err(CameraError::from)?;
+        self.body
+            .as_object_mut()
+            .ok_or_else(|| {
+                CameraError::Messaging("terminal body must be a JSON object".to_string())
+            })?
+            .insert("thumbnail".to_string(), value);
+        Ok(self)
     }
 
     /// Validated schema-v1 body document.
@@ -627,6 +750,128 @@ mod tests {
         assert_eq!(value["backendMetadata"], json!({"exposureUs": 1200}));
         assert!(value.get("captureGroupId").is_none());
         assert!(value.get("groupSize").is_none());
+    }
+
+    /// A JPEG fixture with enough entropy that base64 of it cannot appear in the wire bytes by luck.
+    fn jpeg_fixture() -> Vec<u8> {
+        use image::ExtendedColorType;
+        use image::codecs::jpeg::JpegEncoder;
+
+        let (width, height) = (48_u32, 32_u32);
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                pixels.extend_from_slice(&[(x * 5) as u8, (y * 7) as u8, ((x * y) % 251) as u8]);
+            }
+        }
+        let mut encoded = Vec::new();
+        JpegEncoder::new_with_quality(std::io::Cursor::new(&mut encoded), 80)
+            .encode(&pixels, width, height, ExtendedColorType::Rgb8)
+            .expect("fixture JPEG");
+        encoded
+    }
+
+    /// The thumbnail's bytes survive an envelope encode/decode as NATIVE protobuf bytes, byte for byte.
+    ///
+    /// This is the whole reason `data` goes through `binary_value` instead of being a base64 string
+    /// in the JSON body. Two independent assertions pin it, because either alone could pass while
+    /// the contract was broken:
+    ///
+    /// * the encoded envelope CONTAINS the JPEG as a contiguous run of raw bytes, and does NOT
+    ///   contain its base64 text -- which is exactly what distinguishes a protobuf `bytes_value`
+    ///   from a base64 string that merely decodes back to the same picture; and
+    /// * decoding the envelope yields the same JPEG, byte for byte, so nothing was lost or padded on
+    ///   the way through.
+    #[test]
+    fn the_announced_thumbnail_survives_the_envelope_as_native_protobuf_bytes() {
+        use edgecommons::messaging::{Message, MessageBuilder};
+
+        let jpeg = jpeg_fixture();
+        let mut body = base_body();
+        body.image = Some(ImageArtifact {
+            absolute_path: "/captures/a.jpg".to_string(),
+            relative_path: "a.jpg".to_string(),
+            file_uri: "file:///captures/a.jpg".to_string(),
+            content_type: "image/jpeg".to_string(),
+            encoding: OutputEncoding::Jpeg,
+            bytes: 3,
+            sha256: "00".repeat(32),
+            metadata_sidecar_relative_path: None,
+        });
+
+        // The preview is attached to the ANNOUNCEMENT, exactly as `announce_terminal` does it, and
+        // is not in the body this message was built from.
+        let message = TerminalMessage::new(TerminalKind::Captured, body)
+            .unwrap()
+            .with_thumbnail(&Thumbnail::new(48, 32, &jpeg).expect("a 48x32 JPEG is under 64 KiB"))
+            .expect("the announcement must accept the preview");
+        let envelope = MessageBuilder::new(message.header_name(), "1.0")
+            .payload(message.body().clone())
+            .correlation_id(message.correlation_id())
+            .build();
+        let wire = envelope
+            .to_vec()
+            .expect("the announcement must serialize to protobuf");
+
+        assert!(
+            wire.windows(jpeg.len()).any(|window| window == jpeg),
+            "the JPEG must appear in the protobuf envelope as its own raw bytes"
+        );
+        let base64 = message.body()["thumbnail"]["data"]["_edgecommonsBinary"]["data"]
+            .as_str()
+            .expect("the JSON-shaped body carries the marker's base64")
+            .as_bytes()
+            .to_vec();
+        assert!(
+            !wire.windows(base64.len()).any(|window| window == base64),
+            "base64 text on the wire would mean the picture was NOT encoded as native protobuf bytes"
+        );
+
+        let decoded = Message::from_slice(&wire).expect("the envelope must decode");
+        let received: Thumbnail = serde_json::from_value(decoded.body["thumbnail"].clone())
+            .expect("a consumer must be able to read the thumbnail back off the wire");
+        assert_eq!(received.encoding, ThumbnailEncoding::Jpeg);
+        assert_eq!((received.width, received.height), (48, 32));
+        assert_eq!(received.bytes, jpeg.len() as u64);
+        assert_eq!(
+            received.data_bytes().expect("the marker survives the wire"),
+            jpeg,
+            "the picture that comes off the wire must be the picture that went on it, byte for byte"
+        );
+    }
+
+    /// A thumbnail carries no digest, and nothing about the artifact's own digest changes.
+    #[test]
+    fn a_thumbnail_never_serializes_a_digest_of_its_own() {
+        let mut body = base_body();
+        body.image = Some(ImageArtifact {
+            absolute_path: "/captures/a.jpg".to_string(),
+            relative_path: "a.jpg".to_string(),
+            file_uri: "file:///captures/a.jpg".to_string(),
+            content_type: "image/jpeg".to_string(),
+            encoding: OutputEncoding::Jpeg,
+            bytes: 3,
+            sha256: "ab".repeat(32),
+            metadata_sidecar_relative_path: None,
+        });
+        let value = TerminalMessage::new(TerminalKind::Captured, body)
+            .unwrap()
+            .with_thumbnail(&Thumbnail::new(2, 2, &jpeg_fixture()).unwrap())
+            .unwrap()
+            .body()
+            .clone();
+        assert!(
+            value["thumbnail"].get("sha256").is_none(),
+            "a lossy re-encode that is not verifiable against the artifact must not look as if it is"
+        );
+        assert_eq!(
+            value["image"]["sha256"], "abababababababababababababababababababababababababababababababab",
+            "and the artifact's own digest -- the only verifiable one -- is untouched"
+        );
+        assert_eq!(
+            value["thumbnail"]["encoding"], "jpeg",
+            "the thumbnail is a JPEG whatever the artifact was encoded as"
+        );
     }
 
     #[test]

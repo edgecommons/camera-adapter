@@ -29,6 +29,7 @@ pub mod state_path;
 pub mod storage;
 pub mod storage_pressure;
 pub mod supervisor;
+pub mod thumbnail;
 #[cfg(windows)]
 mod windows_security;
 

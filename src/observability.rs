@@ -353,6 +353,17 @@ pub const HEALTH_METRIC: &str = "southbound_health";
 /// This is how many were lost -- the only place that loss is visible, and the reason it is a measure
 /// on `camera_captures` rather than a log line nobody aggregates.
 pub const ANNOUNCEMENT_FAILED_MEASURE: &str = "announcementFailed";
+/// Configured thumbnails that could not be rendered or encoded at all.
+///
+/// The capture SUCCEEDED and was announced; only the preview could not be made. It is counted rather
+/// than merely logged because a camera whose every thumbnail fails is a camera producing frames this
+/// component cannot interpret -- worth an alarm, and invisible in a log nobody aggregates.
+pub const THUMBNAIL_FAILED_MEASURE: &str = "thumbnailFailed";
+/// Thumbnails that rendered but were too large for the announcement's byte ceiling.
+///
+/// Distinct from `thumbnailFailed` on purpose: this one says the picture was fine and the BUDGET was
+/// not, which is an operator's cue to configure a smaller size rather than to suspect the camera.
+pub const THUMBNAIL_DROPPED_MEASURE: &str = "thumbnailDropped";
 
 impl CaptureMetrics {
     /// Defines both metrics against the component's metric service.
@@ -367,6 +378,8 @@ impl CaptureMetrics {
                 .add_measure("cancelled", "Count", 60)
                 .add_measure("interrupted", "Count", 60)
                 .add_measure(ANNOUNCEMENT_FAILED_MEASURE, "Count", 60)
+                .add_measure(THUMBNAIL_FAILED_MEASURE, "Count", 60)
+                .add_measure(THUMBNAIL_DROPPED_MEASURE, "Count", 60)
                 .build(),
         );
         metrics.define_metric(

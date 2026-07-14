@@ -239,11 +239,49 @@ async fn runtime_with_storage_pressure(
     .await
 }
 
+/// The runtime, plus the announcer every one of its engines publishes through.
+///
+/// The announcer is SHARED across the engines rather than one per camera, so a test can ask what the
+/// component announced -- for the whole fleet, in order -- which is the only place a volatile detail
+/// of an announcement (the thumbnail) can be observed at all.
+async fn runtime_with_announcer(
+    config: AdapterConfig,
+    directory: &TempDir,
+) -> (Arc<CameraRuntime>, Arc<RecordingAnnouncer>) {
+    let announcer = Arc::new(RecordingAnnouncer::default());
+    let runtime = runtime_with_everything(
+        config,
+        directory,
+        None,
+        Arc::new(RecordingMetrics::default()),
+        Arc::clone(&announcer),
+    )
+    .await;
+    (runtime, announcer)
+}
+
 async fn runtime_with_storage_pressure_and_metrics(
     config: AdapterConfig,
     directory: &TempDir,
     storage_pressure: Option<StoragePressureMonitor>,
     metrics: Arc<dyn edgecommons::metrics::MetricService>,
+) -> Arc<CameraRuntime> {
+    runtime_with_everything(
+        config,
+        directory,
+        storage_pressure,
+        metrics,
+        Arc::new(RecordingAnnouncer::default()),
+    )
+    .await
+}
+
+async fn runtime_with_everything(
+    config: AdapterConfig,
+    directory: &TempDir,
+    storage_pressure: Option<StoragePressureMonitor>,
+    metrics: Arc<dyn edgecommons::metrics::MetricService>,
+    announcer: Arc<RecordingAnnouncer>,
 ) -> Arc<CameraRuntime> {
     let state = directory.path().join("state");
     std::fs::create_dir_all(&state).unwrap();
@@ -265,7 +303,7 @@ async fn runtime_with_storage_pressure_and_metrics(
                 catalog.clone(),
                 admission.clone(),
                 storage.clone(),
-                Arc::new(RecordingAnnouncer::default()) as Arc<dyn crate::jobs::TerminalAnnouncer>,
+                Arc::clone(&announcer) as Arc<dyn crate::jobs::TerminalAnnouncer>,
                 Arc::clone(&waiters) as Arc<dyn JobHooks>,
             )
             .with_acceptance_hook(Arc::clone(&waiters) as Arc<dyn AcceptanceHook>),

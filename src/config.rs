@@ -760,8 +760,52 @@ pub struct CaptureProfile {
     pub gain: Option<f64>,
     /// Required output encoding.
     pub output: ProfileOutputConfig,
+    /// Optional thumbnail of the captured frame. Absent means no thumbnail is produced.
+    pub thumbnail: Option<ThumbnailConfig>,
     /// Per-profile PTZ/capture interlock override.
     pub capture_interlock: Option<CaptureInterlock>,
+}
+
+/// Opt-in thumbnail settings for one capture profile.
+///
+/// Presence is the opt-in: a profile without a `thumbnail` section produces no thumbnail, and the
+/// terminal announcement carries no `thumbnail` key at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThumbnailConfig {
+    /// Which of the three sizes to produce.
+    pub size: ThumbnailSize,
+}
+
+/// The thumbnail's longest-edge bound.
+///
+/// The bound is the LONGEST EDGE, not a fixed width x height: cameras are 4:3 and 16:9, and a fixed
+/// frame would distort one of them or letterbox it. The other axis follows the aspect ratio, and a
+/// frame already smaller than the bound is carried at its own size rather than upscaled.
+///
+/// There is no quality and no format knob. The component owns that trade, because the encoded
+/// thumbnail has to fit inside the terminal announcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThumbnailSize {
+    /// 160 px longest edge -- a list row or a badge.
+    Small,
+    /// 320 px longest edge -- a preview card.
+    Medium,
+    /// 640 px longest edge -- enough to glance at and judge.
+    Large,
+}
+
+impl ThumbnailSize {
+    /// The longest edge, in pixels, that a thumbnail of this size may have.
+    #[must_use]
+    pub const fn longest_edge(self) -> u32 {
+        match self {
+            Self::Small => 160,
+            Self::Medium => 320,
+            Self::Large => 640,
+        }
+    }
 }
 
 /// Offline admission policy.

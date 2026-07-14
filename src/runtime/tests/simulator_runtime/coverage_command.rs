@@ -4434,3 +4434,316 @@ fn terminal_profile(record: &crate::catalog::JobRecord) -> crate::config::Captur
             .expect("the durable record must carry the profile it used");
     snapshot.capture
 }
+
+/// The thumbnail that is announced is a downscale of THE FRAME THIS CAMERA TOOK.
+///
+/// The sibling of `the_image_that_is_delivered_is_the_image_the_camera_took`, and it exists for the
+/// same reason. A thumbnail is the one thing in the announcement an operator LOOKS at, and a preview
+/// of the wrong frame -- a stale one, a neighbouring camera's, a placeholder -- would look completely
+/// convincing. Nothing else in the body could reveal it: the dimensions would be right, the byte
+/// count would be right, and there is deliberately no digest to check it against.
+///
+/// So the frame is regenerated independently, straight from the simulator with the same seed and no
+/// part of the capture pipeline involved, downscaled here with the same public filter the renderer
+/// uses, and compared against the announced picture pixel by pixel. JPEG is lossy, so the comparison
+/// is a tolerance -- and the tolerance is shown to have TEETH: the same measurement against the same
+/// frame shifted by a few pixels blows past it by an order of magnitude, so a thumbnail that was
+/// merely "a plausible picture" could not pass.
+#[tokio::test]
+async fn the_thumbnail_that_is_announced_is_a_downscale_of_the_frame_the_camera_took() {
+    use image::{ImageReader, RgbImage, imageops};
+
+    let directory = TempDir::new().unwrap();
+    let mut configuration = config(directory.path(), &["camera-a"], false);
+    let crate::config::BackendConfig::Sim(sim) = &mut configuration.instances[0].backend else {
+        panic!("test fixture must use the simulator backend");
+    };
+    sim.seed = Some(20_260_714);
+    sim.frame.width = 640;
+    sim.frame.height = 480;
+    // A pattern with STRUCTURE, so that "is this the right picture" is a question with a sharp
+    // answer: the flat colour bars barely change when the frame does, and a comparison that cannot
+    // tell two different frames apart cannot vouch for one either.
+    sim.frame.pattern = crate::config::SimPattern::Checkerboard;
+    let backend_config = sim.clone();
+
+    for profile in configuration.instances[0].capture_profiles.values_mut() {
+        profile.thumbnail = Some(crate::config::ThumbnailConfig {
+            size: crate::config::ThumbnailSize::Medium,
+        });
+    }
+
+    let (runtime, announcer) = runtime_with_announcer(configuration, &directory).await;
+    runtime
+        .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+        .unwrap();
+    wait_for_online(&runtime, "camera-a").await;
+
+    let accepted = runtime
+        .submit_capture(
+            "camera-a".to_string(),
+            "thumbnail-fidelity".to_string(),
+            None,
+            None,
+            serde_json::Map::new(),
+            "thumbnail-fidelity-correlation".to_string(),
+            "sb/capture-submit",
+            crate::admission::CapturePriority::Submitted,
+        )
+        .await
+        .unwrap();
+    let capture_id = match accepted {
+        crate::catalog::AcceptJobOutcome::Inserted(record) => record.capture_id,
+        other => panic!("expected a newly accepted capture, got {other:?}"),
+    };
+    let terminal = wait_for_terminal(&runtime, &capture_id).await;
+    assert_eq!(terminal.state, crate::model::JobState::Succeeded);
+
+    // What the component ANNOUNCED -- the only place the preview exists. The durable body it was
+    // built from has none, which `the_thumbnail_is_announced_and_is_in_nothing_durable` pins.
+    let published = announcer.for_capture(&capture_id);
+    assert_eq!(published.len(), 1, "one terminal, one announcement");
+    assert!(
+        terminal
+            .terminal_result
+            .as_ref()
+            .expect("a succeeded capture commits a terminal body")
+            .get("thumbnail")
+            .is_none(),
+        "the preview must not have reached the durable record"
+    );
+    let announced: crate::messages::Thumbnail =
+        serde_json::from_value(published[0].body["thumbnail"].clone())
+            .expect("a profile that asked for a thumbnail must have been announced one");
+    assert_eq!(
+        (announced.width, announced.height),
+        (320, 240),
+        "medium bounds the longest edge of a 640x480 frame and keeps its aspect"
+    );
+    let delivered = ImageReader::new(std::io::Cursor::new(
+        announced
+            .data_bytes()
+            .expect("the announced marker must carry decodable bytes"),
+    ))
+    .with_guessed_format()
+    .expect("the thumbnail must be a recognisable image")
+    .decode()
+    .expect("the thumbnail must decode")
+    .to_rgb8();
+    assert_eq!(delivered.dimensions(), (320, 240));
+
+    // What the camera actually produced -- regenerated from the same seed, through the backend
+    // itself, with no part of the capture pipeline involved.
+    use crate::backend::CameraBackendFactory as _;
+    let factory = crate::backend::sim::SimBackendFactory;
+    let mut session = factory
+        .connect(crate::backend::ConnectRequest {
+            instance_id: "camera-a".to_owned(),
+            backend: crate::config::BackendConfig::Sim(backend_config),
+            timeout: Duration::from_secs(5),
+            cancellation: CancellationToken::new(),
+        })
+        .await
+        .expect("the simulator must connect");
+    let regenerate = || crate::backend::CaptureRequest {
+        capture_id: "regenerated".to_owned(),
+        profile: terminal_profile(&terminal),
+        maximum_frame_bytes: 8 * 1024 * 1024,
+        timeout: Duration::from_secs(5),
+        cancellation: CancellationToken::new(),
+    };
+    let frame = session
+        .capture(regenerate())
+        .await
+        .expect("the simulator must produce its first frame");
+    // The SECOND frame of the same camera: the most dangerous near-miss there is, because a stale
+    // preview is one the operator has no way at all to recognise as stale.
+    let next_frame = session
+        .capture(regenerate())
+        .await
+        .expect("the simulator must produce its second frame");
+    session.close().await.ok();
+    assert_eq!(frame.pixel_format, crate::model::PixelFormat::Rgb8);
+    assert_ne!(
+        frame.bytes, next_frame.bytes,
+        "the fixture is only useful if the camera's next frame is a different picture"
+    );
+
+    let camera_frame = RgbImage::from_raw(640, 480, frame.bytes.to_vec())
+        .expect("the regenerated frame is RGB8 640x480");
+    let expected = imageops::resize(
+        &camera_frame,
+        320,
+        240,
+        imageops::FilterType::Lanczos3,
+    );
+
+    // JPEG is lossy, so "the same picture" is a tolerance, not an equality. Quality 80 at 320x240
+    // moves a channel by a couple of levels; 8 is comfortably above that and nowhere near the
+    // ~60-100 that two DIFFERENT pictures score (asserted below).
+    const TOLERANCE: f64 = 8.0;
+    assert!(
+        mean_channel_difference(&delivered, &expected) < TOLERANCE,
+        "the announced thumbnail is not a downscale of the frame the camera took: mean channel \
+         difference {:.2} exceeds the {TOLERANCE} a lossy JPEG can explain",
+        mean_channel_difference(&delivered, &expected)
+    );
+
+    // The tolerance has TEETH, and this is the proof. Two pictures that a careless comparison would
+    // happily accept -- the same frame shifted six pixels, and the very next frame this same camera
+    // took -- must both be rejected by the same measurement, by a wide margin. Without this, a
+    // tolerance of 8 could not be told apart from a tolerance of 800.
+    let mut shifted = RgbImage::new(640, 480);
+    for (x, y, pixel) in camera_frame.enumerate_pixels() {
+        shifted.put_pixel((x + 6) % 640, y, *pixel);
+    }
+    let next = RgbImage::from_raw(640, 480, next_frame.bytes.to_vec())
+        .expect("the camera's next frame is RGB8 640x480");
+    for (what, other) in [("a 6-pixel shift of it", shifted), ("the camera's NEXT frame", next)] {
+        let difference = mean_channel_difference(
+            &delivered,
+            &imageops::resize(&other, 320, 240, imageops::FilterType::Lanczos3),
+        );
+        assert!(
+            difference > TOLERANCE * 3.0,
+            "the tolerance must reject a picture that is merely PLAUSIBLE, or it proves nothing: \
+             {what} scored {difference:.2}, and a {TOLERANCE} tolerance that accepted it would \
+             vouch for any preview at all"
+        );
+    }
+
+    runtime.shutdown().await;
+}
+
+/// Mean absolute per-channel difference between two same-sized RGB images, in 0..=255 levels.
+fn mean_channel_difference(left: &image::RgbImage, right: &image::RgbImage) -> f64 {
+    assert_eq!(
+        left.dimensions(),
+        right.dimensions(),
+        "a difference between differently-sized pictures is not a difference, it is a bug"
+    );
+    let total: u64 = left
+        .pixels()
+        .zip(right.pixels())
+        .flat_map(|(left, right)| {
+            left.0
+                .iter()
+                .zip(right.0.iter())
+                .map(|(left, right)| u64::from(left.abs_diff(*right)))
+                .collect::<Vec<_>>()
+        })
+        .sum();
+    let channels = u64::from(left.width()) * u64::from(left.height()) * 3;
+    total as f64 / channels as f64
+}
+
+/// A group reply carries one body PER MEMBER -- and not one preview among them.
+///
+/// This is where a preview in the durable record would hurt most: the group aggregate embeds every
+/// member's committed terminal body verbatim, so a 48 KiB thumbnail per capture becomes N of them in
+/// a single reply. It is also the sharpest statement of the rule, because the aggregate is built
+/// from the CATALOG -- if the durable bodies were clean and the aggregate still had previews, or the
+/// other way round, this is the test that would say so.
+#[tokio::test]
+async fn a_group_reply_embeds_every_members_body_and_not_one_thumbnail() {
+    let directory = TempDir::new().unwrap();
+    let mut configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+    for camera in &mut configuration.instances {
+        for profile in camera.capture_profiles.values_mut() {
+            profile.thumbnail = Some(crate::config::ThumbnailConfig {
+                size: crate::config::ThumbnailSize::Large,
+            });
+        }
+    }
+    let runtime = runtime(configuration, &directory).await;
+    for instance in ["camera-a", "camera-b"] {
+        runtime
+            .start_supervisor(instance.to_string(), runtime.engine(instance).unwrap())
+            .unwrap();
+        wait_for_online(&runtime, instance).await;
+    }
+
+    let accepted = runtime
+        .submit_group(
+            group_request("group-of-two", &["camera-a", "camera-b"]),
+            "group-preview-correlation".to_string(),
+            crate::admission::CapturePriority::Submitted,
+            None,
+        )
+        .await
+        .expect("the group must be accepted");
+    let terminal = wait_for_group_terminal(&runtime, &accepted.group_id).await;
+    assert_eq!(terminal.state, crate::model::JobState::Succeeded);
+
+    // The exact document a group's caller is answered with.
+    let group = group_for(&runtime, "group-of-two")
+        .await
+        .expect("the durable group must exist");
+    let reply = group_terminal_json(&group);
+    let members = reply["members"]
+        .as_array()
+        .expect("a group reply carries its members");
+    assert_eq!(members.len(), 2, "both members must be in the reply");
+    for member in members {
+        assert!(
+            member["image"]["sha256"].is_string(),
+            "the fixture is only meaningful if these are real, succeeded captures: {member}"
+        );
+        assert!(
+            member.get("thumbnail").is_none(),
+            "a group reply must not carry a preview per member: {member}"
+        );
+    }
+    assert!(
+        !reply.to_string().contains("thumbnail"),
+        "not one preview may appear anywhere in a group reply: {reply}"
+    );
+
+    runtime.shutdown().await;
+}
+
+/// The thumbnail measures are wired to the metric an operator actually watches.
+///
+/// A hook that counts nothing is indistinguishable from a hook that is never called, and this
+/// component shipped three fully-built subsystems wired to nothing. Both measures go through the
+/// real `RuntimeJobHooks` on a real runtime, into the real `CaptureMetrics`, and are read back off
+/// the metric target -- the same path `announcementFailed` takes.
+#[tokio::test]
+async fn a_thumbnail_that_fails_or_is_dropped_is_counted_on_the_capture_metric() {
+    use crate::jobs::JobHooks as _;
+
+    let directory = TempDir::new().unwrap();
+    let (runtime, recorder) =
+        runtime_with_metrics(config(directory.path(), &["camera-a"], false), &directory).await;
+
+    runtime.waiters.thumbnail_failed().await;
+    runtime.waiters.thumbnail_dropped().await;
+    runtime.waiters.thumbnail_dropped().await;
+
+    assert_eq!(
+        recorder.counts(
+            crate::observability::CAPTURE_METRIC,
+            crate::observability::THUMBNAIL_FAILED_MEASURE
+        ),
+        1.0,
+        "a thumbnail that could not be rendered must be visible outside the process"
+    );
+    assert_eq!(
+        recorder.counts(
+            crate::observability::CAPTURE_METRIC,
+            crate::observability::THUMBNAIL_DROPPED_MEASURE
+        ),
+        2.0,
+        "and so must every thumbnail that did not fit the ceiling"
+    );
+    assert!(
+        edgecommons::metrics::MetricService::is_metric_defined(
+            recorder.as_ref(),
+            crate::observability::CAPTURE_METRIC
+        ),
+        "the measures must be DEFINED on the capture metric, not emitted into a metric that has \
+         never heard of them"
+    );
+
+    runtime.shutdown().await;
+}

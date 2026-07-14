@@ -33,7 +33,7 @@ use crate::encoding::EncodingRequest;
 use crate::messages::{
     CameraSummary, CaptureDurations, CaptureTimestamps, CaptureTrigger, FailureSummary,
     FrameSummary, ImageArtifact, TERMINAL_SCHEMA_VERSION, TerminalBody, TerminalKind,
-    TerminalMessage,
+    TerminalMessage, Thumbnail,
 };
 use crate::model::{
     CaptureFrame, CaptureMode, FrameTimestampQuality, JobState, PixelFormat, PtzRequest, PtzResult,
@@ -42,6 +42,7 @@ use crate::storage::{
     InstallGate, PrepareCapture, RecoveryOutcome, RecoveryRequest, RelativeOutputPath,
     StorageReservation, StorageRoot,
 };
+use crate::thumbnail::ThumbnailOutcome;
 use crate::{CameraError, ErrorCode, Result};
 
 /// How long the terminal reaper waits before trying a durable store that just refused it.
@@ -201,6 +202,16 @@ pub trait JobHooks: Send + Sync {
     /// The capture is already durable and already SUCCEEDED/FAILED/CANCELLED. This is where the
     /// component counts the loss and marks messaging degraded; it must never fail the capture.
     async fn terminal_announcement_failed(&self, _record: &JobRecord, _error: &CameraError) {}
+
+    /// Observes a configured thumbnail that could not be rendered or encoded.
+    ///
+    /// The capture is unaffected: it succeeds, it is announced, and it simply carries no preview.
+    /// Which capture it was is already in the WARN the engine logged; the measure is deliberately
+    /// undimensioned, because a per-camera dimension on a 256-camera fleet is 256 metric streams.
+    async fn thumbnail_failed(&self) {}
+
+    /// Observes a configured thumbnail that rendered but exceeded the announcement's byte ceiling.
+    async fn thumbnail_dropped(&self) {}
 }
 
 /// Runs after durable `ACCEPTED` insertion and before the record can become `QUEUED` or visible
@@ -680,7 +691,7 @@ impl JobEngine {
         match self.catalog.cancel_job(capture_id, write).await? {
             TerminalOutcome::Won(record) => {
                 runtime.cancellation.cancel();
-                self.after_terminal(&runtime, &record, &body).await;
+                self.after_terminal(&runtime, &record, &body, None).await;
                 Ok(CancelResult {
                     cancelled: true,
                     state: record.state,
@@ -799,7 +810,7 @@ impl JobEngine {
             // for this capture, whoever committed it announced it, and announcing it twice would
             // publish the same event id again.
             TerminalOutcome::Won(record) => {
-                self.announce_terminal(&record, &body).await;
+                self.announce_terminal(&record, &body, None).await;
                 record
             }
             TerminalOutcome::AlreadyTerminal(record) => record,
@@ -935,7 +946,7 @@ impl JobEngine {
             // Only the winner announces: a record that was already terminal was already announced by
             // whoever committed it, and announcing it again would republish that event id.
             TerminalOutcome::Won(terminal) => {
-                self.announce_terminal(&terminal, &body).await;
+                self.announce_terminal(&terminal, &body, None).await;
                 self.hooks.settle_waiters(&terminal, &body).await;
                 if terminal.group_id.is_some() {
                     self.hooks.group_member_terminal(&terminal, &body).await;
@@ -1124,13 +1135,14 @@ impl JobEngine {
         } else {
             runtime.deadlines().persist_at_ms
         };
-        let prepared = match self
+        let (prepared, thumbnail) = match self
             .prepare_blocking(&runtime, frame, processing, encoder, writer, work_deadline)
             .await
         {
             Ok(prepared) => prepared,
             Err(error) => return self.finish_error(&runtime, error).await,
         };
+        let thumbnail = self.settle_thumbnail(&runtime, thumbnail).await;
 
         {
             let mut trace = lock(&runtime.trace);
@@ -1219,7 +1231,10 @@ impl JobEngine {
             .catalog
             .commit_terminal(&runtime.spec.capture_id, pending)
             .await?;
-        self.finish_terminal_outcome(&runtime, outcome, &committed_body)
+        // The thumbnail rides ONLY on the announcement, never into `committed_body` -- which is what
+        // the catalog holds, what the sidecar is written from, and what a deferred/group reply
+        // carries. See the `messages` module docs.
+        self.finish_terminal_outcome(&runtime, outcome, &committed_body, thumbnail.as_ref())
             .await
     }
 
@@ -1440,6 +1455,17 @@ impl JobEngine {
         outcome
     }
 
+    /// Encodes and stages the artifact, and -- when the profile asks for one -- the thumbnail.
+    ///
+    /// Both are CPU-bound, both work from the same in-hand frame, and both belong inside the SAME
+    /// `spawn_blocking`: it already holds the encoder and writer permits that bound how much of this
+    /// work the component does at once, and it is already off the reactor. The thumbnail is rendered
+    /// from `request.frame` BEFORE the request is moved into `prepare_capture`, so it is made from
+    /// the camera's frame -- the same bytes the artifact is derived from -- and not from the file.
+    ///
+    /// The thumbnail's outcome is RETURNED rather than acted on here: a failed or dropped preview is
+    /// a fact to log and count on the async side, never an error that could reach this function's
+    /// `Result` and become the capture's.
     async fn prepare_blocking(
         &self,
         runtime: &Arc<JobRuntime>,
@@ -1448,12 +1474,17 @@ impl JobEngine {
         encoder: Option<EncoderPermit>,
         writer: WriterPermit,
         deadline_ms: i64,
-    ) -> Result<crate::storage::PreparedInstall> {
+    ) -> Result<(crate::storage::PreparedInstall, Option<ThumbnailOutcome>)> {
         let current = processing.reserved_disk_bytes();
         let other = self
             .admission
             .outstanding_disk_bytes()
             .saturating_sub(current);
+        let thumbnail = runtime.spec.profile.capture.thumbnail;
+        // The picture the thumbnail may decode is bounded by the same ceiling the capture was
+        // ADMITTED with. A JPEG frame's decoded size is not its file size, and this is the only code
+        // in the component that decodes one -- see `thumbnail::render`.
+        let maximum_frame_bytes = runtime.spec.profile.maximum_frame_bytes;
         let request = PrepareCapture {
             capture_id: runtime.spec.capture_id.clone(),
             relative_path: runtime.spec.relative_path.clone(),
@@ -1474,10 +1505,13 @@ impl JobEngine {
             let _encoder = encoder;
             let _writer = writer;
             let mut processing = processing;
+            let thumbnail = thumbnail.map(|thumbnail| {
+                crate::thumbnail::render(&request.frame, thumbnail.size, maximum_frame_bytes)
+            });
             let prepared = storage.prepare_capture(request, &cancellation)?;
             processing.release_memory();
             processing.shrink_disk(prepared.artifact().bytes)?;
-            Ok((prepared, processing))
+            Ok((prepared, thumbnail, processing))
         });
         tokio::pin!(task);
         tokio::select! {
@@ -1488,9 +1522,47 @@ impl JobEngine {
                 Err(timeout_error("encoding/persistence"))
             }
             result = &mut task => {
-                let (prepared, _processing) = result
+                let (prepared, thumbnail, _processing) = result
                     .map_err(|error| CameraError::Storage(format!("bounded persistence worker failed: {error}")))??;
-                Ok(prepared)
+                Ok((prepared, thumbnail))
+            }
+        }
+    }
+
+    /// Turns one thumbnail outcome into the preview to announce, plus its log line and its measure.
+    ///
+    /// Everything that is not a rendered thumbnail resolves to `None`: the capture is already on
+    /// disk, the announcement is already owed, and a preview is a convenience that never gets to
+    /// change either.
+    async fn settle_thumbnail(
+        &self,
+        runtime: &Arc<JobRuntime>,
+        outcome: Option<ThumbnailOutcome>,
+    ) -> Option<Thumbnail> {
+        match outcome? {
+            ThumbnailOutcome::Rendered(thumbnail) => Some(thumbnail),
+            ThumbnailOutcome::Dropped { bytes } => {
+                tracing::warn!(
+                    capture = %runtime.spec.capture_id,
+                    instance = %runtime.spec.instance,
+                    bytes,
+                    ceiling = crate::thumbnail::MAX_THUMBNAIL_BYTES,
+                    "the thumbnail did not fit the announcement ceiling even at the lowest quality \
+                     and was dropped; the capture and its announcement are unaffected"
+                );
+                self.hooks.thumbnail_dropped().await;
+                None
+            }
+            ThumbnailOutcome::Failed { reason } => {
+                tracing::warn!(
+                    capture = %runtime.spec.capture_id,
+                    instance = %runtime.spec.instance,
+                    reason = %reason,
+                    "the thumbnail could not be rendered; the capture and its announcement are \
+                     unaffected"
+                );
+                self.hooks.thumbnail_failed().await;
+                None
             }
         }
     }
@@ -1544,7 +1616,7 @@ impl JobEngine {
             .commit_terminal(&runtime.spec.capture_id, write)
             .await?;
         let record = self
-            .finish_terminal_outcome(runtime, outcome, &body)
+            .finish_terminal_outcome(runtime, outcome, &body, None)
             .await?;
         runtime.cancellation.cancel();
         Ok(record)
@@ -1566,7 +1638,7 @@ impl JobEngine {
         {
             TerminalOutcome::Won(record) => {
                 runtime.cancellation.cancel();
-                self.after_terminal(runtime, &record, &body).await;
+                self.after_terminal(runtime, &record, &body, None).await;
                 Ok(record)
             }
             TerminalOutcome::AlreadyTerminal(record) => {
@@ -1588,10 +1660,11 @@ impl JobEngine {
         runtime: &Arc<JobRuntime>,
         outcome: TerminalOutcome,
         body: &Value,
+        thumbnail: Option<&Thumbnail>,
     ) -> Result<JobRecord> {
         match outcome {
             TerminalOutcome::Won(record) => {
-                self.after_terminal(runtime, &record, body).await;
+                self.after_terminal(runtime, &record, body, thumbnail).await;
                 Ok(record)
             }
             TerminalOutcome::AlreadyTerminal(record) => {
@@ -1605,9 +1678,19 @@ impl JobEngine {
         }
     }
 
-    async fn after_terminal(&self, runtime: &Arc<JobRuntime>, record: &JobRecord, body: &Value) {
+    /// Everything that happens once a terminal has WON its durable commit.
+    ///
+    /// `body` is the committed document, and it is what the waiters and the group coordinator are
+    /// settled with -- unchanged, thumbnail-free. Only the announcement gets the preview.
+    async fn after_terminal(
+        &self,
+        runtime: &Arc<JobRuntime>,
+        record: &JobRecord,
+        body: &Value,
+        thumbnail: Option<&Thumbnail>,
+    ) {
         self.complete_runtime(runtime);
-        self.announce_terminal(record, body).await;
+        self.announce_terminal(record, body, thumbnail).await;
         self.hooks.settle_waiters(record, body).await;
         if record.group_id.is_some() {
             self.hooks.group_member_terminal(record, body).await;
@@ -1621,11 +1704,23 @@ impl JobEngine {
     /// never retried, and every way it can fail ends here, at WARN, with a counted metric and
     /// messaging marked degraded. A broker that is down loses announcements; it does not lose
     /// captures, does not reject captures, and does not stop the component.
-    async fn announce_terminal(&self, record: &JobRecord, body: &Value) {
+    async fn announce_terminal(
+        &self,
+        record: &JobRecord,
+        body: &Value,
+        thumbnail: Option<&Thumbnail>,
+    ) {
         let started = Instant::now();
         let announcement = match terminal_kind(record.state)
             .and_then(|kind| TerminalMessage::from_committed_body(kind, body.clone()))
-        {
+            .and_then(|message| match thumbnail {
+                // The one thing the wire carries that the durable record does not: a volatile,
+                // derived preview, attached to the message and to nothing else. An announcement
+                // REBUILT from the durable body in a later process -- the recovery paths below --
+                // passes `None` here and simply has no preview, because the frame is long gone.
+                Some(thumbnail) => message.with_thumbnail(thumbnail),
+                None => Ok(message),
+            }) {
             Ok(message) => self.announcer.announce(&message).await,
             Err(error) => Err(error),
         };
@@ -1857,7 +1952,7 @@ pub(crate) mod testing {
     use crate::{CameraError, Result};
 
     /// One announcement, as a test can see it: exactly what would have gone on the wire.
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq)]
     pub(crate) struct Announcement {
         /// EdgeCommons envelope header name (`ImageCaptured`, ...).
         pub header_name: &'static str,
@@ -1869,6 +1964,8 @@ pub(crate) mod testing {
         pub capture_id: String,
         /// Envelope correlation.
         pub correlation_id: String,
+        /// The validated schema-v1 body document exactly as it would be published.
+        pub body: serde_json::Value,
     }
 
     /// Records every announcement, and fails them all while `fail` is set -- which is what a broker
@@ -1925,6 +2022,7 @@ pub(crate) mod testing {
                         .unwrap_or_default()
                         .to_string(),
                     correlation_id: message.correlation_id().to_string(),
+                    body: message.body().clone(),
                 });
             if self.fail.load(Ordering::SeqCst) {
                 return Err(CameraError::Messaging(
@@ -2345,6 +2443,7 @@ mod tests {
                 encoding: OutputEncoding::Jpeg,
                 jpeg_quality: 90,
             },
+            thumbnail: None,
             capture_interlock: None,
         }
     }
@@ -3444,5 +3543,470 @@ mod tests {
         );
         assert_eq!(hooks.announced.load(Ordering::SeqCst), 1);
         assert_eq!(hooks.failed.load(Ordering::SeqCst), 0);
+    }
+
+    // ============================ the opt-in thumbnail ============================
+    //
+    // The property under all of these: a thumbnail is a convenience, and a convenience may not cost
+    // a capture anything. Whatever the preview does -- absent, unrenderable, too big -- the capture
+    // reaches SUCCEEDED, the artifact is installed, and the terminal is announced.
+
+    /// A camera that hands the engine exactly the frame the test chose.
+    struct FrameSession {
+        capabilities: crate::model::CameraCapabilities,
+        frame: CaptureFrame,
+    }
+
+    #[async_trait]
+    impl CameraSession for FrameSession {
+        fn capabilities(&self) -> &crate::model::CameraCapabilities {
+            &self.capabilities
+        }
+
+        async fn status(&mut self) -> Result<CameraStatus> {
+            unreachable!("a capture does not read camera status")
+        }
+
+        async fn capture(&mut self, _request: CaptureRequest) -> Result<CaptureFrame> {
+            Ok(self.frame.clone())
+        }
+
+        async fn ptz_bounded(
+            &mut self,
+            _request: PtzRequest,
+            _deadline: Instant,
+            _cancellation: &CancellationToken,
+        ) -> Result<PtzResult> {
+            unreachable!("the interlock is Allow in these fixtures")
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Counts what the engine told the runtime about each thumbnail, and about each announcement.
+    #[derive(Default)]
+    struct ThumbnailHooks {
+        announced: AtomicUsize,
+        thumbnail_failed: AtomicUsize,
+        thumbnail_dropped: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl JobHooks for ThumbnailHooks {
+        async fn terminal_announced(&self, _record: &JobRecord, _latency: Duration) {
+            self.announced.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn thumbnail_failed(&self) {
+            self.thumbnail_failed.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn thumbnail_dropped(&self) {
+            self.thumbnail_dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A capture whose profile asks for `size` (or, when `None`, does not mention thumbnails at all).
+    fn thumbnail_submission(
+        capture_id: &str,
+        size: Option<crate::config::ThumbnailSize>,
+        encoding: OutputEncoding,
+    ) -> JobSubmission {
+        let mut submission = command_submission(capture_id, Utc::now().timestamp_millis());
+        submission.spec.profile.capture.output.encoding = encoding;
+        submission.spec.profile.capture.thumbnail =
+            size.map(|size| crate::config::ThumbnailConfig { size });
+        submission.spec.profile.capture.maximum_frame_bytes = Some(8 * 1024 * 1024);
+        submission.spec.profile.maximum_frame_bytes = 8 * 1024 * 1024;
+        // The durable snapshot and the runtime snapshot are the same profile, and the engine checks
+        // that they are.
+        submission.job.effective_profile = serde_json::to_value(&submission.spec.profile).unwrap();
+        submission
+    }
+
+    fn test_frame(format: PixelFormat, bytes: Vec<u8>, width: u32, height: u32) -> CaptureFrame {
+        CaptureFrame {
+            bytes: Bytes::from(bytes),
+            width,
+            height,
+            pixel_format: format,
+            capture_mode: CaptureMode::Simulated,
+            source_timestamp: None,
+            timestamp_quality: FrameTimestampQuality::Camera,
+            backend_metadata: BTreeMap::new(),
+        }
+    }
+
+    /// An RGB8 frame whose pixels vary with position.
+    fn gradient_frame(width: u32, height: u32) -> CaptureFrame {
+        let mut bytes = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                bytes.extend_from_slice(&[(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]);
+            }
+        }
+        test_frame(PixelFormat::Rgb8, bytes, width, height)
+    }
+
+    /// Runs one capture end to end against a chosen frame, and reports what was announced.
+    async fn capture_frame(
+        submission: JobSubmission,
+        frame: CaptureFrame,
+        hooks: &Arc<ThumbnailHooks>,
+    ) -> (JobRecord, Vec<super::testing::Announcement>, TempDir) {
+        let capture_id = submission.spec.capture_id.clone();
+        let (engine, directory, announcer) = engine_with_announcer(
+            Arc::new(RecordingAnnouncer::default()),
+            Arc::clone(hooks) as Arc<dyn JobHooks>,
+        )
+        .await;
+        let dispatcher = RecordingDispatcher::default();
+        engine
+            .accept_and_queue(&dispatcher, submission)
+            .await
+            .expect("the capture must be accepted");
+        let descriptor = lock(&dispatcher.descriptors)
+            .pop()
+            .expect("acceptance must have committed a descriptor to the actor");
+        let mut session = FrameSession {
+            capabilities: test_capabilities(),
+            frame,
+        };
+        let record = engine
+            .execute(&mut session, descriptor)
+            .await
+            .expect("the capture must reach a terminal state");
+        (record, announcer.for_capture(&capture_id), directory)
+    }
+
+    /// Absent `thumbnail` in the profile means no thumbnail, and no `thumbnail` key on the wire.
+    ///
+    /// Off by default is the whole opt-in surface. A key carrying `null`, or an empty object, would
+    /// be a consumer's problem to disambiguate forever after; the field simply is not there.
+    #[tokio::test]
+    async fn a_profile_that_asks_for_no_thumbnail_announces_no_thumbnail_key_at_all() {
+        let hooks = Arc::new(ThumbnailHooks::default());
+        let (record, announced, _directory) = capture_frame(
+            thumbnail_submission("cap-thumb-off", None, OutputEncoding::Jpeg),
+            gradient_frame(320, 240),
+            &hooks,
+        )
+        .await;
+
+        assert_eq!(record.state, JobState::Succeeded);
+        assert_eq!(announced.len(), 1, "one terminal, one announcement");
+        assert!(
+            announced[0].body.get("thumbnail").is_none(),
+            "a profile that never mentioned thumbnails must not announce one: {}",
+            announced[0].body
+        );
+        assert!(
+            announced[0].body.get("image").is_some(),
+            "the artifact itself is unaffected"
+        );
+        assert_eq!(hooks.thumbnail_failed.load(Ordering::SeqCst), 0);
+        assert_eq!(hooks.thumbnail_dropped.load(Ordering::SeqCst), 0);
+    }
+
+    /// A configured thumbnail is announced beside the artifact, as bytes, with no digest of its own.
+    ///
+    /// Three claims, and each is load-bearing:
+    /// * the picture is carried through the library's binary marker, so it lands on the wire as a
+    ///   native protobuf `bytes_value` rather than as a base64 string inside the JSON body;
+    /// * the announced `width`/`height`/`bytes` describe the JPEG actually carried; and
+    /// * there is NO `sha256`. The thumbnail is a lossy re-encode, so a digest of it could never be
+    ///   checked against the artifact whose digest sits three keys away -- it could only invite a
+    ///   consumer to believe it could be.
+    #[tokio::test]
+    async fn a_configured_thumbnail_is_announced_as_bytes_beside_the_artifact_and_carries_no_digest()
+    {
+        let hooks = Arc::new(ThumbnailHooks::default());
+        let (record, announced, _directory) = capture_frame(
+            thumbnail_submission(
+                "cap-thumb-on",
+                Some(crate::config::ThumbnailSize::Medium),
+                OutputEncoding::Jpeg,
+            ),
+            gradient_frame(1024, 768),
+            &hooks,
+        )
+        .await;
+
+        assert_eq!(record.state, JobState::Succeeded);
+        assert_eq!(announced.len(), 1);
+        let thumbnail = &announced[0].body["thumbnail"];
+        assert_eq!(thumbnail["encoding"], "jpeg", "a thumbnail is always a JPEG");
+        assert_eq!(thumbnail["width"], 320, "medium bounds the longest edge");
+        assert_eq!(thumbnail["height"], 240, "and the aspect ratio survives");
+        assert!(
+            thumbnail.get("sha256").is_none(),
+            "a lossy re-encode must not be handed a digest that invites verification: {thumbnail}"
+        );
+        assert!(
+            thumbnail["data"]["_edgecommonsBinary"].is_object(),
+            "the picture must go through the library's binary marker, not into the JSON as base64"
+        );
+
+        // The bytes announced are a JPEG of exactly the announced size.
+        let carried: crate::messages::Thumbnail = serde_json::from_value(thumbnail.clone())
+            .expect("a consumer must be able to read the announced thumbnail back");
+        let jpeg = carried
+            .data_bytes()
+            .expect("the marker must carry decodable bytes");
+        assert_eq!(
+            thumbnail["bytes"].as_u64(),
+            Some(jpeg.len() as u64),
+            "the announced byte count must be the size of the bytes announced"
+        );
+        assert!(jpeg.starts_with(&[0xff, 0xd8]) && jpeg.ends_with(&[0xff, 0xd9]));
+
+        // ...and the DURABLE record does not carry it. See the test below.
+        let durable = record.terminal_result.as_ref().unwrap();
+        assert!(
+            durable.get("thumbnail").is_none(),
+            "the preview is volatile: it belongs on the wire and nowhere else"
+        );
+        assert_eq!(
+            durable["image"], announced[0].body["image"],
+            "and the announcement is otherwise the committed body, unchanged"
+        );
+        assert_eq!(hooks.thumbnail_failed.load(Ordering::SeqCst), 0);
+        assert_eq!(hooks.thumbnail_dropped.load(Ordering::SeqCst), 0);
+        assert_eq!(hooks.announced.load(Ordering::SeqCst), 1);
+    }
+
+    /// NOTHING DURABLE CARRIES THE THUMBNAIL -- not the catalog, not the sidecar, not a reply.
+    ///
+    /// This is the whole point of the preview being volatile, and it is the reason the durable
+    /// outbox was deleted in the first place: a capture must not pay to STORE an envelope. A 48 KiB
+    /// preview in the terminal body would put ~64 KB of base64 into the catalog's `terminal_result`
+    /// for every capture, the same again into the on-disk metadata sidecar beside the very image it
+    /// is a thumbnail OF, and N times over into a group reply.
+    ///
+    /// So this asserts the negative, on a capture whose thumbnail was configured, rendered, and
+    /// successfully announced: the announced body has it, and every durable/derived artifact of the
+    /// same capture -- the catalog record, the sidecar FILE on disk, and the body the deferred
+    /// caller is settled with -- does not.
+    #[tokio::test]
+    async fn the_thumbnail_is_announced_and_is_in_nothing_durable() {
+        /// A waiter/group coordinator that keeps the exact body it was settled with.
+        #[derive(Default)]
+        struct SettledBodies {
+            settled: Mutex<Vec<Value>>,
+        }
+
+        #[async_trait]
+        impl JobHooks for SettledBodies {
+            async fn settle_waiters(&self, _record: &JobRecord, terminal_body: &Value) {
+                lock(&self.settled).push(terminal_body.clone());
+            }
+
+            async fn group_member_terminal(&self, _record: &JobRecord, terminal_body: &Value) {
+                lock(&self.settled).push(terminal_body.clone());
+            }
+        }
+
+        let hooks = Arc::new(SettledBodies::default());
+        let capture_id = "cap-thumb-volatile";
+        let (engine, _directory, announcer) = engine_with_announcer(
+            Arc::new(RecordingAnnouncer::default()),
+            Arc::clone(&hooks) as Arc<dyn JobHooks>,
+        )
+        .await;
+        let dispatcher = RecordingDispatcher::default();
+        engine
+            .accept_and_queue(
+                &dispatcher,
+                thumbnail_submission(
+                    capture_id,
+                    Some(crate::config::ThumbnailSize::Medium),
+                    OutputEncoding::Jpeg,
+                ),
+            )
+            .await
+            .unwrap();
+        let descriptor = lock(&dispatcher.descriptors).pop().unwrap();
+        let mut session = FrameSession {
+            capabilities: test_capabilities(),
+            frame: gradient_frame(1024, 768),
+        };
+        let record = engine.execute(&mut session, descriptor).await.unwrap();
+        assert_eq!(record.state, JobState::Succeeded);
+
+        // It WAS announced -- otherwise the negatives below would be vacuously true.
+        let announced = announcer.for_capture(capture_id);
+        assert_eq!(announced.len(), 1);
+        assert!(
+            announced[0].body["thumbnail"]["data"]["_edgecommonsBinary"].is_object(),
+            "the fixture must actually have produced and announced a thumbnail: {}",
+            announced[0].body
+        );
+
+        // 1. The durable catalog record.
+        let durable = record
+            .terminal_result
+            .as_ref()
+            .expect("a succeeded capture commits a terminal body");
+        assert!(
+            durable.get("thumbnail").is_none(),
+            "the CATALOG must not store a lossy preview for every capture ever taken: {durable}"
+        );
+
+        // 2. The metadata sidecar FILE on disk -- which is the durable body, verbatim.
+        let image = durable["image"]["absolutePath"].as_str().unwrap();
+        let sidecar: Value =
+            serde_json::from_slice(&std::fs::read(format!("{image}.json")).unwrap()).unwrap();
+        assert_eq!(
+            sidecar, *durable,
+            "the sidecar is the committed body verbatim, and that invariant is untouched"
+        );
+        assert!(
+            sidecar.get("thumbnail").is_none(),
+            "a base64 preview of an image has no business sitting in a file NEXT to that image"
+        );
+
+        // 3. The body every deferred caller and group coordinator is settled with.
+        let settled = lock(&hooks.settled).clone();
+        assert!(!settled.is_empty(), "the waiter hook must have been called");
+        for body in settled {
+            assert!(
+                body.get("thumbnail").is_none(),
+                "a reply -- and a group reply carries one body PER MEMBER -- must not carry \
+                 previews: {body}"
+            );
+        }
+    }
+
+    /// A thumbnail that will not fit the ceiling is dropped -- the capture and the announcement are not.
+    ///
+    /// This is the case the whole ladder exists for. Over 64 KiB the messaging library refuses the
+    /// binary value, which means the ANNOUNCEMENT ITSELF would fail to build and the capture's
+    /// terminal message would be lost. So the thumbnail is what gives way, and it is counted.
+    #[tokio::test]
+    async fn a_thumbnail_over_the_ceiling_is_dropped_while_the_capture_succeeds_and_is_announced() {
+        // Incompressible per-pixel noise: at 640px even quality 50 cannot get under 48 KiB.
+        let (width, height) = (640_u32, 640_u32);
+        let mut bytes = Vec::with_capacity((width * height * 3) as usize);
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        for _ in 0..width * height * 3 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.push(state as u8);
+        }
+
+        let hooks = Arc::new(ThumbnailHooks::default());
+        let (record, announced, _directory) = capture_frame(
+            thumbnail_submission(
+                "cap-thumb-huge",
+                Some(crate::config::ThumbnailSize::Large),
+                OutputEncoding::Jpeg,
+            ),
+            test_frame(PixelFormat::Rgb8, bytes, width, height),
+            &hooks,
+        )
+        .await;
+
+        assert_eq!(
+            record.state,
+            JobState::Succeeded,
+            "a preview that would not fit is not a capture that failed"
+        );
+        assert!(
+            std::path::Path::new(
+                record.terminal_result.as_ref().unwrap()["image"]["absolutePath"]
+                    .as_str()
+                    .unwrap()
+            )
+            .exists(),
+            "the artifact is on disk, at full size, exactly as it would have been"
+        );
+        assert_eq!(announced.len(), 1, "and it was still announced");
+        assert!(
+            announced[0].body.get("thumbnail").is_none(),
+            "an announcement that could not carry the picture carries no thumbnail key: {}",
+            announced[0].body
+        );
+        assert_eq!(
+            hooks.thumbnail_dropped.load(Ordering::SeqCst),
+            1,
+            "the drop is counted -- it is the only way an operator learns the preview never comes"
+        );
+        assert_eq!(
+            hooks.thumbnail_failed.load(Ordering::SeqCst),
+            0,
+            "the picture rendered fine; it was the BUDGET that did not fit, and the two measures \
+             call for different responses"
+        );
+    }
+
+    /// A frame whose thumbnail cannot be rendered still succeeds, and is still announced.
+    ///
+    /// The frame is a real one a camera can send: a small, structurally valid JPEG whose SOF header
+    /// declares 20000x20000. `encoding::validate_frame` reads only the HEADER of a declared JPEG, so
+    /// the frame passes validation and a `passthrough` profile persists its bytes exactly as sent --
+    /// the CAPTURE SUCCEEDS. The thumbnail, which is the only thing in this component that would
+    /// actually DECODE a camera's JPEG, refuses it rather than allocating the 1.2 GB the header asks
+    /// for. That refusal ends where every thumbnail failure ends: WARN, count, announce without it.
+    #[tokio::test]
+    async fn a_frame_whose_thumbnail_cannot_be_rendered_still_succeeds_and_is_announced_without_one()
+    {
+        use image::ExtendedColorType;
+        use image::codecs::jpeg::JpegEncoder;
+
+        const CLAIMED: u16 = 20_000;
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(std::io::Cursor::new(&mut jpeg), 90)
+            .encode(&[128_u8; 32 * 32 * 3], 32, 32, ExtendedColorType::Rgb8)
+            .expect("fixture JPEG");
+        let sof = jpeg
+            .windows(2)
+            .position(|marker| marker == [0xff, 0xc0])
+            .expect("a baseline JPEG has an SOF0 marker");
+        jpeg[sof + 5..sof + 7].copy_from_slice(&CLAIMED.to_be_bytes());
+        jpeg[sof + 7..sof + 9].copy_from_slice(&CLAIMED.to_be_bytes());
+
+        let hooks = Arc::new(ThumbnailHooks::default());
+        let (record, announced, _directory) = capture_frame(
+            thumbnail_submission(
+                "cap-thumb-broken",
+                Some(crate::config::ThumbnailSize::Medium),
+                OutputEncoding::Passthrough,
+            ),
+            test_frame(
+                PixelFormat::Jpeg,
+                jpeg.clone(),
+                u32::from(CLAIMED),
+                u32::from(CLAIMED),
+            ),
+            &hooks,
+        )
+        .await;
+
+        assert_eq!(
+            record.state,
+            JobState::Succeeded,
+            "the frame passed the encoder's header check and was persisted; the capture SUCCEEDED, \
+             and an unrenderable preview may not retroactively fail it"
+        );
+        assert_eq!(
+            record.installed_bytes,
+            Some(jpeg.len() as u64),
+            "passthrough installed exactly the bytes the camera sent"
+        );
+        assert_eq!(announced.len(), 1, "and the terminal was announced");
+        assert!(
+            announced[0].body.get("thumbnail").is_none(),
+            "an announcement whose picture could not be rendered carries no thumbnail key: {}",
+            announced[0].body
+        );
+        assert_eq!(
+            hooks.thumbnail_failed.load(Ordering::SeqCst),
+            1,
+            "the failure is counted, not merely logged"
+        );
+        assert_eq!(hooks.thumbnail_dropped.load(Ordering::SeqCst), 0);
     }
 }

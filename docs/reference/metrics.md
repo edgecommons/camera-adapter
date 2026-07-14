@@ -28,6 +28,8 @@ so a capture that starts and finishes between two collection intervals is still 
 | `cancelled` | Count | A capture reaches `CANCELLED`. |
 | `interrupted` | Count | A capture reaches `INTERRUPTED`. |
 | `announcementFailed` | Count | A durable terminal result could not be announced. The capture is committed, its image is on disk, and the message is dropped rather than retried; this is the count of results nobody was told about. |
+| `thumbnailFailed` | Count | A capture profile asked for a thumbnail and the component could not render one from the frame. The capture succeeds and is announced without it. |
+| `thumbnailDropped` | Count | A thumbnail rendered but exceeded the byte ceiling a message may carry, so it was left out. The capture succeeds and is announced without it. |
 
 `camera_queue` samples what the component is currently holding, every 30 seconds. These are levels rather
 than events, so there is nothing to miss between samples.

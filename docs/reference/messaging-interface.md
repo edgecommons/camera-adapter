@@ -125,3 +125,32 @@ broker it cannot reach never has this effect, because messaging is not what a ca
 moving. It contains the camera/schedule occurrence context, not image bytes or credentials. Component
 alarms `storage-low` and `message-publish-degraded` are documented in the
 [metrics reference](metrics.md). Capture lifecycle diagnostics are documented above.
+
+## Capture thumbnail
+
+When a capture profile asks for one, the published capture result carries a `thumbnail` beside `artifact`:
+
+```jsonc
+"thumbnail": {
+  "encoding": "jpeg",
+  "width":  320,
+  "height": 240,
+  "bytes":  14231,
+  "data":   "<raw JPEG bytes>"
+}
+```
+
+`data` is a binary value: on the wire it is raw bytes, not a base64 string.
+
+The thumbnail is a lossy re-encode of the same camera frame the artifact is derived from. It carries **no
+digest**, deliberately — it cannot be verified against the artifact, and a `sha256` beside the artifact's
+own would invite the belief that it can. The artifact's `sha256` describes the installed image and nothing
+else.
+
+A thumbnail is present only in the published result. It is never written to the metadata sidecar, never
+stored in the catalog, and never included in a `sb/capture` reply or a group reply. A result republished
+after a restart therefore carries no thumbnail: the frame it would be made from is gone.
+
+`thumbnail` may be absent even when a profile asks for one — a frame the component cannot render, or a
+thumbnail that will not fit the message's byte ceiling, is left out. The capture still succeeds and its
+image is still installed.

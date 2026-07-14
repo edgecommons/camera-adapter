@@ -881,6 +881,56 @@ session consumes observable decoder/native resources, is closed on reload, disco
 shutdown, and is never shared between cameras. When the RTSP build feature is absent, config that requires
 `rtsp-frame` or enables fallback is rejected for that instance with a stable unsupported-build error.
 
+## 11a. Capture thumbnail
+
+A capture profile may opt in to a thumbnail (`thumbnail.size` = `small` | `medium` | `large`). Absent, no
+thumbnail is produced and no `thumbnail` key appears on the wire.
+
+The bound is the **longest edge** — 160, 320, 640 px — with the aspect ratio preserved and no upscaling of a
+smaller frame. The encoding is always JPEG. It is rendered from the camera's `CaptureFrame`, on the blocking
+pool, inside the same permits as encoding and persistence, so no image work reaches the reactor.
+
+The thumbnail is carried in the **announcement only**. It is not written to the metadata sidecar, not stored
+in the catalog's `terminal_result`, and not included in a deferred or group reply — those are all made from
+the committed body, and a lossy, derived, disposable preview must not be durably stored once per capture
+(the reason the outbox was removed). An announcement rebuilt from the durable body after a restart therefore
+carries no thumbnail.
+
+The thumbnail carries **no digest**. It is a lossy re-encode; a `sha256` beside the artifact's own would
+invite a consumer to believe it is verifiable against the artifact, which it is not and cannot be.
+
+`data` is a binary value and MUST reach the wire as native protobuf bytes, never as base64 inside JSON.
+
+### Byte ceiling — a known constraint, not a design
+
+The messaging library caps a binary value at `MAX_BINARY_BODY_BYTES` = 64 KiB and errors above it. If a
+thumbnail exceeded that, the announcement itself would fail to build and the capture's message would be
+lost — a preview must never be able to do that. The component therefore encodes at JPEG quality 80, then 65,
+then 50, accepting the first result at or under **48 KiB**; if none fits, the thumbnail is dropped and the
+announcement is published without it.
+
+That 64 KiB is **not** a transport limit. `core/docs/platform/DESIGN-binary-messaging.md` §3.6 sizes it for
+the JSON BinaryValue path, where base64 inflates the payload and it flows through JSON parsers. On the
+protobuf wire the value is emitted as native `EcValue.bytes_value` — no base64, no JSON parser — so the cap
+guards a cost this path does not pay, and it over-constrains it. AWS IoT Core's 128 KiB ceiling does not
+apply either: announcements are local-destination only and never go northbound. Raising the limit is the
+`BinaryFrame` work in core (1 MiB default, configurable, all four languages). Until then this component
+lives under 64 KiB because that is what the library enforces, not because the number is principled.
+
+### Failure semantics
+
+A thumbnail that cannot be rendered (`thumbnailFailed`) or will not fit (`thumbnailDropped`) is counted on
+`camera_captures`, logged at WARN, and omitted. It never fails a capture, never rejects one, and never
+changes readiness.
+
+### Decompression bound
+
+The thumbnail is the only code in the component that decodes a camera's JPEG. A JPEG's decoded size is not
+its file size — a few hundred bytes can declare a 65500x65500 image and decode to gigabytes. A JPEG frame
+whose header-declared decoded size exceeds the capture's own admitted `maximumFrameBytes` is refused before
+any pixel buffer is allocated, and counted as a render failure. An out-of-memory death is not a degraded
+preview.
+
 ## 11. Announcement failure and readiness
 
 A terminal announcement is published once, best effort, after its terminal state is durably committed.

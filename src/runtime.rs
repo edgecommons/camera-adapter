@@ -1252,6 +1252,29 @@ impl JobHooks for RuntimeJobHooks {
             )
             .await;
     }
+
+    // A thumbnail is a convenience, and neither of these is a capture's failure: the capture is
+    // already on disk and is announced either way. They are COUNTED so that a camera whose previews
+    // never arrive is visible to an operator, rather than being a log line nobody aggregates -- and
+    // they are counted apart, because "cannot be rendered" and "does not fit the budget" call for
+    // different responses.
+    async fn thumbnail_failed(&self) {
+        if let Some(runtime) = self.runtime() {
+            runtime
+                .metrics
+                .count(crate::observability::THUMBNAIL_FAILED_MEASURE)
+                .await;
+        }
+    }
+
+    async fn thumbnail_dropped(&self) {
+        if let Some(runtime) = self.runtime() {
+            runtime
+                .metrics
+                .count(crate::observability::THUMBNAIL_DROPPED_MEASURE)
+                .await;
+        }
+    }
 }
 
 #[async_trait]
