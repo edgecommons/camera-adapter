@@ -1682,9 +1682,18 @@ impl CameraRuntime {
     }
 
     #[allow(clippy::too_many_arguments)] // The group builder preserves each immutable acceptance fact.
+    /// Builds one member of a synchronised group capture.
+    ///
+    /// `group_size` is the member count, and it is a PARAMETER because the builder cannot derive it
+    /// and must not invent it. It used to return `Some(2)` -- a value picked to satisfy the `size >= 2`
+    /// check the durable layer applies -- and rely on the caller to overwrite it with the true count.
+    /// That is a lie the type system was happy to carry: a second caller, or a reordering that pushed
+    /// the submission before the fix-up line, ships a five-camera group as a two-member group, and the
+    /// durable layer accepts it without complaint because two is a legal size.
     async fn build_group_submission(
         &self,
         instance: &str,
+        group_size: usize,
         request_id: &str,
         capture_group_id: &str,
         requested_profile: Option<&str>,
@@ -1836,7 +1845,7 @@ impl CameraRuntime {
                 correlation_id,
                 metadata,
                 camera: camera_summary,
-                group_size: Some(2), // replaced by the caller with the exact validated member count.
+                group_size: Some(group_size),
             },
             priority: crate::admission::CapturePriority::Direct,
         })
@@ -1934,6 +1943,7 @@ impl CameraRuntime {
             let mut submission = self
                 .build_group_submission(
                     instance,
+                    body.instances.len(),
                     &body.request_id,
                     &group_id,
                     selected,
@@ -1943,7 +1953,6 @@ impl CameraRuntime {
                 )
                 .await?;
             submission.priority = priority;
-            submission.spec.group_size = Some(body.instances.len());
             submissions.push(submission);
         }
         let new_group = crate::catalog::NewGroup {
@@ -7188,9 +7197,14 @@ impl RuntimeCommandRouter {
         request: Message,
         deferred: DeferredReplyRegistry,
     ) -> CommandOutcome {
+        // The wire codes come from `ErrorCode::as_str`, which is the one place that decides what a
+        // code is called. These three were hand-typed, so the enum and the router each held their own
+        // opinion of the spelling -- and a renamed variant would have left these three quietly emitting
+        // the old string, which is the sort of drift nothing fails on until an operator's alarm rule
+        // stops matching.
         if self.stopping.load(Ordering::Acquire) {
             return CommandOutcome::ImmediateError(CommandError::new(
-                "COMPONENT_STOPPING",
+                crate::ErrorCode::ComponentStopping.as_str(),
                 "the camera adapter is shutting down",
             ));
         }
@@ -7198,7 +7212,7 @@ impl RuntimeCommandRouter {
             Ok(slot) => slot.clone(),
             Err(_) => {
                 return CommandOutcome::ImmediateError(CommandError::new(
-                    "BACKEND_ERROR",
+                    crate::ErrorCode::BackendError.as_str(),
                     "the camera command router is unavailable",
                 ));
             }
@@ -7206,7 +7220,7 @@ impl RuntimeCommandRouter {
         match service {
             Some(service) => service.handle_camera_command(verb, request, deferred).await,
             None => CommandOutcome::ImmediateError(CommandError::new(
-                "CAMERA_UNAVAILABLE",
+                crate::ErrorCode::CameraUnavailable.as_str(),
                 "the camera adapter is still starting",
             )),
         }
@@ -15271,6 +15285,47 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
+            runtime.shutdown().await;
+        }
+
+        /// A group member reports the size of the group it is actually in.
+        ///
+        /// `build_group_submission` used to return `group_size: Some(2)` and trust its caller to
+        /// overwrite it with the real member count. Two is not a placeholder that fails loudly -- it is
+        /// the smallest LEGAL group size, chosen so the durable layer's `size >= 2` check would wave it
+        /// through. A second caller, or a reordering that pushed the submission before the fix-up line,
+        /// would ship a five-camera group as a two-member group and nothing anywhere would object.
+        ///
+        /// The builder is now told the size, so there is no value for it to invent.
+        #[tokio::test]
+        async fn a_group_member_carries_the_size_of_its_own_group() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(
+                config(directory.path(), &["camera-a", "camera-b", "camera-c"], false),
+                &directory,
+            )
+            .await;
+
+            let submission = runtime
+                .build_group_submission(
+                    "camera-a",
+                    3,
+                    "group-size-request",
+                    "grp_size_check",
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "group-size-correlation".to_string(),
+                )
+                .await
+                .expect("the group member must be built");
+
+            assert_eq!(
+                submission.spec.group_size,
+                Some(3),
+                "a member of a three-camera group must say so; reporting two is what the placeholder \
+                 did, and two is a legal size, so nothing downstream would have caught it"
+            );
             runtime.shutdown().await;
         }
 
