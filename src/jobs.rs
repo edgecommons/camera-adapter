@@ -43,6 +43,8 @@ use crate::storage::{
 };
 use crate::{CameraError, ErrorCode, Result};
 
+/// How long the terminal reaper waits before trying a durable store that just refused it.
+const TERMINAL_REAP_RETRY: Duration = Duration::from_secs(1);
 const MAX_TERMINAL_DETAIL_BYTES: usize = 1_024;
 
 /// Fully resolved capture profile stored immutably with an accepted job.
@@ -1532,7 +1534,13 @@ impl JobEngine {
                 self.complete_runtime(runtime);
                 Ok(record)
             }
-            TerminalOutcome::InstallationWon(record) => Ok(record),
+            // The install path won the terminal and has already published it, so this caller must not
+            // publish it again -- but the capture is over, and the runtime it is holding (a whole
+            // `CaptureJobSpec`) is not free. Releasing it is not the same act as terminalizing it.
+            TerminalOutcome::InstallationWon(record) => {
+                self.complete_runtime(runtime);
+                Ok(record)
+            }
         }
     }
 
@@ -1551,7 +1559,10 @@ impl JobEngine {
                 self.complete_runtime(runtime);
                 Ok(record)
             }
-            TerminalOutcome::InstallationWon(record) => Ok(record),
+            TerminalOutcome::InstallationWon(record) => {
+                self.complete_runtime(runtime);
+                Ok(record)
+            }
         }
     }
 
@@ -1561,6 +1572,15 @@ impl JobEngine {
         if record.group_id.is_some() {
             self.hooks.group_member_terminal(record, body).await;
         }
+    }
+
+    /// Whether this engine is still holding a capture's runtime.
+    ///
+    /// Every entry here is a live `CaptureJobSpec`, so "how many is it holding" is a real question
+    /// about the component's memory, not only a test's.
+    #[must_use]
+    pub fn is_active_for_test(&self, capture_id: &str) -> bool {
+        lock(&self.active).contains_key(capture_id)
     }
 
     fn complete_runtime(&self, runtime: &Arc<JobRuntime>) {
@@ -1589,12 +1609,48 @@ impl JobEngine {
                         if runtime.deadlines().terminal_at_ms > terminal_at_ms {
                             continue;
                         }
-                        let _ = engine.finish_failure(
-                            &runtime,
-                            ErrorCode::CaptureTimeout,
-                            "capture exceeded its terminal deadline",
-                        ).await;
-                        return;
+                        // This is the reaper. It is the last thing standing between a capture that
+                        // went wrong and a capture that is never heard from again -- and it used to
+                        // throw its own error away and exit. Under the one condition it exists to
+                        // survive, a durable store that is briefly refusing writes, it therefore did
+                        // nothing at all: the capture kept no terminal, and the runtime it was
+                        // holding -- a whole `CaptureJobSpec` -- was never released, for the life of
+                        // the process. The store being unwell is not a reason to stop reaping.
+                        loop {
+                            match engine.finish_failure(
+                                &runtime,
+                                ErrorCode::CaptureTimeout,
+                                "capture exceeded its terminal deadline",
+                            ).await {
+                                Ok(_) => return,
+                                Err(error) if error.is_durable_store_failure() => {
+                                    tracing::warn!(
+                                        capture = %runtime.spec.capture_id,
+                                        error = %error,
+                                        "the durable store could not retire an expired capture; retrying"
+                                    );
+                                    tokio::select! {
+                                        biased;
+                                        // Somebody else terminalized it while the store was unwell,
+                                        // and released the runtime with it. Nothing left to do.
+                                        _ = runtime.done.cancelled() => return,
+                                        () = tokio::time::sleep(TERMINAL_REAP_RETRY) => {}
+                                    }
+                                }
+                                Err(error) => {
+                                    // Not the store: the capture is no longer in a state this can
+                                    // retire. Whatever decided that owns it now -- but the runtime is
+                                    // this task's to let go of, and holding it changes nothing.
+                                    tracing::warn!(
+                                        capture = %runtime.spec.capture_id,
+                                        error = %error,
+                                        "an expired capture could not be retired and is released"
+                                    );
+                                    engine.complete_runtime(&runtime);
+                                    return;
+                                }
+                            }
+                        }
                     }
                 }
             }

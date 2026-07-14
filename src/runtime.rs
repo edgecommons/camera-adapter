@@ -44,7 +44,7 @@ use crate::{
     admission::{AdmissionController, FilesystemSpaceProbe},
     backend::{BackendRuntimeContext, ConnectRequest, DiscoveryCandidate},
     catalog::{Catalog, CatalogOptions},
-    config::{AdapterConfig, GlobalConfig},
+    config::AdapterConfig,
     jobs::{AcceptanceHook, AppTerminalEnvelopeEncoder, CaptureJobSpec, JobEngine, JobHooks},
     outbox::{EdgeCommonsConfirmedPublisher, OutboxDurability, OutboxPressure, OutboxPublisher},
     registry::{CameraConnectionState, CameraRegistry, CameraStatusError},
@@ -656,7 +656,18 @@ struct DiscoveryCache {
 /// This is important for reload/shutdown correctness: a stale actor can never acquire work after
 /// its supervisor cancellation token is observed.
 pub struct CameraRuntime {
-    config: RwLock<AdapterConfig>,
+    /// The live configuration, shared rather than copied.
+    ///
+    /// `config_snapshot()` used to DEEP-CLONE this on every call -- the whole roster, every camera's
+    /// capture profiles, every backend's allowlists: ~250 KB and thousands of allocations at 256
+    /// cameras, from 34 call sites including the capture hot path, and `lifecycle_events()` did it
+    /// twice per capture to read one bool. At the design's 16 captures/s that is tens of MB/s of
+    /// pure alloc/free churn, and every clone takes the read lock that a reload needs to write.
+    ///
+    /// A snapshot is now a refcount bump. It is still a SNAPSHOT -- a reload swaps the Arc, so a
+    /// caller holding one keeps the configuration it started with, which is the property the deep
+    /// clone was really providing.
+    config: RwLock<Arc<AdapterConfig>>,
     backend_context: BackendRuntimeContext,
     catalog: Catalog,
     admission: AdmissionController,
@@ -719,7 +730,7 @@ impl Drop for ReloadInProgressGuard<'_> {
 /// transition is never rolled back after Core publishes its new snapshot.
 #[derive(Clone)]
 struct RuntimeReloadCheckpoint {
-    config: AdapterConfig,
+    config: Arc<AdapterConfig>,
     engines: BTreeMap<String, JobEngine>,
     events: BTreeMap<String, EventsFacade>,
 }
@@ -1151,23 +1162,10 @@ fn recovered_priority(record: &crate::catalog::JobRecord) -> crate::admission::C
 }
 
 impl CameraRuntime {
-    fn config_snapshot(&self) -> Result<AdapterConfig> {
+    fn config_snapshot(&self) -> Result<Arc<AdapterConfig>> {
         self.config
             .read()
-            .map(|config| config.clone())
-            .map_err(|_| {
-                crate::CameraError::Catalog("runtime configuration lock is unavailable".to_string())
-            })
-    }
-
-    /// Takes the small, shared portion of the active configuration for long-lived supervisor
-    /// work.  A supervisor already reads its camera-specific configuration from the registry;
-    /// cloning the complete camera roster here would retain one full copy per connection attempt
-    /// while the bounded connection gate is saturated.
-    fn global_config_snapshot(&self) -> Result<GlobalConfig> {
-        self.config
-            .read()
-            .map(|config| config.global.clone())
+            .map(|config| Arc::clone(&config))
             .map_err(|_| {
                 crate::CameraError::Catalog("runtime configuration lock is unavailable".to_string())
             })
@@ -1358,7 +1356,7 @@ impl CameraRuntime {
         }
 
         let runtime = Arc::new(Self {
-            config: RwLock::new(config),
+            config: RwLock::new(Arc::new(config)),
             backend_context,
             health,
             catalog: resources.catalog,
@@ -3821,7 +3819,7 @@ impl CameraRuntime {
         }
         {
             match self.config.write() {
-                Ok(mut config) => *config = replacement.clone(),
+                Ok(mut config) => *config = Arc::new(replacement.clone()),
                 Err(_) => {
                     tracing::error!(
                         "runtime configuration lock became unavailable while committing reload"
@@ -4540,12 +4538,13 @@ impl CameraRuntime {
     }
 
     fn start_supervisors(self: &Arc<Self>) -> Result<()> {
-        for camera in self.config_snapshot()?.instances {
+        let config = self.config_snapshot()?;
+        for camera in &config.instances {
             if !camera.enabled {
                 continue;
             }
             let engine = self.engine(&camera.id)?;
-            self.start_supervisor(camera.id, engine)?;
+            self.start_supervisor(camera.id.clone(), engine)?;
         }
         Ok(())
     }
@@ -5417,17 +5416,23 @@ impl CameraRuntime {
         Ok(())
     }
 
+    /// Spawns a task the runtime will wait for at shutdown.
+    ///
+    /// The registry used to be push-only: every schedule, supervisor and periodic task a reload ever
+    /// started stayed in it, so at 256 cameras each reload retained about five hundred `JoinHandle`s
+    /// of tasks that had already finished -- forever, for the life of the process. Reaping the
+    /// finished ones here costs a scan of a list that is only as long as the tasks actually running,
+    /// and it happens on a path that is already spawning a thread's worth of work.
     fn spawn_task(
         &self,
         task: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let handle = tokio::spawn(task);
-        self.tasks
-            .lock()
-            .map_err(|_| {
-                crate::CameraError::Catalog("runtime task registry is unavailable".to_string())
-            })?
-            .push(handle);
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            crate::CameraError::Catalog("runtime task registry is unavailable".to_string())
+        })?;
+        tasks.retain(|running| !running.is_finished());
+        tasks.push(handle);
         Ok(())
     }
 
@@ -5620,20 +5625,21 @@ impl CameraRuntime {
             .snapshot(&instance)
             .map_or(0, |snapshot| snapshot.generation);
         loop {
-            let global_config = match self.global_config_snapshot() {
+            let config = match self.config_snapshot() {
                 Ok(config) => config,
                 Err(error) => {
                     tracing::error!(instance = %instance, error = %error, "camera supervisor lost runtime configuration");
                     return;
                 }
             };
+            let global_config = &config.global;
             let camera = match self.registry.camera_config(&instance) {
                 Ok(camera) if camera.enabled => camera,
                 Ok(_) | Err(_) => return,
             };
             let factory = match self
                 .backend_context
-                .factory_for(&camera.backend, &global_config)
+                .factory_for(&camera.backend, global_config)
             {
                 Ok(factory) => factory,
                 Err(error) => {
@@ -7947,7 +7953,7 @@ mod tests {
             }
             let scheduler = crate::dispatch::CaptureScheduler::new(&config.global.limits).unwrap();
             let runtime = Arc::new(CameraRuntime {
-                config: RwLock::new(config),
+                config: RwLock::new(Arc::new(config)),
                 backend_context: BackendRuntimeContext::new(
                     None,
                     &crate::config::LimitsConfig::default(),
@@ -9376,7 +9382,7 @@ mod tests {
 
             // camera-b is no longer configured on this run.
             let replacement = config(directory.path(), &["camera-a"], false);
-            *runtime.config.write().unwrap() = replacement.clone();
+            *runtime.config.write().unwrap() = Arc::new(replacement.clone());
             runtime
                 .registry
                 .apply_validated_config(&replacement)
@@ -15556,6 +15562,139 @@ mod tests {
             }
             assert_eq!(CommandVerb::parse("sb/capture-groups"), None);
             assert_eq!(CommandVerb::parse("sb/not-a-verb"), None);
+        }
+
+        /// A configuration snapshot shares the configuration; it does not copy it.
+        ///
+        /// `config_snapshot()` deep-cloned the whole `AdapterConfig` -- every camera, every capture
+        /// profile, every backend allowlist -- from 34 call sites including the capture hot path, and
+        /// `lifecycle_events()` did it twice per capture to read a single bool. At 256 cameras that is
+        /// a quarter of a megabyte and thousands of allocations per call, and every one of them took
+        /// the read lock that a reload needs to write.
+        ///
+        /// It is still a SNAPSHOT, and that is the half worth pinning: a reload swaps the pointer, so
+        /// a caller holding one keeps the configuration it started with. That was the only property
+        /// the deep clone was really providing, and sharing must not lose it.
+        #[tokio::test]
+        async fn a_config_snapshot_is_shared_and_still_a_snapshot() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
+
+            let first = runtime.config_snapshot().unwrap();
+            let second = runtime.config_snapshot().unwrap();
+            assert!(
+                Arc::ptr_eq(&first, &second),
+                "two snapshots of an unchanged configuration must be the same configuration,                  not two copies of it"
+            );
+            assert_eq!(first.instances.len(), 1);
+
+            // A reload swaps the pointer. The snapshot taken before it keeps what it was given.
+            let replacement = config(directory.path(), &["camera-a", "camera-b"], false);
+            *runtime.config.write().unwrap() = Arc::new(replacement);
+
+            assert_eq!(
+                first.instances.len(),
+                1,
+                "a snapshot taken before a reload must still describe the world it was taken in"
+            );
+            let after = runtime.config_snapshot().unwrap();
+            assert_eq!(
+                after.instances.len(),
+                2,
+                "and a new one must see the new world"
+            );
+            assert!(!Arc::ptr_eq(&first, &after));
+            runtime.shutdown().await;
+        }
+
+        /// The reaper does not give up on the one failure it exists to survive.
+        ///
+        /// A capture that outlives its terminal deadline is retired by the deadline task. That task
+        /// threw its own error away and exited -- so when the durable store was briefly refusing
+        /// writes, which is precisely the condition it is there for, it did nothing at all: the
+        /// capture kept no terminal, and the runtime it was holding (a whole `CaptureJobSpec`) was
+        /// never released, for the life of the process.
+        ///
+        /// Here the store is refusing writes when the deadline falls, and starts accepting them
+        /// again. The capture must still be retired, and the engine must let go of it.
+        #[tokio::test]
+        async fn an_expired_capture_is_retired_even_if_the_store_was_refusing_writes() {
+            let directory = TempDir::new().unwrap();
+            let mut configuration = config(directory.path(), &["camera-a"], false);
+            // The camera never comes online, so this capture runs out of time where it waits.
+            configuration.global.timeouts.job_terminal_ms = 1_000;
+            configuration.global.timeouts.capture_ms = 500;
+            configuration.global.timeouts.encode_ms = 500;
+            configuration.global.timeouts.persist_ms = 500;
+            let runtime = runtime(configuration, &directory).await;
+
+            let accepted = runtime
+                .submit_capture(
+                    "camera-a".to_string(),
+                    "expires-while-the-store-is-down".to_string(),
+                    None,
+                    None,
+                    serde_json::Map::new(),
+                    "reaper-correlation".to_string(),
+                    "sb/capture-submit",
+                    crate::admission::CapturePriority::Submitted,
+                )
+                .await
+                .unwrap();
+            let capture = match accepted {
+                crate::catalog::AcceptJobOutcome::Inserted(record)
+                | crate::catalog::AcceptJobOutcome::Existing(record) => record.capture_id,
+                crate::catalog::AcceptJobOutcome::Conflict => panic!("unexpected ledger conflict"),
+            };
+
+            // The store stops accepting the write the reaper is about to make. Broken from a second
+            // connection to the same database, so no production type grows a fault-injection hook.
+            let database = directory
+                .path()
+                .join("state")
+                .join("camera-adapter.sqlite3");
+            let break_store = rusqlite::Connection::open(&database).unwrap();
+            break_store
+                .execute_batch("ALTER TABLE jobs RENAME TO jobs_unavailable")
+                .unwrap();
+
+            // The deadline falls while the store is unwell. The old reaper exited here, forever.
+            tokio::time::sleep(Duration::from_millis(1_400)).await;
+            assert!(
+                runtime
+                    .engine("camera-a")
+                    .unwrap()
+                    .is_active_for_test(&capture),
+                "the capture is still held while the store cannot retire it"
+            );
+
+            break_store
+                .execute_batch("ALTER TABLE jobs_unavailable RENAME TO jobs")
+                .unwrap();
+
+            let record =
+                wait_for_terminal_within(&runtime, &capture, Duration::from_secs(20)).await;
+            assert_eq!(record.state, crate::model::JobState::Failed);
+            assert_eq!(
+                record.error_code.as_deref(),
+                Some(crate::ErrorCode::CaptureTimeout.as_str()),
+                "the store recovered, and the capture it could not retire was retired"
+            );
+
+            // And the engine let go of it. The leak was a whole CaptureJobSpec per capture, forever.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while runtime
+                .engine("camera-a")
+                .unwrap()
+                .is_active_for_test(&capture)
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "a retired capture must not still be held by the engine"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            runtime.shutdown().await;
         }
 
         /// G2: a cron fires ONE synchronised group across several cameras.
