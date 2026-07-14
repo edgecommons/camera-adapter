@@ -284,7 +284,7 @@ impl BackendRuntimeContext {
             onvif::OnvifBackendDependencies {
                 resolver: Arc::new(onvif::SystemResolver),
                 discovery,
-                transport: Arc::new(onvif::ReqwestOnvifTransport),
+                transport: Arc::new(onvif::ReqwestOnvifTransport::default()),
                 credentials,
                 clock: Arc::new(onvif::SystemOnvifClock),
                 nonce_source: Arc::new(onvif::SystemNonceSource),

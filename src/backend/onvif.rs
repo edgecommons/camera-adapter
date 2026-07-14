@@ -756,9 +756,97 @@ async fn send_http_bounded(
     }
 }
 
+/// What makes one HTTP client different from another.
+///
+/// The client cannot simply be a singleton: the address is PINNED into it (`resolve`), and the TLS
+/// posture -- hostname verification, certificate acceptance, a private CA -- belongs to the camera,
+/// not to the component. Two cameras with different trust settings must not share a client. Two
+/// requests to the SAME camera must.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HttpClientKey {
+    host: String,
+    socket: SocketAddr,
+    verify_hostname: bool,
+    allow_invalid_certificates: bool,
+    /// The private CA bundle, digested. The bytes themselves are a secret handle and are not kept.
+    ca_digest: Option<[u8; 32]>,
+}
+
+/// The number of distinct client configurations kept alive.
+///
+/// One per camera at the design's 256, plus room for a camera whose address moves. Past it the cache
+/// is emptied rather than grown: a bounded miss costs a handshake, and an unbounded map costs the
+/// process.
+const MAX_POOLED_CLIENTS: usize = 1_024;
+
 /// Production reqwest transport with per-request address pinning and redirects disabled.
+///
+/// The client used to be built INSIDE `send()`, per request. A fresh connection pool, a fresh rustls
+/// configuration, a fresh root-certificate store -- built, used once, and dropped. Keep-alive was not
+/// merely unused, it was structurally impossible: every SOAP call and every snapshot GET paid a full
+/// TCP and TLS handshake and left a socket in TIME_WAIT. Connecting to one camera is about nine
+/// requests. At 256 cameras snapshotting every ten seconds that is ~26 connections a second sustained,
+/// north of 1,500 sockets held continuously, and a TLS handshake per snapshot on hardware that has to
+/// decode video with what is left.
+///
+/// Clients are now kept, keyed by the configuration that makes them different. Same camera, same
+/// posture, same client -- and reqwest's pool does what it was built to do.
 #[derive(Debug, Default)]
-pub struct ReqwestOnvifTransport;
+pub struct ReqwestOnvifTransport {
+    clients: std::sync::Mutex<std::collections::HashMap<HttpClientKey, reqwest::Client>>,
+}
+
+impl ReqwestOnvifTransport {
+    /// The client for this request's camera and trust posture, built once and then reused.
+    fn client(&self, request: &OnvifHttpRequest, socket: SocketAddr) -> Result<reqwest::Client> {
+        let key = HttpClientKey {
+            host: request.target.host().to_owned(),
+            socket,
+            verify_hostname: request.tls.verify_hostname,
+            allow_invalid_certificates: request.tls.allow_invalid_certificates,
+            ca_digest: request.tls.ca_pem.as_ref().map(|pem| {
+                let mut digest = Sha256::new();
+                digest.update(pem.expose());
+                digest.finalize().into()
+            }),
+        };
+
+        if let Ok(clients) = self.clients.lock() {
+            if let Some(client) = clients.get(&key) {
+                return Ok(client.clone());
+            }
+        }
+
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve(request.target.host(), socket)
+            .tls_danger_accept_invalid_hostnames(!request.tls.verify_hostname)
+            .tls_danger_accept_invalid_certs(request.tls.allow_invalid_certificates);
+        if let Some(ca_pem) = &request.tls.ca_pem {
+            let certificates = reqwest::Certificate::from_pem_bundle(ca_pem.expose())
+                .map_err(|_| security_error("private CA bundle is invalid"))?;
+            if certificates.is_empty() {
+                return Err(security_error("private CA bundle contains no certificates"));
+            }
+            for certificate in certificates {
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
+        let client = builder
+            .build()
+            .map_err(|_| backend_error("HTTP client construction failed"))?;
+
+        if let Ok(mut clients) = self.clients.lock() {
+            // A camera that keeps moving must not be able to grow this without bound. Emptying it
+            // costs one handshake per camera; keeping it costs the process.
+            if clients.len() >= MAX_POOLED_CLIENTS {
+                clients.clear();
+            }
+            clients.insert(key, client.clone());
+        }
+        Ok(client)
+    }
+}
 
 fn collect_bounded_response_headers(
     source: &reqwest::header::HeaderMap,
@@ -815,24 +903,7 @@ impl OnvifHttpTransport for ReqwestOnvifTransport {
             return Err(security_error("HTTP response bounds must be non-zero"));
         }
         let socket = SocketAddr::new(request.target.address, request.target.port);
-        let mut builder = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve(request.target.host(), socket)
-            .tls_danger_accept_invalid_hostnames(!request.tls.verify_hostname)
-            .tls_danger_accept_invalid_certs(request.tls.allow_invalid_certificates);
-        if let Some(ca_pem) = &request.tls.ca_pem {
-            let certificates = reqwest::Certificate::from_pem_bundle(ca_pem.expose())
-                .map_err(|_| security_error("private CA bundle is invalid"))?;
-            if certificates.is_empty() {
-                return Err(security_error("private CA bundle contains no certificates"));
-            }
-            for certificate in certificates {
-                builder = builder.add_root_certificate(certificate);
-            }
-        }
-        let client = builder
-            .build()
-            .map_err(|_| backend_error("HTTP client construction failed"))?;
+        let client = self.client(&request, socket)?;
         let method = match request.method {
             OnvifHttpMethod::Get => reqwest::Method::GET,
             OnvifHttpMethod::Post => reqwest::Method::POST,
@@ -2526,7 +2597,7 @@ impl Default for OnvifBackendDependencies {
         Self {
             resolver: Arc::new(SystemResolver),
             discovery: Arc::new(DisabledWsDiscovery),
-            transport: Arc::new(ReqwestOnvifTransport),
+            transport: Arc::new(ReqwestOnvifTransport::default()),
             credentials: None,
             clock: Arc::new(SystemOnvifClock),
             nonce_source: Arc::new(SystemNonceSource),
@@ -4728,9 +4799,49 @@ mod tests {
         assert!(find_auth_scheme("NotDigest realm=\"camera\"", "digest").is_none());
     }
 
+    /// One camera, one HTTP client -- so keep-alive is possible at all.
+    ///
+    /// The client was built INSIDE `send()`, per request: a fresh connection pool, a fresh rustls
+    /// configuration, a fresh root-certificate store, used once and dropped. Keep-alive was not merely
+    /// unused, it was structurally impossible, and every SOAP call and snapshot GET paid a full TCP and
+    /// TLS handshake and left a socket in TIME_WAIT. Connecting to one camera is about nine requests;
+    /// at 256 cameras snapshotting every ten seconds that is ~26 connections a second, sustained.
+    ///
+    /// The client cannot be a singleton either: the address is pinned into it and the TLS posture
+    /// belongs to the camera. Two cameras that trust different certificate authorities must never
+    /// share one -- which is the assertion that actually matters here.
+    #[tokio::test]
+    async fn one_camera_keeps_one_http_client_and_a_different_trust_posture_gets_its_own() {
+        let transport = ReqwestOnvifTransport::default();
+        let socket = SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), 8_443);
+        let plain = loopback_http_request(8_443, OnvifHttpMethod::Post, 32);
+
+        let first = transport.client(&plain, socket).expect("a client is built");
+        let second = transport.client(&plain, socket).expect("and then reused");
+        assert_eq!(
+            transport.clients.lock().unwrap().len(),
+            1,
+            "the same camera, asked twice, must not build a second connection pool"
+        );
+        // `reqwest::Client` is a handle to one pool; cloning shares it. Same pool, same keep-alive.
+        drop((first, second));
+
+        // A camera that trusts a different CA is a different client, and must be.
+        let mut private_ca = loopback_http_request(8_443, OnvifHttpMethod::Post, 32);
+        private_ca.tls.allow_invalid_certificates = true;
+        let _ = transport
+            .client(&private_ca, socket)
+            .expect("its own client");
+        assert_eq!(
+            transport.clients.lock().unwrap().len(),
+            2,
+            "a different trust posture must never share a client with a stricter one"
+        );
+    }
+
     #[tokio::test]
     async fn production_http_transport_uses_pinned_loopback_and_enforces_response_bounds() {
-        let transport = ReqwestOnvifTransport;
+        let transport = ReqwestOnvifTransport::default();
         let (port, server) = serve_loopback_http(
             b"HTTP/1.1 200 OK\r\nX-Result: one\r\nX-Result: two\r\nContent-Length: 5\r\n\r\nhello"
                 .to_vec(),
