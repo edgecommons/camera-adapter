@@ -644,6 +644,86 @@ fn selector_value_matches(
     })
 }
 
+/// Builds the slot map from a roster's engines and whatever event facades go with them.
+///
+/// The engine is what makes a camera exist; the facade is attached to it. `start` requires a facade for
+/// every camera and the reload commit requires one for every camera it adds, so in a running component
+/// they are always both there -- but a camera is never DROPPED here for want of one, because a camera
+/// that silently ceases to exist is a far worse failure than one that cannot publish lifecycle events.
+fn new_slots(
+    engines: BTreeMap<String, JobEngine>,
+    mut events: BTreeMap<String, EventsFacade>,
+) -> BTreeMap<String, CameraSlot> {
+    engines
+        .into_iter()
+        .map(|(instance, engine)| {
+            let events = events.remove(&instance);
+            (
+                instance,
+                CameraSlot {
+                    engine,
+                    events,
+                    supervisor: None,
+                    session: None,
+                    motion_stop: None,
+                },
+            )
+        })
+        .collect()
+}
+
+/// One camera's entire runtime presence, in one place.
+///
+/// This used to be SEVEN maps -- engines, events, actors, supervisor cancellations, supervisor
+/// completions, session cancellations, motion stops -- each with its own lock, each keyed by the same
+/// instance id, and each kept in step with the others BY HAND. Every lifecycle path had to remember all
+/// seven, and they each remembered a different subset: the roster-removal block cleaned five of them,
+/// the supervisor's own teardown cleaned two, rollback restored two, shutdown cleaned none, and
+/// `motion_stops` was cleaned by no lifecycle path at all. That last omission is not a tidiness
+/// complaint. It is how a camera came to be left physically moving with nothing left alive to stop it.
+///
+/// A camera is now one entry. Removing it is one `remove`, which drops its engine, its facades, its
+/// supervisor, its session, and its armed stop together, because they are one thing. The failure mode
+/// the seven maps kept producing -- a camera that half-exists, present in one map and absent from
+/// another -- is no longer representable, which is a stronger guarantee than remembering to be careful.
+struct CameraSlot {
+    /// The durable capture engine. Lives as long as the camera is in the roster.
+    engine: JobEngine,
+    /// The camera's event-publishing facade, when one is installed.
+    ///
+    /// Optional because the runtime has always tolerated its absence -- the lifecycle-event lookup
+    /// warns and carries on. Modelling it as mandatory would have quietly dropped any camera that
+    /// lacked one, which is a worse answer than the warning.
+    events: Option<EventsFacade>,
+    /// The running supervisor generation, if one is running.
+    supervisor: Option<Supervision>,
+    /// The connected session, if the camera is connected.
+    session: Option<Session>,
+    /// A mandatory PTZ stop that has been armed and not yet delivered.
+    motion_stop: Option<ArmedStop>,
+}
+
+/// One supervisor generation.
+///
+/// The two tokens belong together and were never once used apart: `cancellation` retires the
+/// generation and `finished` is how a replacement knows the old one is gone. Holding them in separate
+/// maps meant `start_supervisor` could overwrite one and not the other.
+#[derive(Clone)]
+struct Supervision {
+    /// Retires this generation. A child of the process token, so shutdown reaches it too.
+    cancellation: CancellationToken,
+    /// Cancelled when the supervisor loop has exited. The reload drain barrier waits on this.
+    finished: CancellationToken,
+}
+
+/// A camera's live session: the actor that owns it, and the token that ends it.
+#[derive(Clone)]
+struct Session {
+    actor: CameraActorHandle,
+    /// Cancels this session directly, leaving the supervisor free to reconnect.
+    cancellation: CancellationToken,
+}
+
 /// A mandatory stop that has been armed and not yet delivered (DESIGN 15.5).
 ///
 /// This used to be a bare `CancellationToken`, and the axes it was armed for lived nowhere but inside
@@ -695,8 +775,12 @@ pub struct CameraRuntime {
     admission: AdmissionController,
     storage: StorageRoot,
     registry: Arc<CameraRegistry>,
-    engines: RwLock<BTreeMap<String, JobEngine>>,
-    events: RwLock<BTreeMap<String, EventsFacade>>,
+    /// Every configured camera, and everything the runtime knows about it. See [`CameraSlot`].
+    ///
+    /// An entry exists exactly while the camera is in the roster. Its `supervisor`, `session` and
+    /// `motion_stop` are the lifecycle state within that, and they go when the camera goes -- which is
+    /// the whole reason this is one map and not seven.
+    cameras: Arc<RwLock<BTreeMap<String, CameraSlot>>>,
     outbox_events: Option<EventsFacade>,
     storage_pressure: Option<StoragePressureMonitor>,
     storage_alarm: Arc<Mutex<StorageAlarmState>>,
@@ -705,21 +789,6 @@ pub struct CameraRuntime {
     metrics: Arc<crate::observability::CaptureMetrics>,
     /// Per-camera southbound health, the standard metric every adapter in the ecosystem emits.
     health: Arc<crate::observability::FleetHealth>,
-    actors: Arc<RwLock<HashMap<String, CameraActorHandle>>>,
-    /// Per-supervisor shutdown tokens.  A child token also observes process shutdown, while a
-    /// reload can retire one connecting/backing-off supervisor without stopping the whole runtime.
-    supervisor_cancellations: Arc<RwLock<HashMap<String, CancellationToken>>>,
-    /// The armed stop timer for each camera in continuous motion.
-    ///
-    /// DESIGN §15.5: a continuous move arms a mandatory stop deadline, and the deadline -- not the
-    /// requester -- is what stops the camera. Holding the token here is what lets a later stop, a
-    /// superseding move, or a retiring supervisor disarm it, so a timer armed for one move can never
-    /// stop a different one.
-    motion_stops: Arc<RwLock<HashMap<String, ArmedStop>>>,
-    /// Completion signals paired with [`Self::supervisor_cancellations`].  A replacement waits
-    /// for the old loop to retire before publishing a new actor for the same camera ID.
-    supervisor_finished: Arc<RwLock<HashMap<String, CancellationToken>>>,
-    session_cancellations: Arc<RwLock<HashMap<String, CancellationToken>>>,
     scheduler_cancellations: RwLock<HashMap<(String, String), CancellationToken>>,
     discovery_cancellation: RwLock<Option<CancellationToken>>,
     discovery_cache: Mutex<DiscoveryCache>,
@@ -1216,8 +1285,8 @@ impl CameraRuntime {
         if !config.global.operator_events.capture_lifecycle {
             return None;
         }
-        match self.events.read() {
-            Ok(events) => match events.get(instance).cloned() {
+        match self.cameras.read() {
+            Ok(cameras) => match cameras.get(instance).and_then(|slot| slot.events.clone()) {
                 Some(events) => Some(events),
                 None => {
                     tracing::warn!(
@@ -1393,18 +1462,12 @@ impl CameraRuntime {
             admission: resources.admission,
             storage: resources.storage,
             registry: resources.registry,
-            engines: RwLock::new(engines),
-            events: RwLock::new(events),
+            cameras: Arc::new(RwLock::new(new_slots(engines, events))),
             outbox_events: Some(outbox_events),
             storage_pressure: Some(storage_pressure),
             storage_alarm: Arc::new(Mutex::new(StorageAlarmState::default())),
             readiness,
             metrics,
-            actors: Arc::new(RwLock::new(HashMap::new())),
-            supervisor_cancellations: Arc::new(RwLock::new(HashMap::new())),
-            motion_stops: Arc::new(RwLock::new(HashMap::new())),
-            supervisor_finished: Arc::new(RwLock::new(HashMap::new())),
-            session_cancellations: Arc::new(RwLock::new(HashMap::new())),
             scheduler_cancellations: RwLock::new(HashMap::new()),
             discovery_cancellation: RwLock::new(None),
             discovery_cache: Mutex::new(DiscoveryCache::default()),
@@ -1444,13 +1507,12 @@ impl CameraRuntime {
     /// Returns the currently connected actor.  Offline submission is not allowed to fabricate a
     /// queue entry: the caller must decide according to the immutable profile's offline policy.
     pub fn actor(&self, instance: &str) -> Result<CameraActorHandle> {
-        self.actors
+        self.cameras
             .read()
-            .map_err(|_| {
-                crate::CameraError::Catalog("camera actor map is unavailable".to_string())
-            })?
+            .map_err(|_| crate::CameraError::Catalog("camera slot map is unavailable".to_string()))?
             .get(instance)
-            .cloned()
+            .and_then(|slot| slot.session.as_ref())
+            .map(|session| session.actor.clone())
             .ok_or_else(|| {
                 crate::CameraError::rejected(
                     crate::ErrorCode::CameraUnavailable,
@@ -1461,13 +1523,11 @@ impl CameraRuntime {
 
     /// Returns the durable job engine for one configured camera.
     pub fn engine(&self, instance: &str) -> Result<JobEngine> {
-        self.engines
+        self.cameras
             .read()
-            .map_err(|_| {
-                crate::CameraError::Catalog("camera engine map is unavailable".to_string())
-            })?
+            .map_err(|_| crate::CameraError::Catalog("camera slot map is unavailable".to_string()))?
             .get(instance)
-            .cloned()
+            .map(|slot| slot.engine.clone())
             .ok_or_else(|| {
                 crate::CameraError::rejected(
                     crate::ErrorCode::UnknownInstance,
@@ -2813,9 +2873,10 @@ impl CameraRuntime {
                         chrono::Utc::now().timestamp_millis(),
                     )
                     .await?;
-                if let Ok(sessions) = self.session_cancellations.read() {
-                    if let Some(cancellation) = sessions.get(&instance) {
-                        cancellation.cancel();
+                if let Ok(cameras) = self.cameras.read() {
+                    if let Some(session) = cameras.get(&instance).and_then(|slot| slot.session.as_ref())
+                    {
+                        session.cancellation.cancel();
                     }
                 }
                 // Signalling the session cancellation completes this operation: reconnect is a
@@ -2865,16 +2926,13 @@ impl CameraRuntime {
         let ptz_ms = self
             .config_snapshot()
             .map_or(10_000, |config| config.global.timeouts.ptz_ms);
-        let previous = self.motion_stops.write().ok()?.insert(
-            instance.to_owned(),
-            ArmedStop {
-                cancellation: token.clone(),
-                pan,
-                tilt,
-                zoom,
-                ptz_ms,
-            },
-        );
+        let previous = self.cameras.write().ok()?.get_mut(instance)?.motion_stop.replace(ArmedStop {
+            cancellation: token.clone(),
+            pan,
+            tilt,
+            zoom,
+            ptz_ms,
+        });
         // A superseding move retires the timer the previous one armed, or the old deadline would
         // stop the NEW motion early.
         if let Some(previous) = previous {
@@ -2883,8 +2941,7 @@ impl CameraRuntime {
 
         // The CURRENT actor is looked up when the timer fires, not captured now: a reconnect replaces
         // the actor, and a stop pushed at a handle the camera no longer answers is not a stop.
-        let actors = Arc::clone(&self.actors);
-        let stops = Arc::clone(&self.motion_stops);
+        let cameras = Arc::clone(&self.cameras);
         let instance = instance.to_owned();
         let deadline = tokio::time::Instant::now() + timeout;
         let shutting_down = self.cancellation.clone();
@@ -2902,10 +2959,12 @@ impl CameraRuntime {
             }
             // The component shutting down does not excuse a moving camera; the actor's own teardown
             // delivers a stop in that case, and this one is harmless if it loses the race.
-            let actor = actors
-                .read()
-                .ok()
-                .and_then(|actors| actors.get(&instance).cloned());
+            let actor = cameras.read().ok().and_then(|cameras| {
+                cameras
+                    .get(&instance)
+                    .and_then(|slot| slot.session.as_ref())
+                    .map(|session| session.actor.clone())
+            });
             let Some(actor) = actor else {
                 tracing::warn!(
                     instance = %instance,
@@ -2930,8 +2989,10 @@ impl CameraRuntime {
                     "a moving camera could not be sent its mandatory stop"
                 ),
             }
-            if let Ok(mut stops) = stops.write() {
-                stops.remove(&instance);
+            if let Ok(mut cameras) = cameras.write() {
+                if let Some(slot) = cameras.get_mut(&instance) {
+                    slot.motion_stop = None;
+                }
             }
         })
         .ok()?;
@@ -2941,10 +3002,10 @@ impl CameraRuntime {
     /// Retires a camera's armed stop: its motion has been ended by something else.
     fn disarm_motion_stop(&self, instance: &str) {
         let armed = self
-            .motion_stops
+            .cameras
             .write()
             .ok()
-            .and_then(|mut stops| stops.remove(instance));
+            .and_then(|mut cameras| cameras.get_mut(instance)?.motion_stop.take());
         if let Some(armed) = armed {
             armed.cancellation.cancel();
         }
@@ -2969,35 +3030,33 @@ impl CameraRuntime {
     /// while there is still an actor to deliver through. `instances` selects the cameras being retired;
     /// `None` means all of them, which is what shutdown wants.
     fn deliver_mandatory_stops(&self, instances: Option<&[String]>) -> usize {
+        // Taken and delivered under one lock: the armed stop and the actor it must go through are
+        // now the same entry, so there is no window in which one is found and the other has gone.
         let armed = {
-            let Ok(mut stops) = self.motion_stops.write() else {
+            let Ok(mut cameras) = self.cameras.write() else {
                 return 0;
             };
-            let selected = stops
-                .iter()
+            cameras
+                .iter_mut()
                 .filter(|(instance, _)| {
                     instances.is_none_or(|retiring| retiring.contains(instance))
                 })
-                .map(|(instance, armed)| (instance.clone(), armed.clone()))
-                .collect::<Vec<_>>();
-            for (instance, _) in &selected {
-                stops.remove(instance);
-            }
-            selected
+                .filter_map(|(instance, slot)| {
+                    let armed = slot.motion_stop.take()?;
+                    let actor = slot.session.as_ref().map(|session| session.actor.clone());
+                    Some((instance.clone(), armed, actor))
+                })
+                .collect::<Vec<_>>()
         };
         if armed.is_empty() {
             return 0;
         }
 
-        let actors = self.actors.read().ok();
         let mut delivered = 0;
-        for (instance, armed) in armed {
+        for (instance, armed, actor) in armed {
             // The stop is being delivered now, so the deadline must not deliver a second one at an
             // actor that by then belongs to a different session.
             armed.cancellation.cancel();
-            let actor = actors
-                .as_ref()
-                .and_then(|actors| actors.get(&instance).cloned());
             let Some(actor) = actor else {
                 tracing::error!(
                     instance = %instance,
@@ -3674,11 +3733,9 @@ impl CameraRuntime {
         // not retain these temporary values: the committed transition constructs its own objects
         // after Core has atomically advanced the configuration snapshot.
         let existing_engine_ids = self
-            .engines
+            .cameras
             .read()
-            .map_err(|_| {
-                crate::CameraError::Catalog("camera engine map is unavailable".to_string())
-            })?
+            .map_err(|_| crate::CameraError::Catalog("camera slot map is unavailable".to_string()))?
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
@@ -3706,20 +3763,19 @@ impl CameraRuntime {
     /// transition. All locks are released before any await in the commit/rollback path.
     fn reload_checkpoint(&self) -> Result<RuntimeReloadCheckpoint> {
         let config = self.config_snapshot()?;
-        let engines = self
-            .engines
-            .read()
-            .map_err(|_| {
-                crate::CameraError::Catalog("camera engine map is unavailable".to_string())
-            })?
-            .clone();
-        let events = self
-            .events
-            .read()
-            .map_err(|_| {
-                crate::CameraError::Catalog("camera events map is unavailable".to_string())
-            })?
-            .clone();
+        // Only the roster-durable half of a slot is checkpointed. The supervisor, the session and any
+        // armed stop are generation state, and a rollback retires every generation before it restores
+        // anything -- so carrying them across would be carrying corpses.
+        let cameras = self.cameras.read().map_err(|_| crate::CameraError::Catalog("camera slot map is unavailable".to_string()))?;
+        let engines = cameras
+            .iter()
+            .map(|(instance, slot)| (instance.clone(), slot.engine.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let events = cameras
+            .iter()
+            .filter_map(|(instance, slot)| Some((instance.clone(), slot.events.clone()?)))
+            .collect::<BTreeMap<_, _>>();
+        drop(cameras);
         Ok(RuntimeReloadCheckpoint {
             config,
             engines,
@@ -3769,16 +3825,14 @@ impl CameraRuntime {
         // All direct map writes happen after supervisor retirement. No lock is held across the
         // preceding await, and a poisoned map is reported so Core retains the prior snapshot.
         self.registry.apply_validated_config(&checkpoint.config)?;
-        *self.engines.write().map_err(|_| {
-            crate::CameraError::Catalog(
-                "camera engine map is unavailable during rollback".to_string(),
-            )
-        })? = checkpoint.engines;
-        *self.events.write().map_err(|_| {
-            crate::CameraError::Catalog(
-                "camera events map is unavailable during rollback".to_string(),
-            )
-        })? = checkpoint.events;
+        // The whole roster is reinstated in one write. It used to restore engines and events and
+        // leave the other five maps alone, so a camera the failed candidate had ADDED kept its
+        // supervisor tokens and half-existed afterwards. Rebuilding the slots drops that state with
+        // the cameras it belonged to -- and every supervisor was retired above, so there is nothing
+        // live to drop.
+        *self.cameras.write().map_err(|_| {
+            crate::CameraError::Catalog("camera slot map is unavailable during rollback".to_string())
+        })? = new_slots(checkpoint.engines, checkpoint.events);
         *self.config.write().map_err(|_| {
             crate::CameraError::Catalog(
                 "runtime configuration lock is unavailable during rollback".to_string(),
@@ -3861,16 +3915,13 @@ impl CameraRuntime {
         // Build every new runtime object before changing the published registry.  An absent
         // facade is a real initialization failure, not permission to install a partial roster.
         let existing_engine_ids = self
-            .engines
+            .cameras
             .read()
-            .map_err(|_| {
-                crate::CameraError::Catalog("camera engine map is unavailable".to_string())
-            })?
+            .map_err(|_| crate::CameraError::Catalog("camera slot map is unavailable".to_string()))?
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
-        let mut added_engines = Vec::new();
-        let mut added_events = Vec::new();
+        let mut added = Vec::new();
         for camera in &replacement.instances {
             if existing_engine_ids.contains(&camera.id) {
                 continue;
@@ -3887,8 +3938,19 @@ impl CameraRuntime {
                     camera.id
                 ))
             })?;
-            added_engines.push((camera.id.clone(), self.new_engine(app)));
-            added_events.push((camera.id.clone(), event));
+            // Engine and facade arrive together or the camera is not added at all. They used to go
+            // into two maps in two separate acquisitions, which is precisely how a camera comes to
+            // exist in one and not the other.
+            added.push((
+                camera.id.clone(),
+                CameraSlot {
+                    engine: self.new_engine(app),
+                    events: Some(event),
+                    supervisor: None,
+                    session: None,
+                    motion_stop: None,
+                },
+            ));
         }
         // Core calls this method from its pre-commit application gate. Retire every old
         // supervisor before touching any published runtime generation: a timeout must veto the
@@ -3909,38 +3971,27 @@ impl CameraRuntime {
         self.waiters
             .set_waiter_limit(replacement.global.limits.max_deferred_waiters_per_capture);
         {
-            match self.engines.write() {
-                Ok(mut engines) => {
-                    for (instance, engine) in added_engines {
-                        engines.insert(instance, engine);
+            match self.cameras.write() {
+                Ok(mut cameras) => {
+                    for (instance, slot) in added {
+                        cameras.insert(instance, slot);
                     }
-                }
-                Err(_) => {
-                    tracing::error!("camera engine map became unavailable while committing reload");
-                }
-            }
-        }
-        {
-            match self.events.write() {
-                Ok(mut runtime_events) => {
                     // The listener supplies fresh facades for all retained instances so their core
                     // configuration snapshot stays current; tests and internal callers may omit
                     // retained entries, in which case the established facade remains valid. Newly
                     // added cameras were required above and are therefore never installed without
                     // an event publishing path.
                     for (instance, event) in events {
-                        if replacement_by_id.contains_key(instance.as_str()) {
-                            runtime_events.insert(instance, event);
+                        if !replacement_by_id.contains_key(instance.as_str()) {
+                            continue;
                         }
-                    }
-                    for (instance, event) in added_events {
-                        runtime_events.insert(instance, event);
+                        if let Some(slot) = cameras.get_mut(&instance) {
+                            slot.events = Some(event);
+                        }
                     }
                 }
                 Err(_) => {
-                    tracing::error!(
-                        "camera events facade map became unavailable while committing reload"
-                    );
+                    tracing::error!("camera slot map became unavailable while committing reload");
                 }
             }
         }
@@ -4009,31 +4060,21 @@ impl CameraRuntime {
             }
         }
         if !diff.removed.is_empty() {
-            if let Ok(mut engines) = self.engines.write() {
-                engines.retain(|instance, _| !diff.removed.contains(instance));
-            }
             // A removed camera needs nothing torn down in the queue: it is deregistered, its work
             // is never admissible again, and each entry expires on its own wait deadline. The queue
             // outliving one camera is the same property that lets it outlive a reconnect.
             for instance in &diff.removed {
                 self.scheduler.camera_offline(instance);
             }
-            if let Ok(mut events) = self.events.write() {
-                events.retain(|instance, _| !diff.removed.contains(instance));
-            }
-            if let Ok(mut cancellations) = self.supervisor_cancellations.write() {
-                cancellations.retain(|instance, _| !diff.removed.contains(instance));
-            }
-            if let Ok(mut finished) = self.supervisor_finished.write() {
-                finished.retain(|instance, _| !diff.removed.contains(instance));
-            }
-            if let Ok(mut sessions) = self.session_cancellations.write() {
-                sessions.retain(|instance, _| !diff.removed.contains(instance));
-            }
-            // `replace_supervisors` has already stopped and drained these; the retain is what keeps
-            // the map honest if a camera is ever removed by a path that does not go through it.
-            if let Ok(mut stops) = self.motion_stops.write() {
-                stops.retain(|instance, _| !diff.removed.contains(instance));
+            // ONE removal. This was six hand-written `retain`s over six maps -- and it forgot two of
+            // them, `actors` and `motion_stops`, which is how a camera dropped from the roster mid-move
+            // came to keep an armed stop that nothing would ever deliver. Forgetting is no longer an
+            // available move: the camera's engine, facade, supervisor, session and armed stop are one
+            // entry, and they leave together.
+            if let Ok(mut cameras) = self.cameras.write() {
+                cameras.retain(|instance, _| !diff.removed.contains(instance));
+            } else {
+                tracing::error!("camera slot map became unavailable while removing cameras");
             }
         }
         Ok(diff)
@@ -4065,41 +4106,33 @@ impl CameraRuntime {
         // said a retiring supervisor disarms the timer; until now nothing did.
         self.deliver_mandatory_stops(Some(instances));
 
-        let cancellations = self
-            .supervisor_cancellations
-            .read()
-            .map_err(|_| {
-                crate::CameraError::Catalog(
-                    "supervisor cancellation map is unavailable".to_string(),
-                )
-            })?
-            .iter()
-            .filter(|(instance, _)| instances.contains(*instance))
-            .map(|(_, cancellation)| cancellation.clone())
-            .collect::<Vec<_>>();
-        for cancellation in cancellations {
-            cancellation.cancel();
-        }
-        // A live actor receives the supervisor child token above.  Retaining the direct signal is
-        // useful for an already-dispatched control operation which owns its own child token.
-        if let Ok(sessions) = self.session_cancellations.read() {
-            for (instance, cancellation) in sessions.iter() {
-                if instances.contains(instance) {
-                    cancellation.cancel();
+        // One pass over one map. The supervisor token, the session token and the completion signal
+        // for a camera are the same entry, so they can no longer disagree about which cameras are
+        // being retired -- which is what three separate reads with three different lock-poisoning
+        // policies, ten lines apart, could do.
+        let completed = {
+            let cameras = self.cameras.read().map_err(|_| crate::CameraError::Catalog("camera slot map is unavailable".to_string()))?;
+            let retiring = instances
+                .iter()
+                .filter_map(|instance| cameras.get(instance))
+                .collect::<Vec<_>>();
+            for slot in &retiring {
+                if let Some(supervisor) = &slot.supervisor {
+                    supervisor.cancellation.cancel();
+                }
+                // A live actor already holds a child of the supervisor token. Cancelling the session
+                // directly still matters for an already-dispatched control operation, which owns its
+                // own child token and would not otherwise see the retirement.
+                if let Some(session) = &slot.session {
+                    session.cancellation.cancel();
                 }
             }
-        }
-
-        let completed = self
-            .supervisor_finished
-            .read()
-            .map_err(|_| {
-                crate::CameraError::Catalog("supervisor completion map is unavailable".to_string())
-            })?
-            .iter()
-            .filter(|(instance, _)| instances.contains(*instance))
-            .map(|(_, finished)| finished.clone())
-            .collect::<Vec<_>>();
+            retiring
+                .iter()
+                .filter_map(|slot| slot.supervisor.as_ref())
+                .map(|supervisor| supervisor.finished.clone())
+                .collect::<Vec<_>>()
+        };
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if completed.iter().all(CancellationToken::is_cancelled) {
@@ -4709,24 +4742,29 @@ impl CameraRuntime {
     fn start_supervisor(self: &Arc<Self>, instance: String, engine: JobEngine) -> Result<()> {
         let cancellation = self.cancellation.child_token();
         let finished = CancellationToken::new();
+        // Both tokens land together. They used to be two maps and two acquisitions, so a
+        // `start_supervisor` that displaced a running generation cancelled its token and silently
+        // DROPPED its completion signal -- destroying the only way to await the generation it had just
+        // told to stop. They are one value now, and cannot be half-replaced.
         let previous = self
-            .supervisor_cancellations
+            .cameras
             .write()
-            .map_err(|_| {
-                crate::CameraError::Catalog(
-                    "supervisor cancellation map is unavailable".to_string(),
+            .map_err(|_| crate::CameraError::Catalog("camera slot map is unavailable".to_string()))?
+            .get_mut(&instance)
+            .ok_or_else(|| {
+                crate::CameraError::rejected(
+                    crate::ErrorCode::UnknownInstance,
+                    format!("camera instance '{instance}' is not configured"),
                 )
             })?
-            .insert(instance.clone(), cancellation.clone());
+            .supervisor
+            .replace(Supervision {
+                cancellation: cancellation.clone(),
+                finished: finished.clone(),
+            });
         if let Some(previous) = previous {
-            previous.cancel();
+            previous.cancellation.cancel();
         }
-        self.supervisor_finished
-            .write()
-            .map_err(|_| {
-                crate::CameraError::Catalog("supervisor completion map is unavailable".to_string())
-            })?
-            .insert(instance.clone(), finished.clone());
         let runtime = Arc::clone(self);
         self.spawn_task(async move {
             runtime
@@ -5344,10 +5382,10 @@ impl CameraRuntime {
             return;
         };
         let event = self
-            .events
+            .cameras
             .read()
             .ok()
-            .and_then(|events| events.get(instance).cloned());
+            .and_then(|cameras| cameras.get(instance).and_then(|slot| slot.events.clone()));
         if let Some(event) = event {
             let _ = event
                 .emit(
@@ -5879,12 +5917,14 @@ impl CameraRuntime {
                             continue;
                         }
                     };
-                    if let Ok(mut actors) = self.actors.write() {
-                        actors.insert(camera.id.clone(), handle.clone());
-                    }
                     let actor_cancellation = cancellation.child_token();
-                    if let Ok(mut sessions) = self.session_cancellations.write() {
-                        sessions.insert(camera.id.clone(), actor_cancellation.clone());
+                    if let Ok(mut cameras) = self.cameras.write() {
+                        if let Some(slot) = cameras.get_mut(&camera.id) {
+                            slot.session = Some(Session {
+                                actor: handle.clone(),
+                                cancellation: actor_cancellation.clone(),
+                            });
+                        }
                     }
                     self.publish_camera_state(
                         &camera.id,
@@ -5930,11 +5970,10 @@ impl CameraRuntime {
                     // Its queued work stays queued. That is the entire point of a queue that outlives
                     // the session: a camera that drops does not lose the captures promised to it.
                     self.scheduler.camera_offline(&camera.id);
-                    if let Ok(mut actors) = self.actors.write() {
-                        actors.remove(&camera.id);
-                    }
-                    if let Ok(mut sessions) = self.session_cancellations.write() {
-                        sessions.remove(&camera.id);
+                    if let Ok(mut cameras) = self.cameras.write() {
+                        if let Some(slot) = cameras.get_mut(&camera.id) {
+                            slot.session = None;
+                        }
                     }
                     if cancellation.is_cancelled() {
                         return;
@@ -8122,19 +8161,13 @@ mod tests {
                 admission,
                 storage,
                 registry,
-                engines: RwLock::new(engines),
-                events: RwLock::new(BTreeMap::new()),
+                cameras: Arc::new(RwLock::new(new_slots(engines, BTreeMap::new()))),
                 outbox_events: None,
                 storage_pressure,
                 storage_alarm: Arc::new(Mutex::new(StorageAlarmState::default())),
                 readiness: RuntimeReadiness::noop(),
                 metrics: Arc::new(crate::observability::CaptureMetrics::new(metrics)),
                 health: Arc::new(crate::observability::FleetHealth::default()),
-                actors: Arc::new(RwLock::new(HashMap::new())),
-                supervisor_cancellations: Arc::new(RwLock::new(HashMap::new())),
-                motion_stops: Arc::new(RwLock::new(HashMap::new())),
-                supervisor_finished: Arc::new(RwLock::new(HashMap::new())),
-                session_cancellations: Arc::new(RwLock::new(HashMap::new())),
                 scheduler_cancellations: RwLock::new(HashMap::new()),
                 discovery_cancellation: RwLock::new(None),
                 discovery_cache: Mutex::new(DiscoveryCache::default()),
@@ -10505,15 +10538,15 @@ mod tests {
             let old_cancellation = CancellationToken::new();
             let old_finished = CancellationToken::new();
             runtime
-                .supervisor_cancellations
+                .cameras
                 .write()
                 .unwrap()
-                .insert("camera-a".to_string(), old_cancellation.clone());
-            runtime
-                .supervisor_finished
-                .write()
+                .get_mut("camera-a")
                 .unwrap()
-                .insert("camera-a".to_string(), old_finished.clone());
+                .supervisor = Some(Supervision {
+                cancellation: old_cancellation.clone(),
+                finished: old_finished.clone(),
+            });
 
             let mut replacement = config(directory.path(), &["camera-a"], false);
             replacement.global.timeouts.reload_drain_timeout_ms = 0;
@@ -10531,11 +10564,12 @@ mod tests {
             assert!(old_cancellation.is_cancelled());
             assert!(
                 runtime
-                    .supervisor_cancellations
+                    .cameras
                     .read()
                     .unwrap()
                     .get("camera-a")
-                    .is_some_and(CancellationToken::is_cancelled),
+                    .and_then(|slot| slot.supervisor.as_ref())
+                    .is_some_and(|supervisor| supervisor.cancellation.is_cancelled()),
                 "timeout must not install a replacement supervisor token"
             );
             assert_eq!(
@@ -10563,11 +10597,12 @@ mod tests {
             assert_eq!(diff.lifecycle_changed, vec!["camera-a".to_string()]);
             assert!(
                 !runtime
-                    .supervisor_cancellations
+                    .cameras
                     .read()
                     .unwrap()
                     .get("camera-a")
-                    .is_some_and(CancellationToken::is_cancelled),
+                    .and_then(|slot| slot.supervisor.as_ref())
+                    .is_some_and(|supervisor| supervisor.cancellation.is_cancelled()),
                 "the replacement supervisor starts only after the old completion signal"
             );
             let crate::config::BackendConfig::Sim(sim) =
@@ -10874,15 +10909,15 @@ mod tests {
             let cancellation = CancellationToken::new();
             let completion = CancellationToken::new();
             runtime
-                .supervisor_cancellations
+                .cameras
                 .write()
                 .unwrap()
-                .insert("camera-a".to_string(), cancellation.clone());
-            runtime
-                .supervisor_finished
-                .write()
+                .get_mut("camera-a")
                 .unwrap()
-                .insert("camera-a".to_string(), completion.clone());
+                .supervisor = Some(Supervision {
+                cancellation: cancellation.clone(),
+                finished: completion.clone(),
+            });
 
             let error = runtime
                 .replace_supervisors(&["camera-a".to_string()], Duration::ZERO)
@@ -11085,7 +11120,14 @@ mod tests {
                 runtime.registry.ids().unwrap(),
                 vec!["camera-a".to_string()]
             );
-            assert!(runtime.events.read().unwrap().is_empty());
+            assert!(
+                runtime
+                    .cameras
+                    .read()
+                    .unwrap()
+                    .values()
+                    .all(|slot| slot.events.is_none())
+            );
             runtime.shutdown().await;
         }
 
@@ -11141,7 +11183,12 @@ mod tests {
                 vec!["camera-a".to_string()]
             );
             assert!(
-                runtime.events.read().unwrap().is_empty(),
+                runtime
+                    .cameras
+                    .read()
+                    .unwrap()
+                    .values()
+                    .all(|slot| slot.events.is_none()),
                 "preparation failures must not install a partial event facade map"
             );
             runtime.shutdown().await;
@@ -11166,10 +11213,13 @@ mod tests {
                 .unwrap()
                 .capture_interlock = Some(crate::config::CaptureInterlock::Reject);
             let runtime = runtime(initial, &directory).await;
-            runtime.events.write().unwrap().insert(
-                "camera-a".to_string(),
-                core.instance("camera-a").unwrap().events(),
-            );
+            runtime
+                .cameras
+                .write()
+                .unwrap()
+                .get_mut("camera-a")
+                .unwrap()
+                .events = Some(core.instance("camera-a").unwrap().events());
             runtime
                 .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
                 .unwrap();
@@ -11246,10 +11296,13 @@ mod tests {
             let mut configuration = config(directory.path(), &["camera-a"], false);
             configuration.global.operator_events.capture_lifecycle = true;
             let runtime = runtime(configuration, &directory).await;
-            runtime.events.write().unwrap().insert(
-                "camera-a".to_string(),
-                core.instance("camera-a").unwrap().events(),
-            );
+            runtime
+                .cameras
+                .write()
+                .unwrap()
+                .get_mut("camera-a")
+                .unwrap()
+                .events = Some(core.instance("camera-a").unwrap().events());
             runtime
                 .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
                 .unwrap();
@@ -11339,10 +11392,13 @@ mod tests {
             let (port, publishes) = spawn_recording_mqtt_broker().await;
             let core = facade_core(&directory, port).await;
             let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
-            runtime.events.write().unwrap().insert(
-                "camera-a".to_string(),
-                core.instance("camera-a").unwrap().events(),
-            );
+            runtime
+                .cameras
+                .write()
+                .unwrap()
+                .get_mut("camera-a")
+                .unwrap()
+                .events = Some(core.instance("camera-a").unwrap().events());
             runtime
                 .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
                 .unwrap();
@@ -11394,10 +11450,13 @@ mod tests {
             let mut configuration = config(directory.path(), &["camera-a"], false);
             configuration.global.operator_events.capture_lifecycle = true;
             let runtime = runtime(configuration, &directory).await;
-            runtime.events.write().unwrap().insert(
-                "camera-a".to_string(),
-                core.instance("camera-a").unwrap().events(),
-            );
+            runtime
+                .cameras
+                .write()
+                .unwrap()
+                .get_mut("camera-a")
+                .unwrap()
+                .events = Some(core.instance("camera-a").unwrap().events());
             let permits = Arc::clone(&runtime.waiters.lifecycle_event_slots)
                 .acquire_many_owned(
                     u32::try_from(MAX_LIFECYCLE_EVENT_PUBLISHES)
@@ -11509,10 +11568,11 @@ mod tests {
             assert_eq!(diff.added, vec!["camera-b".to_string()]);
             assert_eq!(
                 runtime
-                    .events
+                    .cameras
                     .read()
                     .unwrap()
                     .get("camera-b")
+                    .and_then(|slot| slot.events.as_ref())
                     .map(EventsFacade::instance_id),
                 Some("camera-b")
             );
@@ -11523,7 +11583,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                !runtime.events.read().unwrap().contains_key("camera-b"),
+                !runtime.cameras.read().unwrap().contains_key("camera-b"),
                 "removing a camera must retire its event facade with the rest of its runtime state"
             );
             runtime.shutdown().await;
@@ -11544,11 +11604,12 @@ mod tests {
             wait_for_online(&runtime, "camera-a").await;
             let generation_before = runtime.registry.snapshot("camera-a").unwrap().generation;
             let supervisor = runtime
-                .supervisor_cancellations
+                .cameras
                 .read()
                 .unwrap()
                 .get("camera-a")
-                .cloned()
+                .and_then(|slot| slot.supervisor.as_ref())
+                .map(|supervisor| supervisor.cancellation.clone())
                 .expect("the live camera must have a supervisor cancellation token");
 
             let listener = RuntimeConfigListener::new(
@@ -11618,11 +11679,12 @@ mod tests {
                 .unwrap();
             wait_for_online(&runtime, "camera-a").await;
             let retired_supervisor = runtime
-                .supervisor_cancellations
+                .cameras
                 .read()
                 .unwrap()
                 .get("camera-a")
-                .cloned()
+                .and_then(|slot| slot.supervisor.as_ref())
+                .map(|supervisor| supervisor.cancellation.clone())
                 .expect("the initial runtime must have a supervisor token");
 
             let mut replacement = config(directory.path(), &["camera-a"], false);
@@ -11682,11 +11744,12 @@ mod tests {
             );
             assert!(
                 !runtime
-                    .supervisor_cancellations
+                    .cameras
                     .read()
                     .unwrap()
                     .get("camera-a")
-                    .is_some_and(CancellationToken::is_cancelled),
+                    .and_then(|slot| slot.supervisor.as_ref())
+                    .is_some_and(|supervisor| supervisor.cancellation.is_cancelled()),
                 "rollback must install a live prior-config supervisor rather than revive a cancelled actor"
             );
 
@@ -11782,14 +11845,20 @@ mod tests {
                 ["camera-a", "camera-c"]
             );
             {
-                let events = runtime.events.read().unwrap();
-                assert_eq!(events.len(), 2);
+                let cameras = runtime.cameras.read().unwrap();
+                assert_eq!(cameras.values().filter(|slot| slot.events.is_some()).count(), 2);
                 assert_eq!(
-                    events.get("camera-a").map(EventsFacade::instance_id),
+                    cameras
+                        .get("camera-a")
+                        .and_then(|slot| slot.events.as_ref())
+                        .map(EventsFacade::instance_id),
                     Some("camera-a")
                 );
                 assert_eq!(
-                    events.get("camera-c").map(EventsFacade::instance_id),
+                    cameras
+                        .get("camera-c")
+                        .and_then(|slot| slot.events.as_ref())
+                        .map(EventsFacade::instance_id),
                     Some("camera-c")
                 );
             }
@@ -15102,12 +15171,29 @@ mod tests {
                 .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
                 .unwrap();
             wait_for_online(&runtime, "camera-a").await;
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            assert_eq!(
-                runtime.scheduler.pending(),
-                1,
-                "a capture the store could not rebase is still owed a run and must stay queued"
-            );
+
+            // Sampling ONCE after a fixed sleep asks the wrong question. The scheduler pops the
+            // descriptor, fails the rebase, and pushes it back -- so there is a real instant in which it
+            // is in flight and `pending()` is legitimately 0, and a loaded machine can land the sample
+            // exactly there. The defect this guards is not a momentary dip: it is a descriptor that is
+            // gone FOREVER. So require the queue to SETTLE at 1 and stay there.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut settled = 0;
+            loop {
+                if runtime.scheduler.pending() == 1 {
+                    settled += 1;
+                    if settled == 5 {
+                        break;
+                    }
+                } else {
+                    settled = 0;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "a capture the store could not rebase is still owed a run and must stay queued;                      the queue never settled back to it"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
 
             // The store recovers. The capture must actually run -- being requeued is only half of
             // the promise.
@@ -15329,6 +15415,62 @@ mod tests {
             runtime.shutdown().await;
         }
 
+        /// A camera dropped from the roster leaves NOTHING behind.
+        ///
+        /// This is what the consolidation buys, and it is not a tidiness argument. Removing a camera was
+        /// six hand-written `retain`s over six separate maps, and it forgot two of them -- `actors` and
+        /// `motion_stops`. The second omission is how a camera removed mid-move came to keep an armed
+        /// mandatory stop that nothing would ever deliver, and the camera kept moving.
+        ///
+        /// A camera is one entry now. Its engine, its facade, its supervisor, its session and its armed
+        /// stop leave together, because they are one thing. Forgetting one of them is no longer a move
+        /// that exists.
+        #[tokio::test]
+        async fn removing_a_camera_removes_all_of_it() {
+            let directory = TempDir::new().unwrap();
+            let runtime = runtime(ptz_camera(&directory, 10_000), &directory).await;
+            runtime
+                .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+                .unwrap();
+            wait_for_online(&runtime, "camera-a").await;
+
+            // Give the camera every kind of state it can have: a supervisor, a session, and an armed
+            // mandatory stop with its deadline still seconds away.
+            let request: PtzCommandRequest = crate::commands::parse_closed(json!({
+                "operation": "continuous",
+                "instance": "camera-a",
+                "requestId": "estop-removal",
+                "velocity": { "pan": 0.5, "tilt": 0.0, "zoom": 0.0 },
+                "timeoutMs": 9_000
+            }))
+            .unwrap();
+            runtime.perform_ptz(request).await.unwrap();
+            {
+                let cameras = runtime.cameras.read().unwrap();
+                let slot = cameras.get("camera-a").expect("the camera exists");
+                assert!(slot.supervisor.is_some(), "it has a supervisor");
+                assert!(slot.session.is_some(), "it is connected");
+                assert!(slot.motion_stop.is_some(), "and it is moving");
+            }
+
+            // Drop it from the roster.
+            let mut replacement = ptz_camera(&directory, 10_000);
+            replacement.instances.clear();
+            let diff = runtime
+                .apply_reloaded_config(replacement, BTreeMap::new(), BTreeMap::new())
+                .await
+                .expect("removing a camera is a valid reload");
+            assert_eq!(diff.removed, vec!["camera-a".to_string()]);
+
+            assert!(
+                runtime.cameras.read().unwrap().is_empty(),
+                "a camera dropped from the roster must leave nothing behind -- and the two the old \
+                 removal path forgot were the actor handle and the armed mandatory stop, which is how \
+                 a camera came to be left moving with nothing alive to stop it"
+            );
+            runtime.shutdown().await;
+        }
+
         /// The stop reaches a camera whose actor is about to be taken away.
         ///
         /// The mandatory-stop timer resolves its actor LAZILY, when the deadline fires -- right for a
@@ -15419,10 +15561,11 @@ mod tests {
             );
             assert!(
                 runtime
-                    .motion_stops
+                    .cameras
                     .read()
                     .unwrap()
-                    .contains_key("camera-a"),
+                    .get("camera-a")
+                    .is_some_and(|slot| slot.motion_stop.is_some()),
                 "the move must be armed before shutdown, or this proves nothing"
             );
 
@@ -15437,7 +15580,12 @@ mod tests {
             // Before the fix the entry SURVIVED shutdown, because the timer holding it returned
             // without stopping anything and nothing else touched it.
             assert!(
-                runtime.motion_stops.read().unwrap().is_empty(),
+                runtime
+                    .cameras
+                    .read()
+                    .unwrap()
+                    .values()
+                    .all(|slot| slot.motion_stop.is_none()),
                 "the component shut down and left a camera armed, moving, and unstopped"
             );
         }
@@ -15474,7 +15622,12 @@ mod tests {
                 .expect("the supervisor must retire");
 
             assert!(
-                runtime.motion_stops.read().unwrap().is_empty(),
+                runtime
+                    .cameras
+                    .read()
+                    .unwrap()
+                    .values()
+                    .all(|slot| slot.motion_stop.is_none()),
                 "a supervisor was retired out from under a moving camera and the stop it was owed \
                  went with it"
             );
@@ -16541,11 +16694,12 @@ mod tests {
             wait_for_online(&runtime, "camera-a").await;
 
             let finished = runtime
-                .supervisor_finished
+                .cameras
                 .read()
                 .unwrap()
                 .get("camera-a")
-                .cloned()
+                .and_then(|slot| slot.supervisor.as_ref())
+                .map(|supervisor| supervisor.finished.clone())
                 .expect("a live supervisor must publish its completion token");
             runtime.cancellation.cancel();
             tokio::time::timeout(Duration::from_secs(5), finished.cancelled())
