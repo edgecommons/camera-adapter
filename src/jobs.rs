@@ -212,6 +212,14 @@ pub trait JobHooks: Send + Sync {
 
     /// Observes a configured thumbnail that rendered but exceeded the announcement's byte ceiling.
     async fn thumbnail_dropped(&self) {}
+
+    /// Observes an announcement that would not publish with its preview and was published without it.
+    ///
+    /// Deliberately NOT `thumbnail_dropped`: nothing here says the preview was too big for the
+    /// budget, only that the transport refused the message carrying it. Counting it as a budget drop
+    /// would tell an operator to shrink a thumbnail during a broker outage, when the thumbnail was
+    /// never the problem.
+    async fn announcement_retried_without_preview(&self) {}
 }
 
 /// Runs after durable `ACCEPTED` insertion and before the record can become `QUEUED` or visible
@@ -1774,12 +1782,20 @@ impl JobEngine {
                                     error = %error,
                                     "the capture result could not be announced with its thumbnail;                                      retrying without the preview so the result itself is not lost"
                                 );
-                                self.hooks.thumbnail_dropped().await;
+                                // NOT `thumbnail_dropped`. Nothing here says the preview was too big
+                                // for the budget -- only that the transport refused the message that
+                                // carried it, which a broker outage does just as readily as a size
+                                // ceiling. Counting it as a budget drop would tell an operator to
+                                // shrink a thumbnail that was never the problem.
+                                self.hooks.announcement_retried_without_preview().await;
                                 self.announcer.announce(&base).await
                             }
                         }
                     }
                     Err(_) => {
+                        // The message could not even be BUILT with the preview -- the messaging
+                        // library refused the bytes as a binary value. That is a size verdict, and it
+                        // is the one case here that genuinely is one.
                         self.hooks.thumbnail_dropped().await;
                         self.announcer.announce(&base).await
                     }
@@ -3698,6 +3714,7 @@ mod tests {
         announcement_failed: AtomicUsize,
         thumbnail_failed: AtomicUsize,
         thumbnail_dropped: AtomicUsize,
+        announcement_retried_without_preview: AtomicUsize,
     }
 
     #[async_trait]
@@ -3716,6 +3733,11 @@ mod tests {
 
         async fn thumbnail_dropped(&self) {
             self.thumbnail_dropped.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn announcement_retried_without_preview(&self) {
+            self.announcement_retried_without_preview
+                .fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -4001,9 +4023,16 @@ mod tests {
             "it is the same result, not a rebuilt or degraded one"
         );
         assert_eq!(
-            hooks.thumbnail_dropped.load(Ordering::SeqCst),
+            hooks
+                .announcement_retried_without_preview
+                .load(Ordering::SeqCst),
             1,
             "the shed preview is counted -- it is how an operator learns the limit was mis-modelled"
+        );
+        assert_eq!(
+            hooks.thumbnail_dropped.load(Ordering::SeqCst),
+            0,
+            "and it is NOT counted as a budget drop. The component measured this preview against the              transport's budget and it FIT; the transport refused it anyway. Telling an operator to              configure a smaller size -- which is precisely what `thumbnailDropped` means -- would              send them after a thumbnail that was never the problem. A broker outage lands here too."
         );
         assert_eq!(
             hooks.announced.load(Ordering::SeqCst),

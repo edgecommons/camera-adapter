@@ -364,6 +364,18 @@ pub const THUMBNAIL_FAILED_MEASURE: &str = "thumbnailFailed";
 /// Distinct from `thumbnailFailed` on purpose: this one says the picture was fine and the BUDGET was
 /// not, which is an operator's cue to configure a smaller size rather than to suspect the camera.
 pub const THUMBNAIL_DROPPED_MEASURE: &str = "thumbnailDropped";
+/// Announcements that would not publish while carrying a preview, and were published again without it.
+///
+/// This is NOT `thumbnailDropped`, and conflating the two sends an operator to the wrong knob. That
+/// one means the component measured the preview against the transport's budget and found it too big --
+/// shrink the configured size. This one means the component believed the preview would fit, the
+/// transport disagreed, and the result went out unadorned rather than not at all.
+///
+/// It is the honest signal for a transport whose limit the component has MIS-MODELLED, which has
+/// already happened once: a `medium` preview sailed past every check and then met the Greengrass IPC
+/// client's static 10,000-byte send buffer. A broker outage also lands here -- and lands on
+/// `announcementFailed` too, which is the pair an operator should read together.
+pub const ANNOUNCEMENT_RETRIED_WITHOUT_PREVIEW_MEASURE: &str = "announcementRetriedWithoutPreview";
 
 impl CaptureMetrics {
     /// Defines both metrics against the component's metric service.
@@ -380,6 +392,7 @@ impl CaptureMetrics {
                 .add_measure(ANNOUNCEMENT_FAILED_MEASURE, "Count", 60)
                 .add_measure(THUMBNAIL_FAILED_MEASURE, "Count", 60)
                 .add_measure(THUMBNAIL_DROPPED_MEASURE, "Count", 60)
+                .add_measure(ANNOUNCEMENT_RETRIED_WITHOUT_PREVIEW_MEASURE, "Count", 60)
                 .build(),
         );
         metrics.define_metric(

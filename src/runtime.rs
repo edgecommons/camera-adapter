@@ -1278,6 +1278,15 @@ impl JobHooks for RuntimeJobHooks {
                 .await;
         }
     }
+
+    async fn announcement_retried_without_preview(&self) {
+        if let Some(runtime) = self.runtime() {
+            runtime
+                .metrics
+                .count(crate::observability::ANNOUNCEMENT_RETRIED_WITHOUT_PREVIEW_MEASURE)
+                .await;
+        }
+    }
 }
 
 #[async_trait]
