@@ -1,8 +1,9 @@
 //! Protocol-neutral durable capture-job execution.
 //!
 //! Acceptance, actor dispatch, admission, backend acquisition, bounded encoding/persistence,
-//! installation arbitration, terminal outbox commit, waiter settlement, and group aggregation are
-//! joined here without depending on a concrete camera protocol or runtime supervisor.
+//! installation arbitration, the terminal commit, the best-effort terminal announcement, waiter
+//! settlement, and group aggregation are joined here without depending on a concrete camera protocol
+//! or runtime supervisor.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -24,8 +25,8 @@ use crate::admission::{
 };
 use crate::backend::{CameraSession, CaptureRequest};
 use crate::catalog::{
-    AcceptJobOutcome, Catalog, JobDeadlines, JobRecord, NewJob, NewOutboxMessage, PendingInstall,
-    StateCasOutcome, TerminalOutcome, TerminalWrite,
+    AcceptJobOutcome, Catalog, JobDeadlines, JobRecord, NewJob, PendingInstall, StateCasOutcome,
+    TerminalOutcome, TerminalWrite,
 };
 use crate::config::{CaptureInterlock, CaptureProfile, OfflinePolicy};
 use crate::encoding::EncodingRequest;
@@ -123,35 +124,43 @@ pub trait CaptureDispatcher: Send + Sync {
     fn reserve(&self, camera_id: &str) -> Result<Box<dyn DispatchReservation>>;
 }
 
-/// Exact EdgeCommons terminal-envelope encoder.
-pub trait TerminalEnvelopeEncoder: Send + Sync {
-    /// Stamps and serializes one terminal message for durable outbox insertion.
-    fn encode(&self, message: &TerminalMessage, created_at_ms: i64) -> Result<NewOutboxMessage>;
+/// Publishes the terminal announcement, best-effort.
+///
+/// The announcement is **volatile**. It is sent after the terminal is already durable, it is never
+/// retried, and a failure to send it is a degradation of observability -- not of the capture, which
+/// is on disk and in the catalog either way. An implementation must therefore not wait for a
+/// broker acknowledgement, and must not hold a capture up while it publishes.
+#[async_trait]
+pub trait TerminalAnnouncer: Send + Sync {
+    /// Announces one terminal message. Fire-and-forget: no delivery acknowledgement is awaited.
+    async fn announce(&self, message: &TerminalMessage) -> Result<()>;
 }
 
-/// Production encoder backed by the guarded EdgeCommons `app()` facade.
-pub struct AppTerminalEnvelopeEncoder {
+/// Production announcer backed by the guarded EdgeCommons `app()` facade.
+pub struct AppTerminalAnnouncer {
     app: Arc<AppFacade>,
 }
 
-impl AppTerminalEnvelopeEncoder {
-    /// Binds terminal encoding to one camera-instance application facade.
+impl AppTerminalAnnouncer {
+    /// Binds terminal announcement to one camera-instance application facade.
     #[must_use]
     pub fn new(app: Arc<AppFacade>) -> Self {
         Self { app }
     }
 }
 
-impl TerminalEnvelopeEncoder for AppTerminalEnvelopeEncoder {
-    fn encode(&self, message: &TerminalMessage, created_at_ms: i64) -> Result<NewOutboxMessage> {
+#[async_trait]
+impl TerminalAnnouncer for AppTerminalAnnouncer {
+    async fn announce(&self, message: &TerminalMessage) -> Result<()> {
         let prepared = message.prepare(&self.app)?;
-        Ok(NewOutboxMessage::from_prepared(
-            message.body().event_id.clone(),
-            "terminal",
-            &prepared,
-            created_at_ms,
-            created_at_ms,
-        ))
+        // `publish_prepared`, deliberately -- NOT `publish_prepared_confirmed`. Waiting for a broker
+        // acknowledgement is what the durable outbox existed to make safe, and there is no longer
+        // anything to make safe: nothing is retained, nothing is retried, and nothing downstream
+        // requires delivery.
+        self.app
+            .publish_prepared(&prepared)
+            .await
+            .map_err(|error| CameraError::Messaging(error.to_string()))
     }
 }
 
@@ -181,6 +190,17 @@ pub trait JobHooks: Send + Sync {
 
     /// Offers a terminal group member to the aggregate-completion coordinator.
     async fn group_member_terminal(&self, _record: &JobRecord, _terminal_body: &Value) {}
+
+    /// Observes one terminal announcement that reached the transport, and how long that took.
+    ///
+    /// This is the only source of `publishLatencyMs` in `southbound_health` (SOUTHBOUND §5).
+    async fn terminal_announced(&self, _record: &JobRecord, _latency: Duration) {}
+
+    /// Observes one terminal announcement that could not be published.
+    ///
+    /// The capture is already durable and already SUCCEEDED/FAILED/CANCELLED. This is where the
+    /// component counts the loss and marks messaging degraded; it must never fail the capture.
+    async fn terminal_announcement_failed(&self, _record: &JobRecord, _error: &CameraError) {}
 }
 
 /// Runs after durable `ACCEPTED` insertion and before the record can become `QUEUED` or visible
@@ -387,7 +407,7 @@ pub struct JobEngine {
     catalog: Catalog,
     admission: AdmissionController,
     storage: StorageRoot,
-    envelopes: Arc<dyn TerminalEnvelopeEncoder>,
+    announcer: Arc<dyn TerminalAnnouncer>,
     hooks: Arc<dyn JobHooks>,
     availability: Arc<dyn AvailabilityGate>,
     install_gate: Arc<dyn InstallGate>,
@@ -402,7 +422,7 @@ impl JobEngine {
         catalog: Catalog,
         admission: AdmissionController,
         storage: StorageRoot,
-        envelopes: Arc<dyn TerminalEnvelopeEncoder>,
+        announcer: Arc<dyn TerminalAnnouncer>,
         hooks: Arc<dyn JobHooks>,
     ) -> Self {
         Self {
@@ -410,7 +430,7 @@ impl JobEngine {
             catalog,
             admission,
             storage,
-            envelopes,
+            announcer,
             hooks,
             availability: Arc::new(ConnectedAvailability),
             acceptance_hook: Arc::new(NoopAcceptanceHook),
@@ -774,7 +794,15 @@ impl JobEngine {
             .commit_terminal(&record.capture_id, exact)
             .await?;
         let terminal = match outcome {
-            TerminalOutcome::Won(record) | TerminalOutcome::AlreadyTerminal(record) => record,
+            // Only the winner announces. The staged success this recovery is finishing belongs to a
+            // process that died before it could tell anyone; if a terminal had ALREADY been committed
+            // for this capture, whoever committed it announced it, and announcing it twice would
+            // publish the same event id again.
+            TerminalOutcome::Won(record) => {
+                self.announce_terminal(&record, &body).await;
+                record
+            }
+            TerminalOutcome::AlreadyTerminal(record) => record,
             TerminalOutcome::InstallationWon(_) => {
                 return Err(CameraError::Catalog(
                     "success recovery unexpectedly observed cancellation arbitration".to_string(),
@@ -904,7 +932,17 @@ impl JobEngine {
             .interrupt_recovered(&record.capture_id, expected, write)
             .await?
         {
-            TerminalOutcome::Won(terminal) | TerminalOutcome::AlreadyTerminal(terminal) => {
+            // Only the winner announces: a record that was already terminal was already announced by
+            // whoever committed it, and announcing it again would republish that event id.
+            TerminalOutcome::Won(terminal) => {
+                self.announce_terminal(&terminal, &body).await;
+                self.hooks.settle_waiters(&terminal, &body).await;
+                if terminal.group_id.is_some() {
+                    self.hooks.group_member_terminal(&terminal, &body).await;
+                }
+                Ok(terminal)
+            }
+            TerminalOutcome::AlreadyTerminal(terminal) => {
                 self.hooks.settle_waiters(&terminal, &body).await;
                 if terminal.group_id.is_some() {
                     self.hooks.group_member_terminal(&terminal, &body).await;
@@ -1105,8 +1143,9 @@ impl JobEngine {
         };
         // Sidecar-first visibility requires its body before the final image can be linked. Sample
         // one logical installation-transaction timestamp immediately at that boundary and reuse
-        // its exact body for sidecar and outbox. The live trace is not marked persisted until the
-        // install, parent sync, verification, and installed-artifact catalog write all succeed.
+        // its exact body for the sidecar, the durable terminal, and the announcement. The live trace
+        // is not marked persisted until the install, parent sync, verification, and installed-artifact
+        // catalog write all succeed.
         let terminal_at_ms = now_ms();
         let (write, body) = self.make_terminal_write(
             &runtime,
@@ -1568,9 +1607,45 @@ impl JobEngine {
 
     async fn after_terminal(&self, runtime: &Arc<JobRuntime>, record: &JobRecord, body: &Value) {
         self.complete_runtime(runtime);
+        self.announce_terminal(record, body).await;
         self.hooks.settle_waiters(record, body).await;
         if record.group_id.is_some() {
             self.hooks.group_member_terminal(record, body).await;
+        }
+    }
+
+    /// Announces one terminal that has just WON its durable commit.
+    ///
+    /// The order is the whole point: the capture is on disk and the catalog says so BEFORE anyone is
+    /// told about it. The announcement itself is volatile -- it is attempted exactly once, it is
+    /// never retried, and every way it can fail ends here, at WARN, with a counted metric and
+    /// messaging marked degraded. A broker that is down loses announcements; it does not lose
+    /// captures, does not reject captures, and does not stop the component.
+    async fn announce_terminal(&self, record: &JobRecord, body: &Value) {
+        let started = Instant::now();
+        let announcement = match terminal_kind(record.state)
+            .and_then(|kind| TerminalMessage::from_committed_body(kind, body.clone()))
+        {
+            Ok(message) => self.announcer.announce(&message).await,
+            Err(error) => Err(error),
+        };
+        match announcement {
+            Ok(()) => {
+                self.hooks
+                    .terminal_announced(record, started.elapsed())
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    capture = %record.capture_id,
+                    instance = %record.instance,
+                    state = ?record.state,
+                    error = %error,
+                    "the terminal capture result is durable but could not be announced; \
+                     the announcement is dropped and will not be retried"
+                );
+                self.hooks.terminal_announcement_failed(record, &error).await;
+            }
         }
     }
 
@@ -1731,19 +1806,8 @@ impl JobEngine {
             backend_metadata: frame
                 .map_or_else(BTreeMap::new, |facts| facts.backend_metadata.clone()),
         };
-        let kind = match state {
-            JobState::Succeeded => TerminalKind::Captured,
-            JobState::Cancelled => TerminalKind::Cancelled,
-            JobState::Failed | JobState::Interrupted => TerminalKind::Failed,
-            _ => {
-                return Err(CameraError::Catalog(
-                    "terminal message requested for nonterminal state".to_string(),
-                ));
-            }
-        };
-        let message = TerminalMessage::new(kind, body)?;
-        let value = message.body_value()?;
-        let outbox = self.envelopes.encode(&message, terminal_at_ms)?;
+        let message = TerminalMessage::new(terminal_kind(state)?, body)?;
+        let value = message.body().clone();
         let retained_error = error.map(|(code, message)| (code.as_str().to_string(), message));
         Ok((
             TerminalWrite {
@@ -1752,7 +1816,6 @@ impl JobEngine {
                 error_code: retained_error.as_ref().map(|(code, _)| code.clone()),
                 error_message: retained_error.map(|(_, message)| message),
                 terminal_at_ms,
-                outbox,
             },
             value,
         ))
@@ -1775,6 +1838,113 @@ impl JobEngine {
             _ = tokio::time::sleep_until(instant_for_epoch(deadline_ms)) => Err(timeout_error(stage)),
             result = &mut future => result,
         }
+    }
+}
+
+/// The announcer the tests use, shared by every module that builds a [`JobEngine`].
+///
+/// It is here rather than in one test module because "what did the component announce, and did it
+/// keep working when it could not" is asked by the job tests, the actor tests, and the runtime
+/// tests alike -- and a broker being down has to look the same to all three.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
+
+    use super::{TerminalAnnouncer, TerminalMessage};
+    use crate::{CameraError, Result};
+
+    /// One announcement, as a test can see it: exactly what would have gone on the wire.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Announcement {
+        /// EdgeCommons envelope header name (`ImageCaptured`, ...).
+        pub header_name: &'static str,
+        /// `app/` channel (`image/captured`, ...).
+        pub channel: &'static str,
+        /// Body `eventId`.
+        pub event_id: String,
+        /// Body `captureId`.
+        pub capture_id: String,
+        /// Envelope correlation.
+        pub correlation_id: String,
+    }
+
+    /// Records every announcement, and fails them all while `fail` is set -- which is what a broker
+    /// that is not there looks like from inside the component.
+    #[derive(Debug, Default)]
+    pub(crate) struct RecordingAnnouncer {
+        announced: Mutex<Vec<Announcement>>,
+        fail: AtomicBool,
+    }
+
+    impl RecordingAnnouncer {
+        /// An announcer whose every publish fails, for as long as the test wants.
+        pub fn failing() -> Self {
+            Self {
+                announced: Mutex::new(Vec::new()),
+                fail: AtomicBool::new(true),
+            }
+        }
+
+        /// Starts or stops failing publishes.
+        pub fn set_failing(&self, failing: bool) {
+            self.fail.store(failing, Ordering::SeqCst);
+        }
+
+        /// Every announcement attempted so far, in order.
+        pub fn announcements(&self) -> Vec<Announcement> {
+            self.announced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        /// The announcements attempted for one capture.
+        pub fn for_capture(&self, capture_id: &str) -> Vec<Announcement> {
+            self.announcements()
+                .into_iter()
+                .filter(|announcement| announcement.capture_id == capture_id)
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl TerminalAnnouncer for RecordingAnnouncer {
+        async fn announce(&self, message: &TerminalMessage) -> Result<()> {
+            self.announced
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(Announcement {
+                    header_name: message.header_name(),
+                    channel: message.channel(),
+                    event_id: message.event_id().to_string(),
+                    capture_id: message.body()["captureId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    correlation_id: message.correlation_id().to_string(),
+                });
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(CameraError::Messaging(
+                    "the local broker is not connected".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The terminal message kind one durable terminal state announces itself as.
+fn terminal_kind(state: JobState) -> Result<TerminalKind> {
+    match state {
+        JobState::Succeeded => Ok(TerminalKind::Captured),
+        JobState::Cancelled => Ok(TerminalKind::Cancelled),
+        JobState::Failed | JobState::Interrupted => Ok(TerminalKind::Failed),
+        _ => Err(CameraError::Catalog(
+            "terminal message requested for nonterminal state".to_string(),
+        )),
     }
 }
 
@@ -2037,21 +2207,20 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use bytes::Bytes;
-    use edgecommons::messaging::MessageBuilder;
     use serde_json::json;
     use tempfile::TempDir;
 
+    use super::testing::RecordingAnnouncer;
     use super::*;
     use crate::admission::FilesystemSpaceProbe;
     use crate::backend::{CameraSession, CameraStatus, CaptureRequest};
     use crate::catalog::{CatalogOptions, LedgerKey};
     use crate::config::ProfileOutputConfig;
     use crate::idempotency::RequestHash;
-    use crate::messages::TERMINAL_ENVELOPE_VERSION;
     use crate::model::OutputEncoding;
     use crate::storage::StorageRoot;
 
@@ -2242,29 +2411,21 @@ mod tests {
         }
     }
 
-    struct TestTerminalEncoder;
+    /// Counts what the engine told the runtime about each announcement.
+    #[derive(Default)]
+    struct AnnouncementHooks {
+        announced: AtomicUsize,
+        failed: AtomicUsize,
+    }
 
-    impl TerminalEnvelopeEncoder for TestTerminalEncoder {
-        fn encode(
-            &self,
-            message: &TerminalMessage,
-            created_at_ms: i64,
-        ) -> Result<NewOutboxMessage> {
-            let envelope = MessageBuilder::new(message.header_name(), TERMINAL_ENVELOPE_VERSION)
-                .correlation_id(message.correlation_id())
-                .structured_payload(message.body_value()?)
-                .build();
-            NewOutboxMessage::from_message(
-                message.body().event_id.clone(),
-                "terminal",
-                format!(
-                    "ecv1/test/camera-adapter/camera-a/app/{}",
-                    message.channel()
-                ),
-                &envelope,
-                created_at_ms,
-                created_at_ms,
-            )
+    #[async_trait]
+    impl JobHooks for AnnouncementHooks {
+        async fn terminal_announced(&self, _record: &JobRecord, _latency: Duration) {
+            self.announced.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn terminal_announcement_failed(&self, _record: &JobRecord, _error: &CameraError) {
+            self.failed.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -2315,7 +2476,19 @@ mod tests {
         }
     }
 
-    async fn engine() -> (JobEngine, TempDir) {
+    async fn engine() -> (JobEngine, TempDir, Arc<RecordingAnnouncer>) {
+        engine_with_announcer(
+            Arc::new(RecordingAnnouncer::default()),
+            Arc::new(NoopJobHooks),
+        )
+        .await
+    }
+
+    /// An engine whose announcements a test can see, and whose hooks it can count.
+    async fn engine_with_announcer(
+        announcer: Arc<RecordingAnnouncer>,
+        hooks: Arc<dyn JobHooks>,
+    ) -> (JobEngine, TempDir, Arc<RecordingAnnouncer>) {
         let directory = TempDir::new().unwrap();
         let output = directory.path().join("output");
         let state = directory.path().join("state");
@@ -2334,10 +2507,11 @@ mod tests {
                 catalog,
                 admission,
                 StorageRoot::open(&output).unwrap(),
-                Arc::new(TestTerminalEncoder),
-                Arc::new(NoopJobHooks),
+                Arc::clone(&announcer) as Arc<dyn TerminalAnnouncer>,
+                hooks,
             ),
             directory,
+            announcer,
         )
     }
 
@@ -2426,7 +2600,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stop_and_settle_bounds_a_hung_ptz_status_by_the_capture_deadline() {
-        let (engine, _directory) = engine().await;
+        let (engine, _directory, _announcer) = engine().await;
         let runtime = stop_and_settle_runtime(Duration::from_millis(100), 0);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut session = HungPtzSession {
@@ -2455,7 +2629,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stop_and_settle_cancels_a_hung_ptz_status_without_waiting_for_its_deadline() {
-        let (engine, _directory) = engine().await;
+        let (engine, _directory, _announcer) = engine().await;
         let runtime = stop_and_settle_runtime(Duration::from_secs(10), 0);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mut session = HungPtzSession {
@@ -2484,7 +2658,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stop_and_settle_bounds_the_post_stop_settle_delay_by_the_capture_deadline() {
-        let (engine, _directory) = engine().await;
+        let (engine, _directory, _announcer) = engine().await;
         let runtime = stop_and_settle_runtime(Duration::from_millis(100), 200);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let stop_seen = Arc::new(AtomicBool::new(false));
@@ -2520,7 +2694,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn deadline_helper_preserves_results_and_reports_cancellation_or_timeout() {
-        let (engine, _directory) = engine().await;
+        let (engine, _directory, _announcer) = engine().await;
         let cancellation = CancellationToken::new();
         assert_eq!(
             engine
@@ -2574,7 +2748,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_writes_preserve_profile_trigger_frame_and_failure_contracts() {
-        let (engine, _directory) = engine().await;
+        let (engine, _directory, _announcer) = engine().await;
         let now = Utc::now().timestamp_millis();
         let mut submission = command_submission("cap-terminal", now);
         submission.spec.trigger = CaptureTrigger::GroupCommand {
@@ -2686,7 +2860,7 @@ mod tests {
     /// the job they belong to.
     #[tokio::test]
     async fn a_capture_the_store_could_not_run_is_retired_without_killing_the_session() {
-        let (engine, _directory) = engine().await;
+        let (engine, _directory, _announcer) = engine().await;
         let now = Utc::now().timestamp_millis();
         let dispatcher = RecordingDispatcher::default();
         let accepted = engine
@@ -2732,7 +2906,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_acceptance_is_idempotent_and_active_cancellation_is_durable() {
-        let (engine, _directory) = engine().await;
+        let (engine, _directory, _announcer) = engine().await;
         let now = Utc::now().timestamp_millis();
         let dispatcher = RecordingDispatcher::default();
         let inserted = engine
@@ -2776,7 +2950,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserved_dispatch_failure_publishes_one_terminal_and_later_cancel_is_idempotent() {
-        let (engine, _directory) = engine().await;
+        let (engine, _directory, _announcer) = engine().await;
         let now = Utc::now().timestamp_millis();
         let dispatcher = RecordingDispatcher {
             descriptors: Arc::new(Mutex::new(Vec::new())),
@@ -2799,14 +2973,9 @@ mod tests {
         assert_eq!(terminal.state, JobState::Failed);
         assert_eq!(terminal.error_code.as_deref(), Some("QUEUE_FULL"));
         assert_eq!(
-            engine
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1_000, 10)
-                .await
-                .unwrap()
-                .len(),
+            _announcer.for_capture("cap-dispatch-failure").len(),
             1,
-            "the failure result must be published exactly once"
+            "the failure result must be announced exactly once"
         );
 
         let repeated_cancel = engine
@@ -2819,7 +2988,7 @@ mod tests {
 
     #[tokio::test]
     async fn preaccepted_queue_phase_uses_the_durable_row_and_cancellation_remains_durable() {
-        let (engine, _directory) = engine().await;
+        let (engine, _directory, _announcer) = engine().await;
         let now = Utc::now().timestamp_millis();
         let submission = command_submission("cap-preaccepted", now);
         assert!(matches!(
@@ -2856,19 +3025,15 @@ mod tests {
             .unwrap();
         assert_eq!(durable.state, JobState::Cancelled);
         assert_eq!(
-            engine
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1_000, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
+            _announcer.for_capture("cap-preaccepted").len(),
+            1,
+            "one won terminal, one announcement"
         );
     }
 
     #[tokio::test]
     async fn interrupted_recovery_rehydrates_command_profile_trigger_and_metadata() {
-        let (engine, _directory) = engine().await;
+        let (engine, _directory, _announcer) = engine().await;
         let now = Utc::now().timestamp_millis();
         let submission = command_submission("cap-recovery", now);
         engine.catalog.accept_job(submission.job).await.unwrap();
@@ -3052,7 +3217,7 @@ mod tests {
     /// actually landed, so a generic "interrupted" would be a guess published as a fact.
     #[tokio::test]
     async fn interruption_recovery_refuses_a_capture_that_is_over_or_owned_by_the_installer() {
-        let (engine, _directory) = engine().await;
+        let (engine, _directory, _announcer) = engine().await;
         let now = Utc::now().timestamp_millis();
         engine
             .catalog
@@ -3088,16 +3253,8 @@ mod tests {
         assert!(matches!(owned, CameraError::Catalog(_)));
         assert!(owned.to_string().contains("install-owned"));
 
-        // Exactly one terminal reached the outbox, which is the invariant all of the above protects.
-        assert_eq!(
-            engine
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1_000, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        // Exactly one terminal was announced, which is the invariant all of the above protects.
+        assert_eq!(_announcer.announcements().len(), 1);
     }
 
     /// A durable row the component cannot read is a catalog error, never a panic.
@@ -3110,7 +3267,7 @@ mod tests {
     /// never reach the point of quarantining the row that is killing it.
     #[tokio::test]
     async fn a_recovery_record_the_component_cannot_read_is_refused_field_by_field() {
-        let (engine, _directory) = engine().await;
+        let (engine, _directory, _announcer) = engine().await;
         let now = Utc::now().timestamp_millis();
         engine
             .catalog
@@ -3159,5 +3316,133 @@ mod tests {
                 "the refusal must name the field that could not be read; got: {error}"
             );
         }
+    }
+
+    /// An announcement that cannot be published is attempted EXACTLY ONCE, and never retried.
+    ///
+    /// This is the whole trade the durable outbox used to make in the other direction. There is no
+    /// queue behind the announcement any more, no backoff, and nothing that comes back for it later:
+    /// one attempt per terminal, and a failure is a WARN, a metric, and a shrug. A retry loop
+    /// creeping back in here would rebuild the outbox by accident -- in memory, unbounded.
+    #[tokio::test]
+    async fn a_failed_announcement_is_attempted_once_and_never_retried() {
+        let hooks = Arc::new(AnnouncementHooks::default());
+        let (engine, _directory, announcer) = engine_with_announcer(
+            Arc::new(RecordingAnnouncer::failing()),
+            Arc::clone(&hooks) as Arc<dyn JobHooks>,
+        )
+        .await;
+        let now = Utc::now().timestamp_millis();
+        let dispatcher = RecordingDispatcher::default();
+        engine
+            .accept_and_queue(&dispatcher, command_submission("cap-no-retry", now))
+            .await
+            .unwrap();
+
+        let cancelled = engine
+            .cancel_active("cap-no-retry", "operator cancelled")
+            .await
+            .unwrap();
+        assert!(cancelled.cancelled);
+
+        // Give any retry the engine might be hiding every chance to happen.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let attempts = announcer.for_capture("cap-no-retry");
+        assert_eq!(
+            attempts.len(),
+            1,
+            "one terminal is one announcement attempt, however badly it went: {attempts:?}"
+        );
+        assert_eq!(attempts[0].header_name, "ImageCaptureCancelled");
+        assert_eq!(
+            hooks.failed.load(Ordering::SeqCst),
+            1,
+            "the failure must be reported once, so it can be counted once"
+        );
+        assert_eq!(
+            hooks.announced.load(Ordering::SeqCst),
+            0,
+            "a publish that failed must never be reported as published"
+        );
+        // The capture is terminal and durable regardless of what the broker did.
+        let durable = engine.catalog.job("cap-no-retry").await.unwrap().unwrap();
+        assert_eq!(durable.state, JobState::Cancelled);
+        assert!(durable.terminal_result.is_some());
+    }
+
+    /// A publish failure never reaches the caller: the terminal commit succeeds, and so does the call.
+    ///
+    /// The engine's terminal paths return `Result`, and the announcement happens inside them. If the
+    /// announcement's error were ever propagated, a broker outage would turn every capture's terminal
+    /// into an error the runtime would then try to "handle" -- re-terminalizing a capture that is
+    /// already durably terminal.
+    #[tokio::test]
+    async fn a_publish_failure_never_becomes_the_captures_failure() {
+        let hooks = Arc::new(AnnouncementHooks::default());
+        let (engine, _directory, announcer) = engine_with_announcer(
+            Arc::new(RecordingAnnouncer::failing()),
+            Arc::clone(&hooks) as Arc<dyn JobHooks>,
+        )
+        .await;
+        let now = Utc::now().timestamp_millis();
+        let dispatcher = RecordingDispatcher::default();
+        engine
+            .accept_and_queue(&dispatcher, command_submission("cap-broker-down", now))
+            .await
+            .unwrap();
+
+        let record = engine
+            .interrupt_for_reload(
+                engine
+                    .catalog
+                    .job("cap-broker-down")
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .await
+            .expect("a broker that cannot be published to must not fail the terminal commit");
+
+        assert_eq!(record.state, JobState::Interrupted);
+        assert_eq!(record.error_code.as_deref(), Some("PROCESS_INTERRUPTED"));
+        assert_eq!(announcer.for_capture("cap-broker-down").len(), 1);
+        assert_eq!(hooks.failed.load(Ordering::SeqCst), 1);
+    }
+
+    /// A published announcement is reported as published, with the latency it took.
+    ///
+    /// `publishLatencyMs` is a contract measure of `southbound_health` (SOUTHBOUND §5) and this hook
+    /// is now its only source -- the confirmed-publish observer that used to feed it went with the
+    /// outbox.
+    #[tokio::test]
+    async fn a_published_announcement_is_reported_with_its_latency() {
+        let hooks = Arc::new(AnnouncementHooks::default());
+        let (engine, _directory, announcer) = engine_with_announcer(
+            Arc::new(RecordingAnnouncer::default()),
+            Arc::clone(&hooks) as Arc<dyn JobHooks>,
+        )
+        .await;
+        let now = Utc::now().timestamp_millis();
+        let dispatcher = RecordingDispatcher::default();
+        engine
+            .accept_and_queue(&dispatcher, command_submission("cap-announced", now))
+            .await
+            .unwrap();
+
+        engine
+            .cancel_active("cap-announced", "operator cancelled")
+            .await
+            .unwrap();
+
+        let announced = announcer.for_capture("cap-announced");
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].channel, "image/cancelled");
+        assert_eq!(
+            announced[0].correlation_id, "corr-1",
+            "the announcement is correlated to the request that asked for the capture"
+        );
+        assert_eq!(hooks.announced.load(Ordering::SeqCst), 1);
+        assert_eq!(hooks.failed.load(Ordering::SeqCst), 0);
     }
 }

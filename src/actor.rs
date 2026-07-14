@@ -517,7 +517,6 @@ mod tests {
 
     use async_trait::async_trait;
     use chrono::Utc;
-    use edgecommons::messaging::{Message, MessageBuilder};
     use serde_json::{Map, Value, json};
     use tempfile::TempDir;
 
@@ -529,7 +528,6 @@ mod tests {
     };
     use crate::catalog::{
         AcceptJobOutcome, Catalog, CatalogOptions, InstallOutcome, JobDeadlines, LedgerKey, NewJob,
-        NewOutboxMessage,
     };
     use crate::config::{
         BackendConfig, CaptureInterlock, CaptureProfile, OfflinePolicy, OutputConfig,
@@ -537,11 +535,12 @@ mod tests {
         SimPtzConfig,
     };
     use crate::idempotency::canonical_request_hash;
+    use crate::jobs::testing::RecordingAnnouncer;
     use crate::jobs::{
         AvailabilityGate, CaptureJobSpec, JobHooks, JobProfileSnapshot, JobSubmission,
-        TerminalEnvelopeEncoder,
+        TerminalAnnouncer,
     };
-    use crate::messages::{CameraSummary, CaptureTrigger, TerminalMessage};
+    use crate::messages::{CameraSummary, CaptureTrigger};
     use crate::model::{
         BackendKind, CameraCapabilities, CaptureFrame, CaptureMode, JobState, OutputEncoding,
         PixelFormat, PtzVector,
@@ -549,33 +548,6 @@ mod tests {
     use crate::storage::{
         InstallDecision, InstallGate, OutputPathVariables, StorageRoot, render_output_path,
     };
-
-    struct TestEnvelopeEncoder;
-
-    impl TerminalEnvelopeEncoder for TestEnvelopeEncoder {
-        fn encode(
-            &self,
-            terminal: &TerminalMessage,
-            created_at_ms: i64,
-        ) -> Result<NewOutboxMessage> {
-            let message = MessageBuilder::new(terminal.header_name(), "1.0")
-                .correlation_id(terminal.correlation_id())
-                .payload(terminal.body_value()?)
-                .build();
-            NewOutboxMessage::from_message(
-                terminal.body().event_id.clone(),
-                "terminal",
-                format!(
-                    "ecv1/device/camera-adapter/{}/app/{}",
-                    terminal.body().camera_id,
-                    terminal.channel()
-                ),
-                &message,
-                created_at_ms,
-                created_at_ms,
-            )
-        }
-    }
 
     #[derive(Default)]
     struct RecordingHooks {
@@ -743,6 +715,7 @@ mod tests {
         actor: CameraActor,
         handle: CameraActorHandle,
         hooks: Arc<RecordingHooks>,
+        announcer: Arc<RecordingAnnouncer>,
         pause: Option<Arc<PausingInstallGate>>,
         output: OutputConfig,
         _output_directory: TempDir,
@@ -775,11 +748,12 @@ mod tests {
                 .unwrap();
         let storage = StorageRoot::open(&output).unwrap();
         let hooks = Arc::new(RecordingHooks::default());
+        let announcer = Arc::new(RecordingAnnouncer::default());
         let mut engine = JobEngine::new(
             catalog.clone(),
             admission,
             storage,
-            Arc::new(TestEnvelopeEncoder),
+            Arc::clone(&announcer) as Arc<dyn TerminalAnnouncer>,
             hooks.clone(),
         );
         let pause = pause_install.then(|| {
@@ -818,6 +792,7 @@ mod tests {
             actor,
             handle,
             hooks,
+            announcer,
             pause,
             output,
             _output_directory: output_directory,
@@ -1016,8 +991,62 @@ mod tests {
         found
     }
 
+    /// A capture whose announcement cannot be published still SUCCEEDS, and the image is still there.
+    ///
+    /// This is the consequence of making the terminal announcement volatile, stated as an assertion:
+    /// the announcement is observability, and the capture is the product. A broker that is down costs
+    /// the announcement and NOTHING else -- not the image, not the sidecar, not the durable
+    /// SUCCEEDED that `sb/capture-status` answers with, and not the caller's reply.
     #[tokio::test]
-    async fn sim_capture_runs_end_to_end_with_sidecar_and_one_terminal_outbox() {
+    async fn a_capture_whose_announcement_cannot_be_published_still_succeeds() {
+        let harness = harness(sim(5, false, false), 2, 2, true, false).await;
+        harness.announcer.set_failing(true);
+        let shutdown = CancellationToken::new();
+        let actor_task = tokio::spawn(harness.actor.run(shutdown.clone()));
+        assert!(matches!(
+            harness
+                .engine
+                .accept_and_queue(
+                    &harness.handle,
+                    submission(&harness.output, "cap-broker-down", OutputEncoding::Png)
+                )
+                .await
+                .unwrap(),
+            AcceptJobOutcome::Inserted(_)
+        ));
+
+        let record = terminal(&harness.catalog, "cap-broker-down").await;
+        assert_eq!(
+            record.state,
+            JobState::Succeeded,
+            "a capture is not a publication: the broker was down, and the capture still happened"
+        );
+        assert!(record.error_code.is_none(), "the capture did not fail");
+        let body = record.terminal_result.as_ref().unwrap();
+        let image_path = body["image"]["absolutePath"].as_str().unwrap();
+        assert!(
+            Path::new(image_path).exists(),
+            "the image must be on disk whatever the broker did"
+        );
+        assert!(
+            Path::new(&format!("{image_path}.json")).exists(),
+            "the sidecar -- which IS the data path to file-replicator -- must be on disk too"
+        );
+        assert_eq!(
+            harness.announcer.for_capture("cap-broker-down").len(),
+            1,
+            "the announcement is attempted once, fails, and is dropped"
+        );
+        // The deferred caller is still settled: the reply comes from the durable terminal, not from
+        // the announcement.
+        assert_eq!(harness.hooks.waiters.load(Ordering::SeqCst), 1);
+
+        shutdown.cancel();
+        actor_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sim_capture_runs_end_to_end_with_sidecar_and_one_terminal_announcement() {
         let harness = harness(sim(5, false, false), 2, 2, true, false).await;
         let Harness {
             catalog,
@@ -1025,6 +1054,7 @@ mod tests {
             actor,
             handle,
             hooks,
+            announcer,
             output,
             _output_directory,
             _state_directory,
@@ -1051,13 +1081,17 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&sidecar_path).unwrap()).unwrap();
         assert_eq!(sidecar, *record.terminal_result.as_ref().unwrap());
         assert!(sidecar["timestamps"]["persistedAt"].is_string());
-        let outbox = catalog
-            .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-            .await
-            .unwrap();
-        assert_eq!(outbox.len(), 1);
-        let envelope = Message::from_slice(&outbox[0].encoded_envelope).unwrap();
-        assert_eq!(envelope.body, sidecar);
+        let announced = announcer.for_capture("cap-e2e");
+        assert_eq!(announced.len(), 1, "one terminal, one announcement");
+        assert_eq!(announced[0].header_name, "ImageCaptured");
+        assert_eq!(announced[0].channel, "image/captured");
+        assert_eq!(
+            announced[0].event_id,
+            record.terminal_result.as_ref().unwrap()["eventId"]
+                .as_str()
+                .unwrap(),
+            "the announcement carries the durable terminal body, not a rebuilt one"
+        );
         assert_eq!(hooks.waiters.load(Ordering::SeqCst), 1);
         shutdown.cancel();
         actor_task.await.unwrap().unwrap();
@@ -1087,15 +1121,9 @@ mod tests {
         assert_eq!(cancelled.state, JobState::Cancelled);
         let record = terminal(&harness.catalog, "cap-cancel").await;
         assert_eq!(record.state, JobState::Cancelled);
-        assert_eq!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        let announced = harness.announcer.for_capture("cap-cancel");
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].header_name, "ImageCaptureCancelled");
         shutdown.cancel();
         actor_task.await.unwrap().unwrap();
     }
@@ -1129,13 +1157,9 @@ mod tests {
             JobState::Succeeded
         );
         assert_eq!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
+            harness.announcer.for_capture("cap-install").len(),
+            1,
+            "the installation winner announces, and the cancellation that lost does not"
         );
         shutdown.cancel();
         actor_task.await.unwrap().unwrap();
@@ -1169,12 +1193,8 @@ mod tests {
         assert!(record.install_started);
         assert_eq!(record.state, JobState::Persisting);
         assert!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .is_empty()
+            harness.announcer.announcements().is_empty(),
+            "nothing is announced until a terminal is durable"
         );
         shutdown.cancel();
         actor_task.await.unwrap().unwrap();
@@ -1219,23 +1239,20 @@ mod tests {
                 .unwrap();
             assert_eq!(terminal.state, JobState::Succeeded);
             assert!(terminal.pending_success.is_none());
-            let outbox = harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap();
-            assert_eq!(outbox.len(), 1);
-            let envelope = Message::from_slice(&outbox[0].encoded_envelope).unwrap();
-            assert_eq!(envelope.body, terminal.terminal_result.clone().unwrap());
+            // The staged success belonged to a process that died before it could tell anyone. The
+            // recovery that commits it is the one that announces it -- rebuilt from the durable
+            // body, because the message the original process would have sent died with it.
+            let announced = harness.announcer.for_capture(capture_id);
+            assert_eq!(announced.len(), 1, "the recovered terminal is announced once");
+            let body = terminal.terminal_result.clone().unwrap();
+            assert_eq!(announced[0].header_name, "ImageCaptured");
+            assert_eq!(announced[0].event_id, body["eventId"].as_str().unwrap());
             if sidecar {
-                let image_path =
-                    terminal.terminal_result.as_ref().unwrap()["image"]["absolutePath"]
-                        .as_str()
-                        .unwrap();
+                let image_path = body["image"]["absolutePath"].as_str().unwrap();
                 let sidecar_body: Value =
                     serde_json::from_slice(&std::fs::read(format!("{image_path}.json")).unwrap())
                         .unwrap();
-                assert_eq!(sidecar_body, envelope.body);
+                assert_eq!(sidecar_body, body);
             }
             shutdown.cancel();
             actor_task.await.unwrap().unwrap();
@@ -1288,12 +1305,8 @@ mod tests {
         assert_eq!(retained.state, JobState::Persisting);
         assert!(retained.pending_success.is_some());
         assert!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .is_empty()
+            harness.announcer.announcements().is_empty(),
+            "a recovery that refused to commit must announce nothing"
         );
 
         shutdown.cancel();
@@ -1597,7 +1610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deterministic_sim_stage_failure_commits_one_failed_outbox() {
+    async fn deterministic_sim_stage_failure_commits_and_announces_one_failure() {
         let harness = harness(sim(1, true, false), 2, 2, false, false).await;
         let shutdown = CancellationToken::new();
         let actor_task = tokio::spawn(harness.actor.run(shutdown.clone()));
@@ -1616,15 +1629,10 @@ mod tests {
             record.terminal_result.as_ref().unwrap()["failure"]["stage"],
             "ACQUIRING"
         );
-        assert_eq!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        let announced = harness.announcer.for_capture("cap-fail");
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].header_name, "ImageCaptureFailed");
+        assert_eq!(announced[0].channel, "image/failed");
         shutdown.cancel();
         actor_task.await.unwrap().unwrap();
     }
@@ -1822,15 +1830,7 @@ mod tests {
         let record = terminal(&harness.catalog, "cap-panic").await;
         assert_eq!(record.state, JobState::Failed);
         assert_eq!(record.error_code.as_deref(), Some("BACKEND_ERROR"));
-        assert_eq!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(harness.announcer.for_capture("cap-panic").len(), 1);
     }
 
     #[tokio::test]
@@ -1855,15 +1855,11 @@ mod tests {
                 terminal(&harness.catalog, capture_id).await.state,
                 JobState::Cancelled
             );
+            assert_eq!(
+                harness.announcer.for_capture(capture_id).len(),
+                1,
+                "a capture cancelled by shutdown is still announced once"
+            );
         }
-        assert_eq!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .len(),
-            2
-        );
     }
 }

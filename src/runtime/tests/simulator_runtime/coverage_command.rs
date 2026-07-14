@@ -4248,7 +4248,7 @@ async fn candidate_validation_accepts_an_initial_generation_and_a_credential_fre
 
 /// A durable state directory that cannot be created fails startup rather than running without one.
 ///
-/// Everything the component promises -- idempotency, recovery, the outbox -- lives in that
+/// Everything the component promises -- idempotency, recovery, the terminal record -- lives in that
 /// directory. Starting without it would produce a component that accepts captures and forgets them,
 /// so the failure has to be an all-or-nothing startup failure and not a warning.
 #[tokio::test]

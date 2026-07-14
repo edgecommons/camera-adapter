@@ -2,19 +2,22 @@
 
 use super::*;
 
-/// Builds a runtime that owns a real component-level event facade, so the outbox observer and the
-/// storage-pressure alarm have somewhere to publish.
+/// Builds a runtime that owns a real component-level event facade, so the catalog-health observer
+/// and the storage-pressure and messaging alarms have somewhere to publish.
 ///
-/// The shared harness deliberately leaves `outbox_events` empty -- every test that used it asserted
-/// on durable state rather than on what an operator is told. The health/alarm planes are exactly the
-/// part where "what the operator is told" IS the contract, so they need the facade wired in.
+/// The shared harness deliberately leaves `component_events` empty -- every test that used it
+/// asserted on durable state rather than on what an operator is told. The health/alarm planes are
+/// exactly the part where "what the operator is told" IS the contract, so they need the facade
+/// wired in. The announcer is handed in too, because a broker that is down is a thing these tests
+/// have to be able to simulate.
 #[cfg(all(feature = "standalone", feature = "onvif"))]
-async fn runtime_with_outbox_events(
+async fn runtime_with_component_events(
     config: AdapterConfig,
     directory: &TempDir,
-    outbox_events: EventsFacade,
+    component_events: EventsFacade,
     storage_pressure: Option<StoragePressureMonitor>,
     readiness: RuntimeReadiness,
+    announcer: Arc<RecordingAnnouncer>,
 ) -> Arc<CameraRuntime> {
     let state = directory.path().join("state");
     std::fs::create_dir_all(&state).unwrap();
@@ -36,7 +39,7 @@ async fn runtime_with_outbox_events(
                 catalog.clone(),
                 admission.clone(),
                 storage.clone(),
-                Arc::new(TestTerminalEncoder),
+                Arc::clone(&announcer) as Arc<dyn crate::jobs::TerminalAnnouncer>,
                 Arc::clone(&waiters) as Arc<dyn JobHooks>,
             )
             .with_acceptance_hook(Arc::clone(&waiters) as Arc<dyn AcceptanceHook>),
@@ -51,9 +54,10 @@ async fn runtime_with_outbox_events(
         storage,
         registry,
         cameras: Arc::new(RwLock::new(new_slots(engines, BTreeMap::new()))),
-        outbox_events: Some(outbox_events),
+        component_events: Some(component_events),
         storage_pressure,
         storage_alarm: Arc::new(Mutex::new(StorageAlarmState::default())),
+        messaging_alarm: Arc::new(Mutex::new(MessagingAlarmState::default())),
         readiness,
         metrics: Arc::new(crate::observability::CaptureMetrics::new(Arc::new(
             RecordingMetrics::default(),
@@ -65,7 +69,6 @@ async fn runtime_with_outbox_events(
         scheduler,
         cancellation: CancellationToken::new(),
         tasks: Mutex::new(Vec::new()),
-        outbox_escalated: Arc::new(AtomicBool::new(false)),
         connect_gate: Arc::new(Semaphore::new(1)),
         waiters: Arc::clone(&waiters),
         cursors: CursorStore::default(),
@@ -81,18 +84,15 @@ async fn runtime_with_outbox_events(
     runtime
 }
 
-/// Commits one durable terminal message for `camera-b`, with the creation and availability clocks
-/// under the test's control.
+/// Commits one durable terminal for `camera-b`, with the terminal clock under the test's control.
 ///
-/// The outbox's pressure is a function of the age of its oldest undelivered row, so a backlog an
-/// assertion can rely on has to be *stamped* old rather than waited for: a test that slept out the
-/// sixty-second delay threshold would be a minute long and still racy.
+/// Retention is a function of how old a terminal is, so a record an assertion can rely on has to be
+/// *stamped* old rather than waited for.
 async fn stage_terminal_message(
     runtime: &CameraRuntime,
     configuration: &AdapterConfig,
     capture_id: &str,
-    created_at_ms: i64,
-    available_at_ms: i64,
+    terminal_at_ms: i64,
 ) {
     runtime
         .catalog
@@ -101,47 +101,33 @@ async fn stage_terminal_message(
         .unwrap();
     runtime
         .catalog
-        .queue_job(capture_id, created_at_ms)
+        .queue_job(capture_id, terminal_at_ms)
         .await
         .unwrap();
-    let event_key = format!("{capture_id}-terminal");
-    let message = MessageBuilder::new("ImageCaptureFailed", "1.0")
-        .correlation_id("correlation")
-        .structured_payload(json!({
-            "schemaVersion": 1,
-            "eventId": event_key,
-            "captureId": capture_id,
-            "cameraId": "camera-b",
-            "correlationId": "correlation",
-        }))
-        .build();
-    let outbox = crate::catalog::NewOutboxMessage::from_message(
-        event_key,
-        "terminal",
-        "ecv1/gw-01/camera-adapter/camera-b/app/image/failed",
-        &message,
-        created_at_ms,
-        available_at_ms,
-    )
-    .unwrap();
     let outcome = runtime
         .catalog
         .commit_terminal(
             capture_id,
             crate::catalog::TerminalWrite {
                 state: crate::model::JobState::Failed,
-                result: json!({ "state": "FAILED" }),
+                result: json!({
+                    "schemaVersion": 1,
+                    "eventId": format!("{capture_id}-terminal"),
+                    "captureId": capture_id,
+                    "cameraId": "camera-b",
+                    "correlationId": "correlation",
+                    "state": "FAILED",
+                }),
                 error_code: Some("PROCESS_INTERRUPTED".to_string()),
                 error_message: Some("staged by the supervision coverage suite".to_string()),
-                terminal_at_ms: created_at_ms,
-                outbox,
+                terminal_at_ms,
             },
         )
         .await
         .unwrap();
     assert!(
         matches!(outcome, crate::catalog::TerminalOutcome::Won(_)),
-        "the staged terminal message must be durably committed"
+        "the staged terminal must be durably committed"
     );
 }
 
@@ -208,106 +194,114 @@ async fn await_supervisor_exit(finished: &CancellationToken) {
         .expect("the supervisor generation must finish");
 }
 
-/// A backlog older than the outbox's delay threshold raises the delivery alarm, escalates acceptance
-/// back-pressure, and both are withdrawn once the backlog drains.
+/// A broker that is down degrades messaging, and the component says so ONCE -- while it keeps
+/// capturing, keeps persisting, and keeps succeeding.
 ///
-/// This is the whole point of the health observer: an operator finds out that terminal results are
-/// stuck *before* the retention window eats them, and the component stops accepting work it cannot
-/// deliver. A raise with no matching clear is worse than no alarm at all -- it trains the operator to
-/// ignore it -- so the clear is asserted on the same footing as the raise.
+/// This is the trade the durable outbox used to hide. The announcement is volatile now: a publish
+/// that fails is logged, counted, and dropped. What must NOT happen is the component treating that
+/// as a reason to stop: the capture is on disk and SUCCEEDED in the catalog, and `sb/capture-status`
+/// answers for it. The alarm is what tells the operator announcements are being lost, and it clears
+/// as soon as one gets through.
 #[cfg(all(feature = "standalone", feature = "onvif"))]
 #[tokio::test]
-async fn a_stalled_outbox_raises_a_delivery_alarm_and_withdraws_it_once_the_backlog_drains() {
+async fn a_broker_that_is_down_degrades_messaging_and_never_stops_the_captures() {
     let directory = TempDir::new().unwrap();
     let (port, publishes) = spawn_recording_mqtt_broker().await;
     let core = facade_core(&directory, port).await;
-    let mut configuration = config(directory.path(), &["camera-a", "camera-b"], false);
-    // One undelivered message is then already 80% of the durable result capacity, which is the
-    // escalation condition. The alternative is staging eight hundred rows to say the same thing.
-    configuration.global.state.max_result_records = 1;
-    let runtime = runtime_with_outbox_events(
-        configuration.clone(),
+    let configuration = config(directory.path(), &["camera-a"], false);
+    let announcer = Arc::new(RecordingAnnouncer::failing());
+    let runtime = runtime_with_component_events(
+        configuration,
         &directory,
         core.events(),
         None,
         RuntimeReadiness::noop(),
+        Arc::clone(&announcer),
     )
     .await;
-    let now = chrono::Utc::now().timestamp_millis();
-    // Created ten minutes ago, and not due for another attempt for an hour: a stable backlog that
-    // the publisher will not deliver out from under the assertions.
-    stage_terminal_message(
-        &runtime,
-        &configuration,
-        "cap-outbox-stalled",
-        now - 600_000,
-        now + 3_600_000,
-    )
-    .await;
-
     runtime
-        .start_outbox(core.messaging().unwrap())
-        .expect("the outbox worker and its health observer must start");
+        .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+        .unwrap();
+    wait_for_online(&runtime, "camera-a").await;
 
-    let raised = wait_for_alarm(&publishes, "/evt/warning/message-delivery-delayed", true).await;
+    // Three captures, every announcement failing.
+    for request in ["degraded-1", "degraded-2", "degraded-3"] {
+        let accepted = runtime
+            .submit_capture(
+                "camera-a".to_string(),
+                request.to_string(),
+                None,
+                None,
+                serde_json::Map::new(),
+                format!("{request}-correlation"),
+                "sb/capture-submit",
+                crate::admission::CapturePriority::Submitted,
+            )
+            .await
+            .expect("a broker that is down must never reject a capture");
+        let crate::catalog::AcceptJobOutcome::Inserted(record) = accepted else {
+            panic!("each capture must be newly accepted while messaging is degraded");
+        };
+        let terminal = wait_for_terminal(&runtime, &record.capture_id).await;
+        assert_eq!(
+            terminal.state,
+            crate::model::JobState::Succeeded,
+            "a capture whose announcement failed is still a capture that SUCCEEDED"
+        );
+        assert!(
+            terminal.terminal_result.is_some(),
+            "the durable terminal body must be retained, since it is now the only record"
+        );
+    }
     assert_eq!(
-        raised["alarm"],
-        json!(true),
-        "a raise must be a stateful alarm"
+        announcer.announcements().len(),
+        3,
+        "each terminal is announced exactly once -- attempted, failed, and never retried"
     );
+
+    let raised = wait_for_alarm(&publishes, "/evt/warning/message-publish-degraded", true).await;
+    assert_eq!(raised["alarm"], json!(true), "a raise must be stateful");
     assert_eq!(raised["severity"], json!("warning"));
-    assert_eq!(raised["type"], json!("message-delivery-delayed"));
+    assert_eq!(raised["type"], json!("message-publish-degraded"));
+    assert_eq!(raised["context"]["instance"], json!("camera-a"));
+    let raises = publishes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(topic, _)| topic.ends_with("/evt/warning/message-publish-degraded"))
+        .count();
     assert_eq!(
-        raised["context"]["pending"],
-        json!(1),
-        "the alarm must report the backlog it is alarming on"
+        raises, 1,
+        "three lost announcements are ONE degradation, not three alarms"
     );
-    assert!(
-        raised["context"]["oldestAgeMs"].as_u64().unwrap() >= 60_000,
-        "the alarm must only fire once the oldest message is past the delay threshold"
-    );
-    wait_until(
-        "a delayed backlog at capacity must escalate acceptance back-pressure",
-        || runtime.outbox_escalated.load(Ordering::Acquire),
-    )
-    .await;
 
-    let pending = runtime
-        .catalog
-        .pending_outbox(now + 7_200_000, 10)
+    // The broker comes back.
+    announcer.set_failing(false);
+    let accepted = runtime
+        .submit_capture(
+            "camera-a".to_string(),
+            "recovered".to_string(),
+            None,
+            None,
+            serde_json::Map::new(),
+            "recovered-correlation".to_string(),
+            "sb/capture-submit",
+            crate::admission::CapturePriority::Submitted,
+        )
         .await
         .unwrap();
-    assert_eq!(
-        pending.len(),
-        1,
-        "exactly the staged message must be pending"
-    );
-    assert!(
-        runtime
-            .catalog
-            .mark_outbox_delivered(pending[0].id, chrono::Utc::now().timestamp_millis())
-            .await
-            .unwrap(),
-        "the staged message must be markable as delivered"
-    );
-
-    let cleared = wait_for_alarm(&publishes, "/evt/warning/message-delivery-delayed", false).await;
+    let crate::catalog::AcceptJobOutcome::Inserted(record) = accepted else {
+        panic!("the capture after recovery must be newly accepted");
+    };
+    let terminal = wait_for_terminal(&runtime, &record.capture_id).await;
+    assert_eq!(terminal.state, crate::model::JobState::Succeeded);
+    let cleared = wait_for_alarm(&publishes, "/evt/warning/message-publish-degraded", false).await;
     assert_eq!(cleared["alarm"], json!(true));
-    assert_eq!(cleared["type"], json!("message-delivery-delayed"));
-    assert_eq!(
-        cleared["context"]["pending"],
-        json!(0),
-        "the clear must report the drained backlog"
-    );
-    wait_until(
-        "a drained outbox must withdraw acceptance back-pressure",
-        || !runtime.outbox_escalated.load(Ordering::Acquire),
-    )
-    .await;
+    assert_eq!(cleared["type"], json!("message-publish-degraded"));
     runtime.shutdown().await;
 }
 
-/// A catalog that reports its durable state lost closes readiness, and the outbox observer probes it
+/// A catalog that reports its durable state lost closes readiness, and the health observer probes it
 /// until a write commits again -- which is the only thing that reopens readiness.
 ///
 /// Readiness is the component's answer to "may I be sent work". A durable store that failed and then
@@ -330,17 +324,18 @@ async fn a_catalog_that_lost_its_durable_state_is_probed_until_it_commits_and_re
             transitions.lock().unwrap().push(value);
         }))
     };
-    let runtime = runtime_with_outbox_events(
+    let runtime = runtime_with_component_events(
         configuration.clone(),
         &directory,
         core.events(),
         None,
         readiness.clone(),
+        Arc::new(RecordingAnnouncer::default()),
     )
     .await;
     runtime
-        .start_outbox(core.messaging().unwrap())
-        .expect("the outbox worker and its health observer must start");
+        .start_catalog_health()
+        .expect("the catalog health observer must start");
     readiness.complete_startup();
     assert_eq!(
         transitions.lock().unwrap().as_slice(),
@@ -402,12 +397,13 @@ async fn a_storage_root_that_cannot_admit_work_raises_one_alarm_and_clears_it_on
             pressured: Arc::clone(&pressured),
         }),
     );
-    let runtime = runtime_with_outbox_events(
+    let runtime = runtime_with_component_events(
         configuration,
         &directory,
         core.events(),
         Some(monitor),
         RuntimeReadiness::noop(),
+        Arc::new(RecordingAnnouncer::default()),
     )
     .await;
 
@@ -460,28 +456,18 @@ async fn a_storage_root_that_cannot_admit_work_raises_one_alarm_and_clears_it_on
     runtime.shutdown().await;
 }
 
-/// Retention reclaims a delivered outbox row and only then the terminal job behind it.
+/// Retention reclaims a terminal job once it is past its result-retention window.
 ///
-/// The order is the contract: a terminal job is retained until its own messages are gone, so a sweep
-/// that dropped the job first would strand a message whose durable job no longer exists.
+/// Nothing holds the job back any more: it used to be retained until its own durable message had
+/// been delivered and then itself reclaimed, and there are no durable messages left.
 #[tokio::test]
-async fn retention_reclaims_a_delivered_message_and_then_the_terminal_job_behind_it() {
+async fn retention_reclaims_a_terminal_job_past_its_window() {
     let directory = TempDir::new().unwrap();
     let configuration = config(directory.path(), &["camera-a", "camera-b"], false);
     let runtime = runtime(configuration.clone(), &directory).await;
     let long_ago = chrono::Utc::now().timestamp_millis() - 30 * 24 * 3_600_000;
-    stage_terminal_message(&runtime, &configuration, "cap-retention", long_ago, long_ago).await;
-    let pending = runtime
-        .catalog
-        .pending_outbox(chrono::Utc::now().timestamp_millis(), 10)
-        .await
-        .unwrap();
-    assert_eq!(pending.len(), 1);
-    runtime
-        .catalog
-        .mark_outbox_delivered(pending[0].id, long_ago)
-        .await
-        .unwrap();
+    stage_terminal_message(&runtime, &configuration, "cap-retention", long_ago).await;
+    assert!(runtime.catalog.job("cap-retention").await.unwrap().is_some());
 
     let cancellation = CancellationToken::new();
     let sweeper = Arc::clone(&runtime);
@@ -507,19 +493,10 @@ async fn retention_reclaims_a_delivered_message_and_then_the_terminal_job_behind
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "retention never reclaimed the delivered message and its terminal job"
+            "retention never reclaimed the terminal job past its window"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(
-        runtime
-            .catalog
-            .pending_outbox(chrono::Utc::now().timestamp_millis(), 10)
-            .await
-            .unwrap()
-            .is_empty(),
-        "the delivered message must be reclaimed with its job"
-    );
 
     cancellation.cancel();
     tokio::time::timeout(Duration::from_secs(5), sweeping)
@@ -656,24 +633,19 @@ async fn a_supervisor_cannot_be_started_for_a_camera_that_is_not_configured() {
     runtime.shutdown().await;
 }
 
-/// The outbox refuses to start without the event facade its health alarms publish through, rather
-/// than running a delivery worker whose stalls nobody could ever be told about.
-#[cfg(all(feature = "standalone", feature = "onvif"))]
+/// The health observer refuses to start without the event facade its alarms publish through, rather
+/// than watching a durable store whose failures nobody could ever be told about.
 #[tokio::test]
-async fn the_outbox_refuses_to_start_without_the_event_facade_its_alarms_need() {
+async fn the_health_observer_refuses_to_start_without_the_event_facade_its_alarms_need() {
     let directory = TempDir::new().unwrap();
-    let (port, _publishes) = spawn_recording_mqtt_broker().await;
-    let core = facade_core(&directory, port).await;
     // The shared harness runtime is built without a component event facade.
     let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
 
-    let error = runtime
-        .start_outbox(core.messaging().unwrap())
-        .unwrap_err();
+    let error = runtime.start_catalog_health().unwrap_err();
 
     assert!(
         matches!(&error, crate::CameraError::Catalog(message) if message.contains("events facade")),
-        "the outbox must refuse to run without somewhere to raise its health alarms, got {error:?}"
+        "the observer must refuse to run without somewhere to raise its alarms, got {error:?}"
     );
     runtime.shutdown().await;
 }
@@ -732,22 +704,19 @@ async fn a_camera_whose_actor_cannot_be_built_is_held_in_backoff_and_retried() {
     runtime.shutdown().await;
 }
 
-/// An encoder that panics while a capture is being finished takes down that camera's session only --
-/// the supervisor marks it BACKOFF and reconnects it on a new generation.
+/// An announcer that panics while a capture is being finished takes down that camera's session only
+/// -- the supervisor marks it BACKOFF and reconnects it on a new generation.
 ///
 /// Panic isolation is the whole reason the actor owns the session. A panic that escaped would take
 /// the process, and every other camera in the fleet, with it.
 #[tokio::test]
 async fn a_panic_while_finishing_a_capture_is_isolated_to_its_own_camera() {
-    struct PanickingEncoder;
+    struct PanickingAnnouncer;
 
-    impl crate::jobs::TerminalEnvelopeEncoder for PanickingEncoder {
-        fn encode(
-            &self,
-            _terminal: &crate::messages::TerminalMessage,
-            _created_at_ms: i64,
-        ) -> Result<crate::catalog::NewOutboxMessage> {
-            panic!("the terminal encoder panicked inside the camera actor");
+    #[async_trait::async_trait]
+    impl crate::jobs::TerminalAnnouncer for PanickingAnnouncer {
+        async fn announce(&self, _message: &crate::messages::TerminalMessage) -> Result<()> {
+            panic!("the terminal announcer panicked inside the camera actor");
         }
     }
 
@@ -762,7 +731,7 @@ async fn a_panic_while_finishing_a_capture_is_isolated_to_its_own_camera() {
         runtime.catalog.clone(),
         runtime.admission.clone(),
         runtime.storage.clone(),
-        Arc::new(PanickingEncoder),
+        Arc::new(PanickingAnnouncer),
         Arc::clone(&runtime.waiters) as Arc<dyn JobHooks>,
     );
     runtime

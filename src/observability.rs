@@ -86,7 +86,7 @@ impl ReadinessSnapshot {
         blockers
     }
 
-    /// Readiness does not depend on every camera being online or on outbox count alone.
+    /// Readiness does not depend on every camera being online, nor on the messaging plane.
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.blockers().is_empty()
@@ -154,7 +154,7 @@ impl ReadinessTracker {
 pub struct SouthboundHealthSample {
     /// One when the current camera session is online, otherwise zero.
     pub connection_state: u8,
-    /// Last terminal application-message publication latency.
+    /// Time the last terminal announcement took to reach the transport.
     pub publish_latency_ms: Option<u64>,
     /// Last capture/status round-trip latency.
     pub poll_latency_ms: Option<u64>,
@@ -197,7 +197,7 @@ impl CameraHealthTracker {
         self.poll_latency_ms = Some(duration_millis(poll_latency));
     }
 
-    /// Records confirmed terminal-message publication latency.
+    /// Records how long the last terminal announcement took to reach the transport.
     pub fn observe_publish(&mut self, latency: Duration) {
         self.publish_latency_ms = Some(duration_millis(latency));
     }
@@ -279,7 +279,11 @@ impl FleetHealth {
         self.observe(instance, CameraHealthTracker::observe_reconnect);
     }
 
-    /// A terminal message for this camera reached the transport, this long after it was written.
+    /// A terminal announcement for this camera reached the transport, and this is how long it took.
+    ///
+    /// The measurement is the time to hand the message to the transport, because that is all a
+    /// fire-and-forget publication can honestly claim to know: nothing waits for a broker
+    /// acknowledgement any more, so there is no delivery time to report.
     pub fn observed_publish(&self, instance: &str, latency: Duration) {
         self.observe(instance, |tracker| tracker.observe_publish(latency));
     }
@@ -309,12 +313,6 @@ impl FleetHealth {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(instance);
-    }
-}
-
-impl crate::outbox::PublishObserver for FleetHealth {
-    fn observed_publish(&self, instance: &str, latency: Duration) {
-        Self::observed_publish(self, instance, latency);
     }
 }
 
@@ -349,6 +347,12 @@ pub const CAPTURE_METRIC: &str = "camera_captures";
 pub const QUEUE_METRIC: &str = "camera_queue";
 /// The standard per-instance southbound metric every adapter in the ecosystem emits.
 pub const HEALTH_METRIC: &str = "southbound_health";
+/// Terminal results that are durable but were never announced.
+///
+/// The announcement is best-effort, so a broker that is down costs announcements and nothing else.
+/// This is how many were lost -- the only place that loss is visible, and the reason it is a measure
+/// on `camera_captures` rather than a log line nobody aggregates.
+pub const ANNOUNCEMENT_FAILED_MEASURE: &str = "announcementFailed";
 
 impl CaptureMetrics {
     /// Defines both metrics against the component's metric service.
@@ -362,6 +366,7 @@ impl CaptureMetrics {
                 .add_measure("failed", "Count", 60)
                 .add_measure("cancelled", "Count", 60)
                 .add_measure("interrupted", "Count", 60)
+                .add_measure(ANNOUNCEMENT_FAILED_MEASURE, "Count", 60)
                 .build(),
         );
         metrics.define_metric(
@@ -856,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_requires_every_startup_gate_but_not_camera_connectivity_or_outbox_count() {
+    fn readiness_requires_every_startup_gate_but_not_camera_connectivity() {
         let snapshot = ready();
         assert!(snapshot.is_ready());
         assert!(snapshot.blockers().is_empty());

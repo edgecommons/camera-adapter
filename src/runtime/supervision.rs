@@ -2,14 +2,14 @@
 //!
 //! One supervisor per camera -- connect, back off, hold the actor, retire -- plus the periodic
 //! workers that are nobody's command: the metric sampler, the fleet capture scheduler, storage
-//! pressure, retention, the outbox, and startup recovery.
+//! pressure, retention, catalog health, and startup recovery.
 
 use super::*;
 
 impl CameraRuntime {
 
-    /// Starts cooperative shutdown.  Pending outbox rows remain durable; tasks are joined only
-    /// within the configured grace period so the process cannot hang behind a native backend.
+    /// Starts cooperative shutdown.  Tasks are joined only within the configured grace period so the
+    /// process cannot hang behind a native backend.
     pub async fn shutdown(&self) {
         self.readiness.begin_shutdown();
         // DESIGN 20.2 step 2, and it has to happen HERE -- before the cancellation, while the actors
@@ -437,7 +437,6 @@ impl CameraRuntime {
                 .await
             {
                 Ok(sweep) if sweep.reclaimed() > 0 => tracing::info!(
-                    delivered_outbox = sweep.delivered_outbox,
                     terminal_jobs = sweep.terminal_jobs,
                     terminal_groups = sweep.terminal_groups,
                     command_ledgers = sweep.command_ledgers,
@@ -456,9 +455,6 @@ impl CameraRuntime {
 
 
     /// Runs one full retention pass and reports what it reclaimed.
-    ///
-    /// Delivered outbox rows are reclaimed first because a terminal job or group only becomes
-    /// eligible once its own retained messages are gone.
     pub(super) async fn retention_sweep(
         &self,
         now_ms: i64,
@@ -467,16 +463,10 @@ impl CameraRuntime {
     ) -> Result<RetentionSweep> {
         let config = self.config_snapshot()?;
         let state = &config.global.state;
-        let outbox_before_ms =
-            now_ms.saturating_sub(i64::from(state.outbox_retention_hours) * MILLIS_PER_HOUR);
         let terminal_before_ms =
             now_ms.saturating_sub(i64::from(state.result_retention_hours) * MILLIS_PER_HOUR);
         let catalog = &self.catalog;
         Ok(RetentionSweep {
-            delivered_outbox: prune_in_batches(cancellation, batch, |limit| {
-                catalog.prune_delivered_outbox(outbox_before_ms, limit)
-            })
-            .await?,
             terminal_jobs: prune_in_batches(cancellation, batch, |limit| {
                 catalog.prune_terminal_jobs(terminal_before_ms, limit)
             })
@@ -497,38 +487,27 @@ impl CameraRuntime {
     }
 
 
-    pub(super) fn start_outbox(
-        self: &Arc<Self>,
-        messaging: Arc<dyn edgecommons::messaging::MessagingService>,
-    ) -> Result<()> {
-        let config = self.config_snapshot()?;
-        let publisher = OutboxPublisher::new(
-            Arc::new(self.catalog.clone()),
-            Arc::new(EdgeCommonsConfirmedPublisher::new(messaging)),
-            Duration::from_secs(10),
-            Duration::from_millis(250),
-            config.global.state.max_result_records,
-        )?
-        .with_publish_observer(Arc::clone(&self.health) as Arc<dyn crate::outbox::PublishObserver>);
-        let events = self.outbox_events.clone().ok_or_else(|| {
+    /// Watches the durable catalog: readiness follows it, and a disk-full failure re-assesses
+    /// storage pressure so the operator sees the cause rather than the symptom.
+    ///
+    /// This was the outbox worker's observer loop. The outbox is gone; the catalog is not, and it is
+    /// the only thing here that readiness ever depended on -- a broker that is down never belonged
+    /// in a durable-state readiness gate.
+    pub(super) fn start_catalog_health(self: &Arc<Self>) -> Result<()> {
+        let events = self.component_events.clone().ok_or_else(|| {
             crate::CameraError::Catalog(
-                "missing component events facade for outbox health".to_string(),
+                "missing component events facade for catalog health".to_string(),
             )
         })?;
         let readiness = self.readiness.clone();
-        let watchers = OutboxHealthWatchers {
-            pressure: publisher.pressure(),
-            durability: publisher.durability(),
-            catalog_availability: self.catalog.availability(),
-            escalated: Arc::clone(&self.outbox_escalated),
-        };
+        let availability = self.catalog.availability();
         let catalog = self.catalog.clone();
         let storage_pressure = self.storage_pressure.clone();
         let storage_alarm = Arc::clone(&self.storage_alarm);
         let observer_cancellation = self.cancellation.clone();
         self.spawn_task(async move {
-            Self::observe_outbox_health(
-                watchers,
+            Self::observe_catalog_health(
+                availability,
                 catalog,
                 events,
                 storage_pressure,
@@ -537,19 +516,12 @@ impl CameraRuntime {
                 observer_cancellation,
             )
             .await;
-        })?;
-
-        let cancellation = self.cancellation.clone();
-        self.spawn_task(async move {
-            if let Err(error) = publisher.run(cancellation).await {
-                tracing::error!(error = %error, "camera outbox worker stopped unexpectedly");
-            }
         })
     }
 
 
-    async fn observe_outbox_health(
-        mut watchers: OutboxHealthWatchers,
+    async fn observe_catalog_health(
+        mut catalog_availability: watch::Receiver<crate::catalog::CatalogAvailability>,
         catalog: Catalog,
         events: EventsFacade,
         storage_pressure: Option<StoragePressureMonitor>,
@@ -557,53 +529,17 @@ impl CameraRuntime {
         readiness: RuntimeReadiness,
         cancellation: CancellationToken,
     ) {
-        let mut alarms = OutboxAlarmState::default();
-        let mut catalog_unavailable = !watchers
-            .catalog_availability
-            .borrow()
-            .state_capacity_available;
+        let mut catalog_unavailable = !catalog_availability.borrow().state_capacity_available;
         let mut recovery_probe = tokio::time::interval(Duration::from_secs(1));
         recovery_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => return,
-                changed = watchers.pressure.changed() => {
+                changed = catalog_availability.changed() => {
                     if changed.is_err() {
                         return;
                     }
-                    let current = watchers.pressure.borrow_and_update().clone();
-                    watchers.escalated.store(current.escalated, Ordering::Release);
-                    if let Some(transition) = alarms.transition(&current) {
-                        let result = match transition {
-                            OutboxAlarmTransition::Raise(context) => events.raise_alarm(
-                                Severity::Warning,
-                                "message-delivery-delayed",
-                                Some("durable terminal-message delivery is delayed".to_string()),
-                                Some(context),
-                            ).await,
-                            OutboxAlarmTransition::Clear(context) => events.clear_alarm(
-                                Severity::Warning,
-                                "message-delivery-delayed",
-                                Some(context),
-                            ).await,
-                        };
-                        if let Err(error) = result {
-                            tracing::warn!(error = %error, "failed to publish outbox delivery-health alarm");
-                        }
-                    }
-                }
-                changed = watchers.durability.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                    let current = *watchers.durability.borrow_and_update();
-                    readiness.set_outbox_available(current.state_capacity_available);
-                }
-                changed = watchers.catalog_availability.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                    let current = *watchers.catalog_availability.borrow_and_update();
+                    let current = *catalog_availability.borrow_and_update();
                     catalog_unavailable = !current.state_capacity_available;
                     readiness.set_catalog_available(current.state_capacity_available);
                     if current.disk_full {

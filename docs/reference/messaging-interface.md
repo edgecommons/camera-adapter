@@ -33,8 +33,16 @@ completion is an application message, not an operator event: its body includes s
 event and capture IDs, camera ID, original correlation ID, trigger, effective profile/mode, timestamps,
 durations, optional output path/checksum/size, metadata, and a stable failure summary when unsuccessful.
 
-The outbox preserves one encoded terminal envelope through retry. Consumers must tolerate at-least-once
-delivery by deduplicating its stable event ID.
+A terminal message is an announcement, not a delivery. It is published once, best effort, after the
+terminal state is durably committed, and it is never retried. It is lost when the broker or IPC transport
+is unavailable, and when the component stops between the commit and the publish. The capture itself is
+unaffected: the image and its sidecar are on disk, the catalog holds the terminal state, and
+`sb/capture-status` answers for it — that pair, not the message, is authoritative. A consumer that must
+not miss an outcome polls `sb/capture-status` rather than relying on the announcement.
+
+The announcement carries the terminal body the catalog committed, `eventId` included. `sb/capture-status`
+reports that same body, so a result read from status and a result received as a message agree field for
+field.
 
 ## Queue depth and the break-glass drain
 
@@ -74,8 +82,8 @@ The facade supplies the standard `evt` envelope body and routes to
 request metadata, correlation IDs, output paths, image data, and backend/device details. Publication is
 detached from capture admission and acquisition, bounded to five seconds, and capped at 64 concurrent
 diagnostic sends; saturation drops the diagnostic rather than delaying a capture. Failure is logged but
-cannot reject, retry, or reclassify a capture. Terminal completion remains the
-durable `app/image/{captured|failed|cancelled}` contract and is never emitted as an operator lifecycle
+cannot reject, retry, or reclassify a capture. Terminal completion is announced on the
+`app/image/{captured|failed|cancelled}` contract and is never emitted as an operator lifecycle
 event.
 
 ## Terminal application messages
@@ -107,11 +115,13 @@ The public error `code` is one of `INSTANCE_REQUIRED`, `UNKNOWN_INSTANCE`, `CAME
 `PERSISTENCE_FAILED`, `PTZ_DISABLED`, `PTZ_RANGE_ERROR`, `PTZ_TIMEOUT`, `COMPONENT_STOPPING`, or
 `BACKEND_ERROR`. Clients should branch on `code`, not the sanitized human-readable message.
 
-`RESOURCE_LIMIT` on a capture submission means the component is shedding load: its outbox backlog has escalated, so it is refusing new captures until it can publish the results it already owes. It accepts work again as soon as the backlog drains.
+`STORAGE_PRESSURE` on a capture submission means the output or state root is below its configured
+free-space floor, or cannot be read. The component refuses new captures until that root recovers; a
+broker it cannot reach never has this effect, because messaging is not what a capture consumes.
 
 ## Operator events
 
 `schedule-skipped` is a warning event emitted for a scheduled capture skipped because the camera is
 moving. It contains the camera/schedule occurrence context, not image bytes or credentials. Component
-alarms `storage-low` and `message-delivery-delayed` are documented in the
+alarms `storage-low` and `message-publish-degraded` are documented in the
 [metrics reference](metrics.md). Capture lifecycle diagnostics are documented above.

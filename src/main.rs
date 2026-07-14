@@ -100,10 +100,9 @@ async fn main() -> anyhow::Result<()> {
         RuntimeServices {
             apps,
             events,
-            outbox_events: gg.events(),
+            component_events: gg.events(),
             readiness: readiness.clone(),
             backend_context,
-            messaging: gg.messaging()?,
             metrics: gg.metrics(),
         },
     )

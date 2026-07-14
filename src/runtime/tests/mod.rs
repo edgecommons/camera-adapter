@@ -215,42 +215,29 @@ fn job_cursor_binds_filters_and_preserves_typed_tuple() {
     );
 }
 
+/// A messaging outage raises ONE alarm, however many announcements it eats -- and clears once.
+///
+/// The alarm is a condition, not an event. A fleet of 256 cameras failing to announce every capture
+/// while a broker is down must not mint an alarm per capture.
 #[test]
-fn delayed_outbox_alarm_transitions_once_and_keeps_context_bounded() {
-    let mut state = OutboxAlarmState::default();
-    let delayed = OutboxPressure {
-        pending: 101,
-        oldest_age_ms: 61_000,
-        max_attempts: 4,
-        delayed: true,
-        escalated: false,
-        last_error: Some("transport confirmation failed or remained ambiguous".to_string()),
-    };
-    let Some(OutboxAlarmTransition::Raise(context)) = state.transition(&delayed) else {
-        panic!("a delayed outbox must raise exactly one alarm");
-    };
-    assert_eq!(context["pending"], 101);
-    assert_eq!(context["oldestAgeMs"], 61_000);
-    assert_eq!(context["maxAttempts"], 4);
+fn the_messaging_alarm_transitions_once_per_change_and_not_once_per_capture() {
+    let mut state = MessagingAlarmState::default();
     assert_eq!(
-        context["lastError"],
-        "transport confirmation failed or remained ambiguous"
+        state.transition(true),
+        Some(MessagingAlarmTransition::Degraded)
     );
-    assert!(state.transition(&delayed).is_none());
-
-    let cleared = OutboxPressure::default();
-    let Some(OutboxAlarmTransition::Clear(context)) = state.transition(&cleared) else {
-        panic!("a recovered outbox must clear its stateful alarm");
-    };
+    assert!(state.transition(true).is_none());
+    assert!(state.transition(true).is_none());
     assert_eq!(
-        context,
-        json!({
-            "pending": 0,
-            "oldestAgeMs": 0,
-            "maxAttempts": 0,
-        })
+        state.transition(false),
+        Some(MessagingAlarmTransition::Recovered)
     );
-    assert!(state.transition(&cleared).is_none());
+    assert!(state.transition(false).is_none());
+    assert_eq!(
+        state.transition(true),
+        Some(MessagingAlarmTransition::Degraded),
+        "a second outage raises the alarm again"
+    );
 }
 
 #[test]
@@ -377,30 +364,32 @@ fn capture_lifecycle_labels_cover_every_supported_trigger_and_mode() {
     );
 }
 
+/// A recovered catalog cannot make the component ready before startup finishes or after it stops.
 #[test]
-fn outbox_recovery_cannot_make_readiness_true_before_startup_or_after_shutdown() {
+fn catalog_recovery_cannot_make_readiness_true_before_startup_or_after_shutdown() {
     let updates = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&updates);
     let readiness = RuntimeReadiness::new(Arc::new(move |ready| {
         recorded.lock().unwrap().push(ready);
     }));
 
-    readiness.set_outbox_available(false);
-    readiness.set_outbox_available(true);
+    readiness.set_catalog_available(false);
+    readiness.set_catalog_available(true);
     assert_eq!(*updates.lock().unwrap(), vec![false, false]);
 
     readiness.complete_startup();
     readiness.begin_shutdown();
-    readiness.set_outbox_available(false);
-    readiness.set_outbox_available(true);
+    readiness.set_catalog_available(false);
+    readiness.set_catalog_available(true);
     assert_eq!(
         *updates.lock().unwrap(),
         vec![false, false, true, false, false, false]
     );
 }
 
+/// The catalog and the state filesystem are independent readiness gates; both must be up.
 #[test]
-fn catalog_and_outbox_durability_are_independent_readiness_gates() {
+fn catalog_and_state_storage_are_independent_readiness_gates() {
     let updates = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&updates);
     let readiness = RuntimeReadiness::new(Arc::new(move |ready| {
@@ -409,9 +398,9 @@ fn catalog_and_outbox_durability_are_independent_readiness_gates() {
 
     readiness.complete_startup();
     readiness.set_catalog_available(false);
-    readiness.set_outbox_available(false);
+    readiness.set_state_storage_available(false);
     readiness.set_catalog_available(true);
-    readiness.set_outbox_available(true);
+    readiness.set_state_storage_available(true);
 
     assert_eq!(
         *updates.lock().unwrap(),
@@ -468,7 +457,7 @@ fn readiness_publication_is_linearizable_across_concurrent_availability_changes(
 
     let becoming_unavailable = readiness.clone();
     let unavailable_thread = std::thread::spawn(move || {
-        becoming_unavailable.set_outbox_available(false);
+        becoming_unavailable.set_state_storage_available(false);
     });
     assert!(
         false_published_rx

@@ -35,7 +35,7 @@ impl RootPressure {
 pub struct StoragePressureSnapshot {
     /// Image output filesystem assessment.
     pub output: RootPressure,
-    /// Durable catalog/outbox filesystem assessment.
+    /// Durable catalog filesystem assessment.
     pub state: RootPressure,
 }
 

@@ -72,15 +72,16 @@ camera-adapter --platform HOST --transport MQTT /etc/edgecommons/camera-adapter.
 `/livez` reports that the process health server is running. `/readyz` and `/startupz` are `200`
 only after messaging is connected and the adapter has finished its durable startup gates; they are
 `503` during startup, shutdown, while the state directory is below its configured free-space floor
-or cannot be read, or while the catalog/outbox cannot safely complete a durable pass. The output
+or cannot be read, or while the catalog cannot safely complete a durable pass. The output
 and state roots use `minimumFreeBytes` and `minimumFreePercent`; either low/unreadable root raises
 the deduplicated critical `storage-low` alarm with its configured root and observed free space.
 New captures are rejected with `STORAGE_PRESSURE` until the affected root recovers. Output pressure
 does not itself make the catalog unready; state-directory pressure does.
-Temporary broker confirmation failures do not by themselves make the component unready: they remain
-in the durable outbox and, when its pressure threshold is reached, raise the stateful warning alarm
-`message-delivery-delayed`. The example exposes port 8081 only because it sets `health.enabled`
-explicitly.
+A broker the component cannot reach does not make it unready. It keeps capturing and persisting, and it
+retries the connection; the terminal announcements it cannot publish are dropped, counted as
+`camera_captures.announcementFailed`, and reported by the stateful warning alarm
+`message-publish-degraded`, which clears on the next successful announcement. The example exposes port
+8081 only because it sets `health.enabled` explicitly.
 
 For GigE Vision, set a non-empty `component.global.discovery.eligibleInterfaces` list of exact
 interface names. The adapter deliberately does not sweep all NICs. Size MTU, receive buffers,

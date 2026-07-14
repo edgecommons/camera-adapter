@@ -22,7 +22,6 @@ pub mod jobs;
 pub mod messages;
 pub mod model;
 pub mod observability;
-pub mod outbox;
 pub mod registry;
 pub mod runtime;
 pub mod scheduler;

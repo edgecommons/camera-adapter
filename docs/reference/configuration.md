@@ -16,10 +16,9 @@ configuration, messaging, credentials, and platform fields follow the core schem
 | `output.minimumFreePercent` | 5 | Free-space percentage floor after reservations. |
 | `output.directoryMode` | `0750` | Mode for new output directories on Unix. |
 | `output.fileMode` | `0640` | Mode for final images and sidecars on Unix. |
-| `state.directory` | platform-dependent | Explicit durable catalog/outbox root; mandatory for Greengrass. |
+| `state.directory` | platform-dependent | Explicit durable catalog root; mandatory for Greengrass. |
 | `state.resultRetentionHours` | 72 | Terminal ledger retention. |
 | `state.maxResultRecords` | 100000 | Soft cap for terminal records. |
-| `state.outboxRetentionHours` | 168 | Delivered outbox retention. |
 | `state.queuedRecoveryPolicy` | `requeue` | What becomes of captures still queued when the component stopped. `requeue` puts them back on the queue, provided the capture had not yet reached a camera, its deadlines have not passed, and its camera is still configured, enabled, and on the same backend. `interrupt` retires them all with `PROCESS_INTERRUPTED`. Anything a camera had already started is retired either way. |
 | `limits.maxConnectedCameras` | 256 | Maximum enabled camera supervisors. |
 | `limits.maxConcurrentCaptures` | 32 | Captures the component runs at once, fleet-wide. A capture holds one of these from the moment a camera takes it until it is terminal. |
@@ -56,6 +55,10 @@ configuration, messaging, credentials, and platform fields follow the core schem
 | `security.maxDecompressionRatio` | 100 | Decoded/compressed response ratio limit. |
 | `security.allowBasicOverPlaintext` | `false` | Development-only exception for Basic auth over HTTP. |
 | `captureGroupSchedules` | `[]` | Cron schedules that capture several cameras together as one group. |
+
+`state` accepts exactly the four fields listed above. Any other key under it — `outboxRetentionHours`, for
+example — is an unknown key: the configuration is rejected rather than ignored, and the adapter does not
+start (or, on reload, keeps running the configuration it already has). Remove the key.
 
 ## Camera instance fields
 

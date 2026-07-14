@@ -8,7 +8,7 @@ disk rather than sent over MQTT or Greengrass IPC.
 ## Current implementation status
 
 The component has a functional durable startup path, command-router startup gate, SQLite-backed
-catalog/outbox, deterministic simulated backend, ONVIF snapshot/RTSP backend, and an optional
+catalog, deterministic simulated backend, ONVIF snapshot/RTSP backend, and an optional
 Linux GenICam/Aravis backend. It is **not a general-release component yet**: the 256-camera/24-hour
 capacity validation is being built as a separate simulator harness; its short 1,024-configured/256-session/
 32-capture proof and optional 15-minute partial mixed-traffic smoke are runnable on a true Linux host,

@@ -166,8 +166,6 @@ pub struct StateConfig {
     pub result_retention_hours: u32,
     /// Soft terminal-record count cap.
     pub max_result_records: u64,
-    /// Delivered outbox retention.
-    pub outbox_retention_hours: u32,
     /// Restart treatment for queued jobs.
     pub queued_recovery_policy: QueuedRecoveryPolicy,
 }
@@ -178,7 +176,6 @@ impl Default for StateConfig {
             directory: None,
             result_retention_hours: 72,
             max_result_records: 100_000,
-            outbox_retention_hours: 168,
             queued_recovery_policy: QueuedRecoveryPolicy::Requeue,
         }
     }
@@ -1031,13 +1028,6 @@ fn validate_global(global: &GlobalConfig) -> Result<()> {
         10_000_000,
         "component.global.state.maxResultRecords",
     )?;
-    if global.state.outbox_retention_hours < global.state.result_retention_hours {
-        return config_error(
-            "component.global.state.outboxRetentionHours",
-            "must be at least resultRetentionHours",
-        );
-    }
-
     let limits = &global.limits;
     range_usize(
         limits.max_connected_cameras,
@@ -2719,9 +2709,12 @@ mod tests {
             Box::new(|value| {
                 value["component"]["global"]["state"] = json!({"resultRetentionHours": 0});
             }),
+            // The durable outbox is gone, and so is its retention knob. A configuration that still
+            // sets it is REJECTED rather than quietly ignored: an operator who wrote it down was
+            // expecting delivery to be retried, and it no longer is.
             Box::new(|value| {
                 value["component"]["global"]["state"] =
-                    json!({"resultRetentionHours": 24, "outboxRetentionHours": 1});
+                    json!({"resultRetentionHours": 24, "outboxRetentionHours": 168});
             }),
             Box::new(|value| {
                 value["component"]["global"]["limits"] = json!({

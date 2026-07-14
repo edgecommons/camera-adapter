@@ -18,10 +18,10 @@
 //! They are not separate TYPES, and that is a decision rather than an omission. Eighteen of this
 //! struct's twenty-six fields are touched by more than one plane, and the shared state is not
 //! incidental -- it exists precisely to couple them. `reloading` is written by the reload plane and
-//! read by the command router to fence commands mid-reload. `outbox_escalated` is written by the
-//! outbox worker and read by capture intake to shed load. `discovery_cache` is written by periodic
-//! discovery and read by the `list` verb. And the schedule plane CALLS the command plane, because a
-//! schedule is just another producer of captures.
+//! read by the command router to fence commands mid-reload. `messaging_alarm` is written by the job
+//! hooks when an announcement fails and read by the alarm the supervision plane owns.
+//! `discovery_cache` is written by periodic discovery and read by the `list` verb. And the schedule
+//! plane CALLS the command plane, because a schedule is just another producer of captures.
 //!
 //! Splitting the state would give a command half owning ONE private field, a supervision half owning
 //! seven, and a shared core of eighteen that both halves wrap: the same object with an extra
@@ -75,8 +75,7 @@ use crate::{
     backend::{BackendRuntimeContext, ConnectRequest, DiscoveryCandidate},
     catalog::{Catalog, CatalogOptions},
     config::AdapterConfig,
-    jobs::{AcceptanceHook, AppTerminalEnvelopeEncoder, CaptureJobSpec, JobEngine, JobHooks},
-    outbox::{EdgeCommonsConfirmedPublisher, OutboxDurability, OutboxPressure, OutboxPublisher},
+    jobs::{AcceptanceHook, AppTerminalAnnouncer, CaptureJobSpec, JobEngine, JobHooks},
     registry::{CameraConnectionState, CameraRegistry, CameraStatusError},
     scheduler::{ScheduleDecision, ScheduleOccurrence, SchedulePlan},
     state_path::resolve_state_directory,
@@ -136,7 +135,6 @@ type ReadySetter = dyn Fn(bool) + Send + Sync;
 struct RuntimeReadinessState {
     startup_complete: bool,
     catalog_available: bool,
-    outbox_available: bool,
     state_storage_available: bool,
     stopping: bool,
 }
@@ -145,7 +143,6 @@ impl RuntimeReadinessState {
     fn is_ready(self) -> bool {
         self.startup_complete
             && self.catalog_available
-            && self.outbox_available
             && self.state_storage_available
             && !self.stopping
     }
@@ -153,11 +150,12 @@ impl RuntimeReadinessState {
 
 /// Combines the one-way startup gate with independently observed durable-state availability.
 ///
-/// A recovered outbox catalog pass cannot make the component ready before every startup gate has
-/// completed, and it cannot re-enable readiness after shutdown begins. This keeps the core's
-/// single boolean readiness flag honest without treating ordinary broker pressure as a storage
-/// failure. State changes and the external publication are serialized so a delayed older callback
-/// cannot overwrite a newer unavailable state with stale readiness.
+/// Readiness is about DURABLE STATE, not about messaging. A recovered catalog cannot make the
+/// component ready before every startup gate has completed, and it cannot re-enable readiness after
+/// shutdown begins. A broker that is down is deliberately absent from this: the component can still
+/// capture, still persist, and still answer -- it simply cannot announce, which is a degradation and
+/// not an outage. State changes and the external publication are serialized so a delayed older
+/// callback cannot overwrite a newer unavailable state with stale readiness.
 #[derive(Clone)]
 pub struct RuntimeReadiness {
     state: Arc<Mutex<RuntimeReadinessState>>,
@@ -172,7 +170,6 @@ impl RuntimeReadiness {
             state: Arc::new(Mutex::new(RuntimeReadinessState {
                 startup_complete: false,
                 catalog_available: true,
-                outbox_available: true,
                 state_storage_available: true,
                 stopping: false,
             })),
@@ -193,12 +190,6 @@ impl RuntimeReadiness {
     fn set_catalog_available(&self, available: bool) {
         self.transition(|state| {
             std::mem::replace(&mut state.catalog_available, available) != available
-        });
-    }
-
-    fn set_outbox_available(&self, available: bool) {
-        self.transition(|state| {
-            std::mem::replace(&mut state.outbox_available, available) != available
         });
     }
 
@@ -227,52 +218,75 @@ impl RuntimeReadiness {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum OutboxAlarmTransition {
-    Raise(serde_json::Value),
-    Clear(serde_json::Value),
+/// Whether the component can currently tell anyone what it captured.
+///
+/// One bit, and one alarm, for the whole component. It says nothing about the durable state and
+/// nothing about readiness: a degraded messaging plane keeps capturing, keeps persisting, and keeps
+/// answering `sb/capture-status` -- it just loses announcements while it lasts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessagingAlarmTransition {
+    Degraded,
+    Recovered,
 }
 
-struct OutboxHealthWatchers {
-    pressure: watch::Receiver<OutboxPressure>,
-    durability: watch::Receiver<OutboxDurability>,
-    catalog_availability: watch::Receiver<crate::catalog::CatalogAvailability>,
-    /// Raised while the backlog has escalated, and read by the acceptance path.
-    escalated: Arc<AtomicBool>,
-}
-
+/// The last observed announcement outcome, so the alarm is raised and cleared once per transition
+/// rather than on every capture.
 #[derive(Default)]
-struct OutboxAlarmState {
-    delayed: bool,
+struct MessagingAlarmState {
+    degraded: bool,
 }
 
-impl OutboxAlarmState {
-    fn transition(&mut self, pressure: &OutboxPressure) -> Option<OutboxAlarmTransition> {
-        if self.delayed == pressure.delayed {
+impl MessagingAlarmState {
+    fn transition(&mut self, degraded: bool) -> Option<MessagingAlarmTransition> {
+        if self.degraded == degraded {
             return None;
         }
-        self.delayed = pressure.delayed;
-        let context = outbox_pressure_context(pressure);
-        if pressure.delayed {
-            Some(OutboxAlarmTransition::Raise(context))
+        self.degraded = degraded;
+        Some(if degraded {
+            MessagingAlarmTransition::Degraded
         } else {
-            Some(OutboxAlarmTransition::Clear(context))
-        }
+            MessagingAlarmTransition::Recovered
+        })
     }
 }
 
-fn outbox_pressure_context(pressure: &OutboxPressure) -> serde_json::Value {
-    let mut context = serde_json::Map::new();
-    context.insert("pending".to_string(), pressure.pending.into());
-    context.insert("oldestAgeMs".to_string(), pressure.oldest_age_ms.into());
-    context.insert("maxAttempts".to_string(), pressure.max_attempts.into());
-    if let Some(error) = &pressure.last_error {
-        context.insert(
-            "lastError".to_string(),
-            serde_json::Value::String(error.clone()),
-        );
+async fn publish_messaging_alarm(
+    events: Option<EventsFacade>,
+    alarms: &Mutex<MessagingAlarmState>,
+    degraded: bool,
+    context: serde_json::Value,
+) {
+    let transition = alarms
+        .lock()
+        .ok()
+        .and_then(|mut state| state.transition(degraded));
+    let (Some(events), Some(transition)) = (events, transition) else {
+        return;
+    };
+    let result = match transition {
+        MessagingAlarmTransition::Degraded => {
+            events
+                .raise_alarm(
+                    Severity::Warning,
+                    "message-publish-degraded",
+                    Some(
+                        "capture results are durable but cannot be announced; announcements are \
+                         dropped while this lasts"
+                            .to_string(),
+                    ),
+                    Some(context),
+                )
+                .await
+        }
+        MessagingAlarmTransition::Recovered => {
+            events
+                .clear_alarm(Severity::Warning, "message-publish-degraded", Some(context))
+                .await
+        }
+    };
+    if let Err(error) = result {
+        tracing::warn!(error = %error, "failed to publish messaging-degradation alarm");
     }
-    serde_json::Value::Object(context)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -831,9 +845,12 @@ pub struct CameraRuntime {
     /// `motion_stop` are the lifecycle state within that, and they go when the camera goes -- which is
     /// the whole reason this is one map and not seven.
     cameras: Arc<RwLock<BTreeMap<String, CameraSlot>>>,
-    outbox_events: Option<EventsFacade>,
+    /// The component-main event facade: component-wide alarms, not per-camera ones.
+    component_events: Option<EventsFacade>,
     storage_pressure: Option<StoragePressureMonitor>,
     storage_alarm: Arc<Mutex<StorageAlarmState>>,
+    /// Whether the last terminal announcement failed. See [`MessagingAlarmState`].
+    messaging_alarm: Arc<Mutex<MessagingAlarmState>>,
     readiness: RuntimeReadiness,
     /// Capture counters and sampled queue levels. See `observability::CaptureMetrics`.
     metrics: Arc<crate::observability::CaptureMetrics>,
@@ -846,14 +863,6 @@ pub struct CameraRuntime {
     scheduler: crate::dispatch::CaptureScheduler,
     cancellation: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    /// Whether the outbox backlog has escalated.
-    ///
-    /// The flag existed and NOTHING SHED. It tripped at eighty thousand pending messages, raised an
-    /// alarm, and the component carried on accepting captures at full rate -- each one adding another
-    /// durable message to a queue that was already losing. There is no honest way to shed a durable
-    /// message: it is the record of a capture that happened, and dropping it loses data. The only
-    /// place load can be shed is where it is taken on.
-    outbox_escalated: Arc<AtomicBool>,
     connect_gate: Arc<Semaphore>,
     waiters: Arc<RuntimeJobHooks>,
     cursors: CursorStore,
@@ -1206,6 +1215,43 @@ impl JobHooks for RuntimeJobHooks {
             self.complete_group_if_terminal(group_id).await;
         }
     }
+
+    async fn terminal_announced(&self, record: &crate::catalog::JobRecord, latency: Duration) {
+        let Some(runtime) = self.runtime() else {
+            return;
+        };
+        runtime.health.observed_publish(&record.instance, latency);
+        runtime
+            .note_messaging_health(true, Some(serde_json::json!({ "instance": record.instance })))
+            .await;
+    }
+
+    async fn terminal_announcement_failed(
+        &self,
+        record: &crate::catalog::JobRecord,
+        error: &crate::CameraError,
+    ) {
+        let Some(runtime) = self.runtime() else {
+            return;
+        };
+        // Counted, not merely logged. A broker that is down costs announcements, and this is the
+        // only number that says how many -- the capture itself is already durable and already
+        // counted as SUCCEEDED/FAILED/CANCELLED by `settle_waiters`.
+        runtime
+            .metrics
+            .count(crate::observability::ANNOUNCEMENT_FAILED_MEASURE)
+            .await;
+        runtime
+            .note_messaging_health(
+                false,
+                Some(serde_json::json!({
+                    "instance": record.instance,
+                    "captureId": record.capture_id,
+                    "errorCode": error.code().as_str(),
+                })),
+            )
+            .await;
+    }
 }
 
 #[async_trait]
@@ -1244,21 +1290,19 @@ impl AcceptanceHook for RuntimeJobHooks {
 /// Runtime-owned facades and platform services supplied after durable startup resources exist.
 ///
 /// Grouping these dependencies makes the boundary explicit: protocol construction, per-camera
-/// terminal/event publication, component outbox alarms, readiness, and confirmed messaging are
+/// terminal announcement and event publication, component-wide alarms, and readiness are
 /// process-owned services rather than configuration values.
 pub struct RuntimeServices {
-    /// Per-camera application facades used to encode terminal results.
+    /// Per-camera application facades used to announce terminal results.
     pub apps: BTreeMap<String, Arc<AppFacade>>,
     /// Per-camera event facades used by schedules and camera lifecycle events.
     pub events: BTreeMap<String, EventsFacade>,
-    /// Component-main event facade used for component-wide outbox delivery alarms.
-    pub outbox_events: EventsFacade,
+    /// Component-main event facade used for component-wide alarms (storage, messaging).
+    pub component_events: EventsFacade,
     /// Combined startup/durable-state readiness bridge.
     pub readiness: RuntimeReadiness,
     /// Credential/discovery/security services required to construct a backend.
     pub backend_context: BackendRuntimeContext,
-    /// Confirmed local publisher for durable terminal envelopes.
-    pub messaging: Arc<dyn edgecommons::messaging::MessagingService>,
     /// Component metric service. Capture counts ride the job hooks; queue levels are sampled.
     pub metrics: Arc<dyn edgecommons::metrics::MetricService>,
 }
@@ -1435,14 +1479,14 @@ impl CameraRuntime {
             self.catalog.clone(),
             self.admission.clone(),
             self.storage.clone(),
-            Arc::new(AppTerminalEnvelopeEncoder::new(app)),
+            Arc::new(AppTerminalAnnouncer::new(app)),
             Arc::clone(&self.waiters) as Arc<dyn JobHooks>,
         )
         .with_acceptance_hook(Arc::clone(&self.waiters) as Arc<dyn AcceptanceHook>)
     }
 
-    /// Builds the durable runtime, recovers install-owned records, starts outbox publication and
-    /// creates one lightweight supervisor for every enabled camera.
+    /// Builds the durable runtime, recovers install-owned records, and creates one lightweight
+    /// supervisor for every enabled camera.
     ///
     /// The caller must have registered the command router but must not make the component ready
     /// until this method succeeds.  Camera connection failure is intentionally not a startup
@@ -1455,10 +1499,9 @@ impl CameraRuntime {
         let RuntimeServices {
             apps,
             events,
-            outbox_events,
+            component_events,
             readiness,
             backend_context,
-            messaging,
             metrics,
         } = services;
         let metrics = Arc::new(crate::observability::CaptureMetrics::new(metrics));
@@ -1497,7 +1540,7 @@ impl CameraRuntime {
                     resources.catalog.clone(),
                     resources.admission.clone(),
                     resources.storage.clone(),
-                    Arc::new(AppTerminalEnvelopeEncoder::new(Arc::clone(app))),
+                    Arc::new(AppTerminalAnnouncer::new(Arc::clone(app))),
                     Arc::clone(&waiters) as Arc<dyn JobHooks>,
                 )
                 .with_acceptance_hook(Arc::clone(&waiters) as Arc<dyn AcceptanceHook>),
@@ -1513,9 +1556,10 @@ impl CameraRuntime {
             storage: resources.storage,
             registry: resources.registry,
             cameras: Arc::new(RwLock::new(new_slots(engines, events))),
-            outbox_events: Some(outbox_events),
+            component_events: Some(component_events),
             storage_pressure: Some(storage_pressure),
             storage_alarm: Arc::new(Mutex::new(StorageAlarmState::default())),
+            messaging_alarm: Arc::new(Mutex::new(MessagingAlarmState::default())),
             readiness,
             metrics,
             scheduler_cancellations: RwLock::new(HashMap::new()),
@@ -1524,7 +1568,6 @@ impl CameraRuntime {
             scheduler,
             cancellation: CancellationToken::new(),
             tasks: Mutex::new(Vec::new()),
-            outbox_escalated: Arc::new(AtomicBool::new(false)),
             connect_gate: Arc::new(Semaphore::new(max_connection_attempts)),
             waiters: Arc::clone(&waiters),
             cursors: CursorStore::default(),
@@ -1540,7 +1583,7 @@ impl CameraRuntime {
         runtime.start_storage_pressure_monitor()?;
         runtime.start_metric_sampler()?;
         runtime.recover_install_owned().await?;
-        runtime.start_outbox(messaging)?;
+        runtime.start_catalog_health()?;
         runtime.start_supervisors()?;
         runtime.start_schedulers()?;
         runtime.start_periodic_discovery()?;
@@ -1622,7 +1665,7 @@ impl CameraRuntime {
         self.readiness
             .set_state_storage_available(snapshot.state_available());
         publish_storage_alarm(
-            self.outbox_events.clone(),
+            self.component_events.clone(),
             self.storage_alarm.as_ref(),
             &snapshot,
         )
@@ -1630,18 +1673,24 @@ impl CameraRuntime {
         Some(snapshot)
     }
 
+    /// Records whether the last terminal announcement reached the transport, and raises or clears
+    /// the component's messaging alarm on the transition.
+    ///
+    /// Deliberately NOT a readiness gate and NOT an intake gate. Messaging being down loses
+    /// announcements; it does not make a capture impossible, and a component that refused captures
+    /// because a broker was unreachable would be throwing away the very data the catalog and the
+    /// disk are there to keep.
+    async fn note_messaging_health(&self, healthy: bool, context: Option<serde_json::Value>) {
+        publish_messaging_alarm(
+            self.component_events.clone(),
+            self.messaging_alarm.as_ref(),
+            !healthy,
+            context.unwrap_or_else(|| serde_json::json!({})),
+        )
+        .await;
+    }
+
     async fn ensure_storage_capacity(&self) -> Result<()> {
-        // A capture the component cannot tell anyone about is not a capture. When the outbox has
-        // escalated, every new one adds a durable message to a queue that is already losing ground --
-        // and a durable message cannot be shed, because it is the record of something that happened.
-        // Backpressure at the intake is the only load-shedding that does not lose data, and it is what
-        // the escalation flag was raised for. It raised an alarm and nothing else.
-        if self.outbox_escalated.load(Ordering::Acquire) {
-            return Err(crate::CameraError::rejected(
-                crate::ErrorCode::ResourceLimit,
-                "the component cannot publish results as fast as it is being asked to produce them",
-            ));
-        }
         let Some(snapshot) = self.refresh_storage_pressure().await else {
             return Ok(());
         };
@@ -2327,7 +2376,6 @@ fn create_state_directory(directory: &std::path::Path) -> Result<()> {
 /// is alive and how much state it is holding back.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct RetentionSweep {
-    delivered_outbox: u64,
     terminal_jobs: u64,
     terminal_groups: u64,
     command_ledgers: u64,
@@ -2336,8 +2384,7 @@ struct RetentionSweep {
 
 impl RetentionSweep {
     fn reclaimed(self) -> u64 {
-        self.delivered_outbox
-            .saturating_add(self.terminal_jobs)
+        self.terminal_jobs
             .saturating_add(self.terminal_groups)
             .saturating_add(self.command_ledgers)
             .saturating_add(self.over_limit_jobs)

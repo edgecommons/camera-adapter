@@ -70,7 +70,8 @@ The design is successful when an implementation can demonstrate all of the follo
 - GenICam discovery, feature configuration, software trigger, buffer acquisition, and metadata.
 - ONVIF capability discovery, media profiles, snapshot URI capture, authentication, and PTZ.
 - RTSP frame extraction as an ONVIF backend capture mode and fallback.
-- Durable capture-job state, idempotent submission, cancellation, status recovery, and message outbox.
+- Durable capture-job state, idempotent submission, cancellation, status recovery, and best-effort
+  terminal announcement.
 - Crash-recoverable local file persistence under one configured output root.
 - Optional local metadata sidecars.
 - Commands, events, health, metrics, logging, credentials, config reload, and shutdown.
@@ -126,13 +127,13 @@ The words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 | D-CAM-10 | Long-running reply | Add deferred command replies to EdgeCommons core in all four languages | The current command inbox auto-replies and explicitly requires fast handlers; bypassing it would split the command model. |
 | D-CAM-11 | Domain-message correlation | Add a correlation-aware `app()` builder/view in all four languages | Command-originated terminal metadata must carry the original correlation ID while still using the application-message facade. |
 | D-CAM-12 | Message classes | Publish terminal image metadata on `app/image/*`; use `events()` for operator lifecycle and alarms | `app` is the current free-form inter-component class; `evt` has a standardized operator-event body and severity/type channel. |
-| D-CAM-13 | Durable status | SQLite job catalog plus durable message outbox | Recovers status after request timeout or restart and supports at-least-once terminal metadata publication. |
+| D-CAM-13 | Durable status | SQLite job catalog; terminal announcements are volatile | The catalog is the source of truth: it recovers status after a request timeout or restart and makes submission idempotent. Terminal metadata is an announcement, not a delivery — the image and its sidecar are on disk (D-CAM-17), and `sb/capture-status` answers after a restart. This supersedes the original decision, which bundled a durable message outbox into the same entry and asserted at-least-once terminal publication without arguing for it. No consumer requires delivery. |
 | D-CAM-14 | ONVIF capture | Prefer configured ONVIF snapshot mode; support RTSP frame mode and fallback | Snapshot is efficient; RTSP is needed when snapshot support or freshness is inadequate. |
 | D-CAM-15 | PTZ | Common normalized command contract mapped through backend capabilities | ONVIF provides the initial PTZ implementation; unsupported backends return a capability error. |
 | D-CAM-16 | Fleet safety | Layered bounded queues and byte-based admission | Camera count alone is not a safe memory or bandwidth bound. |
 | D-CAM-17 | Delivery | Integrate with `file-replicator` through disk and metadata, not code coupling | Keeps acquisition and delivery independently deployable. |
 | D-CAM-18 | Command addressing | Use the shipped component `main` inbox and select camera `instance` in the body | Matches the shipped CommandInbox contract and both shipped adapters. This deliberately proposes to supersede the approved-but-unshipped Phase 5 per-instance `cmd/sb/*` addressing in `core/docs/SOUTHBOUND.md` §2.2; accepting or rejecting that renegotiation is an explicit review decision (§27). |
-| D-CAM-19 | Outbox acknowledgement | Add acknowledgement-capable QoS 1 publish before claiming message delivery | Current publish submission is not sufficient evidence of MQTT PUBACK; a crash must leave ambiguous messages pending. |
+| D-CAM-19 | Outbox acknowledgement | Withdrawn | There is no outbox and no acknowledgement to wait for. Terminal announcements publish once, best effort. Durable, acknowledged delivery is a generic messaging concern and belongs in the EdgeCommons messaging service as an opt-in augmentation across all four languages, available to any component, rather than being reimplemented inside one. |
 | D-CAM-20 | Group capture | `sb/capture-group` fans one request out as independent per-camera capture jobs sharing an adapter-generated `captureGroupId`; the single deferred reply aggregates every member's terminal result | One operator action often needs an evidence set from several cameras. Aggregation fits the shipped single-reply command model plus the D-CAM-10 deferred reply; a core scatter-gather exchange (one request, multiple replies) is not required for v1 and is raised as a core question (§27). |
 
 ## 5. System context
@@ -177,11 +178,11 @@ flowchart TB
     Registry["Camera registry and supervisors"]
     Scheduler["Schedule service"]
     Admission["Priority admission and byte budget"]
-    Jobs["Durable job catalog and message outbox"]
+    Jobs["Durable job catalog"]
     Workers["Per-camera actors"]
     Encoder["Bounded conversion pool"]
     Writer["Image persistence writer"]
-    Publisher["Outbox publisher"]
+    Publisher["Terminal announcer"]
   end
 
   subgraph Backends["Backend implementations"]
@@ -222,11 +223,12 @@ flowchart TB
 - **Admission controller:** applies priority, per-camera queue bounds, global concurrent-capture limits,
   per-resource-group limits, encoder limits, and a byte budget.
 - **Job catalog:** durably records job parameters, effective profile, state, paths, results, errors,
-  idempotency keys, and terminal-message delivery state.
+  idempotency keys, and the encoded terminal body the announcement carries.
 - **Encoder pool:** performs CPU-heavy pixel conversion outside async executor threads.
 - **Image persistence writer:** validates paths, writes and flushes a same-directory partial file, then
   finalizes it under the platform-specific guarantees in §9.2 and returns checksum and final metadata.
-- **Outbox publisher:** retries terminal `app` messages until the messaging service confirms publication.
+- **Terminal announcer:** publishes the terminal `app` message once, best effort, after the terminal
+  state is durably committed. It never retries and never blocks or fails a capture.
 
 ### 6.2 Backend abstraction
 
@@ -268,7 +270,7 @@ is a required implementation, not only a test fixture hidden behind conditional 
 
 ### 6.3 Threading and blocking I/O
 
-- Tokio tasks MAY manage camera state, timers, queues, messaging, HTTP, and durable outbox work.
+- Tokio tasks MAY manage camera state, timers, queues, messaging, HTTP, and durable catalog work.
 - Native GenICam calls, blocking SDK callbacks, image conversion, and filesystem flush operations MUST
   run on dedicated bounded workers or explicitly bounded blocking tasks.
 - No unbounded `spawn_blocking`, thread-per-request, or frame-per-camera preallocation is allowed.
@@ -446,7 +448,8 @@ flowchart LR
   Flush --> Record["Catalog records PERSISTING target"]
   Record --> Rename["Final install (Linux atomic; Windows no-overwrite link)"]
   Rename --> Verify["Verify size and final path"]
-  Verify --> Commit["Catalog SUCCEEDED plus message outbox"]
+  Verify --> Commit["Catalog SUCCEEDED"]
+  Commit --> Announce["Best-effort terminal announcement"]
 ```
 
 The writer MUST:
@@ -460,7 +463,8 @@ The writer MUST:
    uses standard-library no-overwrite link/install followed by partial cleanup and reports a collision,
    unsupported hard-link filesystem, or finalization failure as `PERSISTENCE_FAILED`.
 7. Flush the parent directory where the platform supports it.
-8. Commit terminal metadata and an outbox message transactionally in SQLite.
+8. Commit terminal metadata — including the encoded terminal body — transactionally in SQLite.
+9. Announce that terminal body once, best effort, after the commit has won.
 
 A crash after finalization but before terminal catalog commit is recovered by inspecting the `PERSISTING`
 record and verifying the final file. A partial file without a valid final image is removed during
@@ -501,7 +505,7 @@ tests.
   before persistence.
 - Low space raises a deduplicated `storage-low` alarm and returns `STORAGE_PRESSURE` for new jobs.
 - Existing writes may finish if their reserved byte budget remains valid.
-- The same floors monitor the `state.directory` filesystem. A catalog or outbox write that fails for
+- The same floors monitor the `state.directory` filesystem. A catalog write that fails for
   lack of space raises the stateful `storage-low` alarm with the state root in context, and readiness
   becomes false while the job catalog cannot commit (§19.4), because the catalog is the component's
   source of truth.
@@ -540,7 +544,6 @@ Camera-specific configuration belongs under permissive `component.global` and
         "directory": "/var/lib/edgecommons/camera-adapter-state",
         "resultRetentionHours": 72,
         "maxResultRecords": 100000,
-        "outboxRetentionHours": 168,
         "queuedRecoveryPolicy": "requeue"
       },
       "limits": {
@@ -719,7 +722,6 @@ without replacing camera sessions.
 | `state.directory` | no | platform durable-data directory; absolute path | restart required |
 | `state.resultRetentionHours` | no | `72`; 1–8760 | live; affects future pruning |
 | `state.maxResultRecords` | no | `100000`; 1,000–10,000,000 | live; terminal records only |
-| `state.outboxRetentionHours` | no | `168`; not shorter than result retention | live; delivered messages only |
 | `state.queuedRecoveryPolicy` | no | `requeue`; `requeue` or `interrupt` | applies at next recovery |
 
 ### 10.7 Capacity limits and timeouts
@@ -976,7 +978,7 @@ whichever way the decision goes, `core/docs/SOUTHBOUND.md` is updated to record 
 
 ### 12.2 Core prerequisites
 
-Three core additions are part of the design contract:
+Two core additions are part of the design contract:
 
 1. **Deferred command reply.** Each language adds the same explicit handler outcome:
    `ImmediateSuccess(result)`, `ImmediateError(code, message)`, or `Deferred(token)`. A deferred handler
@@ -987,19 +989,15 @@ Three core additions are part of the design contract:
 2. **Correlated application-message view/builder.** Each language adds an `app()` path that accepts a
    received request or correlation ID and stamps that ID on the named application-message envelope while
    preserving the facade-generated topic, identity, and caller-owned body.
-3. **Acknowledgement-capable publish.** Each language adds a bounded `publish_confirmed` capability used
-   by a correlated `app()` publisher. With local MQTT QoS 1, completion means the matching broker PUBACK
-   was observed, not merely that the request entered a client queue. With Greengrass IPC, completion means
-   the IPC publish operation completed successfully. An ambiguous timeout is not success.
 
 These are public four-language core capabilities. They require Java canonical design, Java/Python/Rust/
 TypeScript parity, unit coverage, local MQTT interop with every language acting as requester and deferred
 responder, and deployed Greengrass IPC interop on `lab-5950x`.
 
-The existing immediate `publish` API remains unchanged. The camera outbox marks a message delivered only
-after `publish_confirmed` succeeds. Timeout or connection loss leaves it pending and retries the exact
-same serialized envelope and UUID; duplicates are therefore possible and are removed by consumers using
-`eventId` or `captureId`.
+The adapter publishes the terminal announcement through the ordinary correlated `app()` publish, once.
+It does not use an acknowledgement-capable publish: no delivery guarantee is claimed, so there is no
+acknowledgement to wait for (D-CAM-19). The durable facts a consumer can rely on are the catalog and
+`sb/capture-status`.
 
 The deferred registry uses this language-neutral state machine:
 
@@ -1523,7 +1521,7 @@ The component separates domain metadata from operator events:
 
 - Terminal capture metadata uses `gg.instance(cameraId).app()` because `app` is the existing free-form,
   named, inter-component message class.
-- Connection, scheduling, storage, PTZ, and outbox conditions use
+- Connection, scheduling, storage, PTZ, and announcement conditions use
   `gg.instance(cameraId).events()` or component-wide `gg.events()` because `evt` has the standardized
   operator-event body and `evt/{severity}/{type}` topic.
 
@@ -1603,8 +1601,8 @@ trigger, profile, timestamps, durations, backend, and caller metadata. Failure a
 
 Public job state `INTERRUPTED` is published as `ImageCaptureFailed` with
 `failure.code = "PROCESS_INTERRUPTED"`, `retriable = true|false` from recovery policy, and the stage that
-was active at restart. Startup inserts this outbox message in the same transaction that marks the job
-terminal, so interruption is not visible only through status.
+was active at restart. Startup commits this terminal body in the same transaction that marks the job
+terminal and announces it afterwards, so interruption is not visible only through status.
 
 ### 14.2 Operator events and alarms
 
@@ -1620,7 +1618,7 @@ terminal, so interruption is not visible only through status.
 | `storage-low` | critical | raise/clear | root, free bytes, free percent |
 | `ptz-commanded` | info | no | operation, bounded request summary |
 | `ptz-failed` | warning | no | operation, error code |
-| `message-delivery-delayed` | warning | no | oldest outbox age, pending count |
+| `message-publish-degraded` | warning | raise/clear | `instance`, `captureId`, `errorCode` |
 
 `capture-queued` and `capture-started` are disabled by default and intended for diagnostic operation;
 terminal image metadata always comes from `app/image/*`. Repeated per-camera failures SHOULD raise a
@@ -1628,14 +1626,17 @@ rate-limited operator alarm rather than emit an unbounded stream of duplicate `e
 
 ### 14.3 Delivery guarantees
 
-- Terminal application messages use a durable SQLite outbox, publish locally at QoS 1, and are delivered
-  at least once.
-- The outbox stores the exact serialized envelope and reuses the same header UUID on retry.
-- Consumers MUST deduplicate them by `(cameraId, captureId, header.name)` or `eventId`.
-- Debug and operator lifecycle events MAY be best effort and are not placed in the durable outbox unless
-  they raise or clear a stateful alarm.
-- A successful file remains successful when message publication is temporarily unavailable; the outbox
-  continues retrying and `sb/capture-status` remains authoritative.
+- Terminal application messages are announcements, not deliveries. Each is published once, best effort,
+  after the terminal state is durably committed. It is never retried.
+- The announcement carries the terminal body the winning terminal transaction committed, so the
+  `eventId` it reports is the durable one.
+- An announcement that cannot be published — because the broker or IPC is unavailable, or because the
+  component stops between the terminal commit and the publish — is lost. The image, its sidecar, and the
+  catalog record survive, and `sb/capture-status` remains authoritative.
+- A publish failure logs at warning, counts the `announcementFailed` measure on `camera_captures`, and
+  raises the component alarm `message-publish-degraded`; the next successful announcement clears it. It
+  never fails, retries, or rejects a capture.
+- Debug and operator lifecycle events are likewise best effort.
 - Publication failures never cause a second camera capture.
 
 ## 15. Messaging usage sequences
@@ -1650,7 +1651,7 @@ sequenceDiagram
   participant Worker as Camera actor
   participant Camera as Camera backend
   participant Disk as Image persistence writer
-  participant Outbox as Message outbox
+  participant Announcer as Terminal announcer
   participant Bus as Local bus
 
   Clock->>Scheduler: schedule occurrence
@@ -1661,11 +1662,9 @@ sequenceDiagram
   Camera-->>Worker: source frame and metadata
   Worker->>Disk: encode and persist
   Disk-->>Worker: final path, bytes, checksum
-  Worker->>Catalog: commit SUCCEEDED and outbox record
+  Worker->>Catalog: commit SUCCEEDED with the terminal body
   Catalog-->>Worker: terminal state durable
-  Outbox->>Bus: app/image/captured ImageCaptured
-  Bus-->>Outbox: broker PUBACK or IPC operation acknowledgement
-  Outbox->>Catalog: mark message delivered
+  Announcer->>Bus: app/image/captured ImageCaptured (once, best effort)
 ```
 
 There is no originating request correlation because the origin is a schedule. The application message
@@ -1684,7 +1683,7 @@ sequenceDiagram
   participant Worker as Camera actor
   participant Camera
   participant Disk
-  participant Outbox as Message outbox
+  participant Announcer as Terminal announcer
 
   Consumer->>Messaging: subscribe camera instance app/image/#
   Consumer->>Messaging: request(sb/capture, timeout)
@@ -1700,16 +1699,16 @@ sequenceDiagram
   Camera-->>Worker: frame
   Worker->>Disk: persist and finalize image
   Disk-->>Worker: final metadata
-  Worker->>Catalog: commit SUCCEEDED and message outbox
+  Worker->>Catalog: commit SUCCEEDED with the terminal body
   Worker->>Deferred: settle success(token, terminal result)
   Deferred->>Messaging: guarded reply(original request, terminal result)
   Messaging-->>Consumer: one correlated terminal reply
-  Outbox->>Messaging: correlated ImageCaptured app message
+  Announcer->>Messaging: correlated ImageCaptured app message (once, best effort)
 ```
 
 The reply and application message are two observations of one terminal result. Only the reply is a
-response to the request. The application message is published for passive consumers and remains
-retriable through the outbox.
+response to the request. The application message is announced once for passive consumers; a consumer
+that must not miss an outcome queries `sb/capture-status`.
 
 ### 15.3 Asynchronous submitted capture
 
@@ -1719,7 +1718,7 @@ sequenceDiagram
   participant Inbox as Command inbox
   participant Catalog as Job catalog
   participant Worker as Camera actor
-  participant Outbox as Message outbox
+  participant Announcer as Terminal announcer
   participant Bus as Local bus
 
   Consumer->>Bus: subscribe camera instance app/image/#
@@ -1730,8 +1729,8 @@ sequenceDiagram
   Inbox-->>Bus: immediate ACCEPTED reply
   Bus-->>Consumer: captureId and QUEUED
   Inbox->>Worker: queue capture
-  Worker->>Catalog: terminal result and outbox
-  Outbox->>Bus: correlated terminal app message
+  Worker->>Catalog: commit terminal result and body
+  Announcer->>Bus: correlated terminal app message (once, best effort)
   Bus-->>Consumer: ImageCaptured or ImageCaptureFailed
 ```
 
@@ -1746,7 +1745,7 @@ sequenceDiagram
   participant Messaging as Messaging service
   participant Adapter
   participant Catalog as Job catalog
-  participant Outbox as Message outbox
+  participant Announcer as Terminal announcer
   participant Bus as Local bus
 
   Consumer->>Messaging: request sb/capture with 5 second deadline
@@ -1756,7 +1755,7 @@ sequenceDiagram
   Adapter->>Catalog: capture later succeeds
   Adapter->>Messaging: late direct reply
   Note over Messaging: reply is dropped because request already settled
-  Outbox->>Bus: ImageCaptured app message
+  Announcer->>Bus: ImageCaptured app message (once, best effort)
   Consumer->>Bus: request sb/capture-status(captureId or requestId)
   Bus->>Catalog: query durable result
   Catalog-->>Consumer: terminal metadata
@@ -1860,19 +1859,18 @@ the actual payload is known but never overcommitted.
 ### 17.1 Durable job catalog
 
 SQLite runs in WAL mode when supported. The catalog stores jobs, request-id hashes, schedule occurrence
-keys, effective profiles, paths, terminal results, deferred waiter metadata, and the message outbox. Image
-bytes are never stored in SQLite.
+keys, effective profiles, paths, terminal results, deferred waiter metadata, and the encoded terminal
+body each announcement carries. Image bytes are never stored in SQLite.
 
 Terminal jobs and their idempotency mappings share `resultRetentionHours` and `maxResultRecords`; an
 idempotency key is never removed earlier than the status record it resolves. Count-based pruning removes
-only the oldest terminal records and never removes a non-terminal job or undelivered outbox message.
+only the oldest terminal records and never removes a non-terminal job.
 
-The runtime owns an hourly retention sweep on its cancellable task set. Each sweep reclaims delivered
-outbox messages past `outboxRetentionHours`, then terminal jobs, terminal groups, and completed command
-ledgers past `resultRetentionHours`, then enforces `maxResultRecords`. Delivered messages are reclaimed
-first because a terminal job or group is eligible only once its own retained messages are gone. The
-sweep is issued in bounded batches with a pause between them, so a large backlog never saturates the
-two-worker catalog pool that also carries the capture path, and it logs the counts it reclaimed.
+The runtime owns an hourly retention sweep on its cancellable task set. Each sweep reclaims terminal
+jobs, terminal groups, and completed command ledgers past `resultRetentionHours`, then enforces
+`maxResultRecords`. The sweep is issued in bounded batches with a pause between them, so a large backlog
+never saturates the two-worker catalog pool that also carries the capture path, and it logs the counts it
+reclaimed.
 
 A catalog that cannot be read — SQLite reports it as not a database or as corrupt, or it fails
 `PRAGMA integrity_check` — is quarantined rather than fatal. It is renamed to
@@ -1894,24 +1892,30 @@ left exactly as it was found.
 At startup:
 
 1. Validate and open the catalog before accepting commands.
-2. Mark `ACCEPTED` jobs `INTERRUPTED` and insert `ImageCaptureFailed(PROCESS_INTERRUPTED)` in the same
-   transaction because acceptance never completed its durable queue transition.
+2. Mark `ACCEPTED` jobs `INTERRUPTED` and commit an `ImageCaptureFailed(PROCESS_INTERRUPTED)` terminal
+   body in the same transaction, because acceptance never completed its durable queue transition.
 3. For `QUEUED` jobs, requeue only when `queuedRecoveryPolicy = requeue`, the queue deadline has not
    expired, and the snapshotted camera/profile can still run. Every other queued job is transactionally
-   marked `INTERRUPTED` with an `ImageCaptureFailed(PROCESS_INTERRUPTED)` outbox message.
-4. Mark `ACQUIRING` and `ENCODING` jobs `INTERRUPTED` and insert their failure outbox messages; those
+   marked `INTERRUPTED` with an `ImageCaptureFailed(PROCESS_INTERRUPTED)` terminal body.
+4. Mark `ACQUIRING` and `ENCODING` jobs `INTERRUPTED` and commit their failure bodies; those
    operations cannot resume safely.
 5. Reconcile `PERSISTING` jobs with partial and final paths; complete success when the final artifacts
-   verify, otherwise record terminal failure and its outbox message.
-6. Resume outbox publication.
+   verify, otherwise record terminal failure and its body.
+6. Announce each terminal the recovery itself committed, once, best effort. A terminal that was committed
+   before the restart is not re-announced: its announcement was volatile and its moment has passed.
 7. Start camera supervisors and schedules.
 
-### 17.2 Message outbox
+### 17.2 Terminal announcement
 
-The same transaction that records a terminal result inserts its exact terminal application message,
-including stable envelope UUID. Publication is retried with backoff. Successful publication records
-delivery time. Retention removes old delivered messages but
-never an undelivered terminal message without raising an operator-visible alarm.
+The transaction that records a terminal result also stores that result's encoded terminal body and its
+stable `eventId`. The winner of that transaction — and only the winner — publishes it, once, immediately
+afterwards. Nothing is queued, nothing is retried, and nothing is re-sent on the next start.
+
+A failed publish is a degradation of observability, not of the capture: it logs at warning, counts
+`camera_captures.announcementFailed`, and raises the `message-publish-degraded` component alarm, which the
+next successful announcement clears. The component keeps capturing, keeps persisting, and keeps answering
+`sb/capture-status` throughout. An announcement lost to an unavailable broker or to a stop between the
+commit and the publish is lost permanently; the image, the sidecar, and the catalog record are not.
 
 ### 17.3 Error isolation
 
@@ -1930,7 +1934,7 @@ The design does not claim exactly-once terminal-message delivery. It provides:
 - one durable capture job per idempotency key;
 - at most one final file path per capture job;
 - exactly one terminal state in the catalog;
-- at-least-once terminal application-message publication;
+- at most one best-effort terminal application-message announcement, published once and never retried;
 - at-most-one direct reply per deferred waiter;
 - consumer deduplication by `captureId`.
 
@@ -1995,20 +1999,22 @@ contract measures:
 - `staleSignals`: 1 when the camera has no successful health/capture observation within the configured
   stale threshold, otherwise 0.
 
-The optional standard `reconnects` measure is also emitted. Additional capture, queue, storage, PTZ, and
-outbox measures below are camera-specific metrics; they do not redefine `southbound_health`.
+`publishLatencyMs` is observed on the terminal announcement that reached the transport; an announcement
+that could not be published contributes no latency and is counted as `announcementFailed` instead.
+
+The optional standard `reconnects` measure is also emitted. Additional capture, queue, storage, and PTZ
+measures below are camera-specific metrics; they do not redefine `southbound_health`.
 
 ### 19.2 Camera metrics
 
 | Metric group | Bounded dimensions | Measures |
 |---|---|---|
 | `CameraConnection` | instance, backend, state | connected, connectAttempts, connectFailures, reconnects, capabilityChanges |
-| `CameraCapture` | instance, backend, result, captureMode | captures, failures, durationMs, bytes, incompleteFrames, timeouts |
+| `CameraCapture` | instance, backend, result, captureMode | captures, failures, durationMs, bytes, incompleteFrames, timeouts, announcementFailed |
 | `CameraQueue` | instance, trigger | depth, oldestAgeMs, rejected, skipped, active |
 | `CameraEncoding` | encoding, result | frames, durationMs, inputBytes, outputBytes |
 | `CameraStorage` | result | writes, writeDurationMs, bytes, freeBytes, verificationFailures |
 | `CameraPtz` | instance, operation, result | commands, failures, durationMs, forcedStops |
-| `CameraOutbox` | result | published, retries, pending, oldestAgeMs |
 
 Paths, filenames, endpoint URLs, serial numbers, request IDs, capture IDs, and raw error strings are not
 metric dimensions.
@@ -2048,7 +2054,7 @@ immutable effective profile.
 2. Send safety `stop` to cameras with active continuous PTZ motion.
 3. Wait for in-flight capture and persistence up to the configured grace period.
 4. Mark remaining non-terminal jobs `INTERRUPTED` and settle deferred waiters where transport remains.
-5. Flush the message outbox as time allows without delaying beyond the grace period.
+5. Announce those terminals, best effort, without delaying beyond the grace period.
 6. Close backend sessions, catalog, metrics, and messaging subscriptions.
 7. Let EdgeCommons publish its best-effort `STOPPED` state.
 
@@ -2217,7 +2223,7 @@ timing. Neither substitutes for the other.
   collision resistance, and maximum lengths.
 - Cron time zones, DST transitions, misfires, overlap, jitter, and deterministic schedule deduplication.
 - Job state transitions, cancellation races, restart reconciliation, catalog transactions, retention,
-  message outbox, and idempotency conflicts.
+  terminal announcement, and idempotency conflicts.
 - Admission fairness, byte reservations, queue bounds, priority aging, and resource groups.
 - Deferred reply settle-once races, late reply, requester timeout, multiple waiters, and shutdown.
 - Group capture: all-or-nothing validation, aggregated-reply assembly, partial completion, group
@@ -2274,21 +2280,20 @@ For the component:
   recovery, and late reply behavior.
 - Use at least one independent consumer implementation, preferably the EdgeCommons Python library, to
   prove the Rust component contract is not self-consistent only.
-- Verify terminal application messages are published locally by default and survive a broker outage
-  through the outbox with the same envelope UUID on retry.
+- Verify terminal application messages are published locally by default, and that a broker outage costs
+  the announcement and nothing else: captures still succeed, images and sidecars still land, the catalog
+  and `sb/capture-status` still answer, and `message-publish-degraded` is raised and then cleared.
 - Verify shutdown unsubscribes cleanly and does not leak request subscriptions.
 - Verify rooted and rootless exact topics, protobuf wire encoding, and per-camera identity stamping.
 - Verify UNS-bridge behavior with `app` uplink disabled and enabled, and terminal request/reply both before
   and after bridge reply-map TTL expiry.
 
-For the required core deferred-reply, correlated-`app()`, and acknowledged-publish additions:
+For the required core deferred-reply and correlated-`app()` additions:
 
 - Extend shared vectors where applicable.
 - Run Java, Python, Rust, and TypeScript as both requester and deferred responder over local MQTT.
 - Assert exact correlation IDs, one reply, timeout cleanup, late-reply drop, and application-message
   header propagation.
-- Assert MQTT QoS 1 delivery is not confirmed before PUBACK, disconnect-before-PUBACK remains pending,
-  ambiguous timeout retries the same UUID, and Greengrass IPC operation completion is observed.
 - Deploy all four interop nodes on `lab-5950x` and repeat over real Greengrass IPC.
 
 ### 23.4 Backend integration validation
@@ -2333,13 +2338,14 @@ deferred to a later validation phase and is not a current gate:
 - 256 simulated connected cameras for 24 hours with schedules, command bursts, reconnects, and PTZ traffic.
 - 32 concurrent 8-megapixel captures with `maxInFlightBytes` enforcement and no unbounded RSS growth.
 - 10,000 mixed submitted jobs with retries and idempotent duplicates.
-- Broker outage during 1,000 terminal captures, followed by outbox drain with no missing capture IDs.
+- Broker outage during 1,000 terminal captures: every capture still reaches a durable terminal state with
+  its image on disk, and every capture ID is still answerable through `sb/capture-status`.
 - Repeated config reloads while cameras connect, capture, and drain.
 - Forced process termination at acquisition, encoding, persistence, DB commit, reply, and terminal-message publication.
 - Seven-day schedule/DST simulation with an injected clock; no wall-clock waiting in CI.
 
 Record CPU, RSS, native thread count, open descriptors, buffer counts, NIC loss, disk latency, command
-latency, queue depth, and outbox age. Release thresholds are established in the phase-0 spike and kept in a
+latency, and queue depth. Release thresholds are established in the phase-0 spike and kept in a
 versioned benchmark baseline.
 
 ### 23.6 Physical camera compatibility matrix
@@ -2399,7 +2405,7 @@ A phase is not complete based only on unit tests. The review record must include
 |---|---|---|
 | P0 — dependency and capacity spike | Rust skeleton; Aravis and GStreamer packaging; ONVIF client approach; SimBackend; SQLite; Windows feasibility; baseline memory/threads | Native stacks capture one frame; SimBackend proves 256 sessions; dependencies and supported OS matrix approved. |
 | P1 — core messaging plumbing | Four-language deferred commands, correlated application messages, and acknowledgement-capable publish | Unit coverage, local 4×4 MQTT interop including PUBACK behavior, deployed 4-language Greengrass IPC interop; four-language skeletons and CLI component templates updated, compiled, and scaffold→build regression-tested against the new APIs; core docs-site developer guide and per-subsystem reference pages updated. |
-| P2 — common engine | Config, catalog/outbox, admission, schedules, storage, command/message surface, SimBackend | Complete contract green against simulator and EMQX; crash checkpoints and 90% coverage. |
+| P2 — common engine | Config, catalog, admission, schedules, storage, command/message surface, SimBackend | Complete contract green against simulator and EMQX; crash checkpoints and 90% coverage. |
 | P3 — ONVIF snapshot and PTZ | ONVIF discovery/services/auth, snapshot capture, PTZ/presets, simulator | Full ONVIF simulator suite and security tests; physical ONVIF/PTZ compatibility is explicitly waived for this project. |
 | P4 — GenICam/Aravis | GigE Vision and USB3 Vision, feature profiles, buffer acquisition, formats | Aravis simulator and packet-fault tests; vendor hardware compatibility is explicitly waived for this project. |
 | P5 — RTSP capture | GStreamer frame extraction and ONVIF fallback | RTSP simulator and codec/fault suite; physical fallback-camera compatibility is explicitly waived for this project. |
@@ -2436,7 +2442,7 @@ Reviewers should explicitly decide:
 - [ ] One component with `genicam-aravis` and `onvif-rtsp` backends is the right product boundary.
 - [ ] One camera per EdgeCommons instance is correct.
 - [ ] The 256-connected / 32-concurrent capacity target is appropriate.
-- [ ] SQLite durable job state and a message outbox are warranted.
+- [ ] SQLite durable job state, with a volatile best-effort terminal announcement, is warranted.
 - [ ] The output root and default per-camera subdirectory layout are correct.
 - [ ] Absolute path, relative path, file URI, checksum, and metadata are sufficient for consumers.
 - [ ] Deferred `sb/capture` and immediate `sb/capture-submit` are both required.
@@ -2447,7 +2453,7 @@ Reviewers should explicitly decide:
 - [ ] Four-language deferred-command, correlated-`app()`, and acknowledgement-capable-publish core
   additions are accepted plumbing.
 - [ ] Command names, bodies, error codes, and PTZ normalized coordinates are acceptable.
-- [ ] Event types and at-least-once semantics are sufficient.
+- [ ] Event types and best-effort, publish-once announcement semantics are sufficient.
 - [ ] ONVIF snapshot timing semantics and RTSP fallback are described truthfully.
 - [ ] Storage, URI, credential, and PTZ security controls are adequate.
 - [ ] Simulator, waived-physical, Greengrass, Kubernetes, scale, and soak gates are sufficient.
@@ -2476,7 +2482,7 @@ Reviewers should explicitly decide:
    into one reply within the existing single-reply command model. A core pattern would also serve other
    fan-out surfaces (multi-instance adapters, edge-console bulk commands) and, if wanted, should be
    designed in core with four-language parity rather than per component.
-10. Should the P2 common engine (config, catalog/outbox, admission, scheduling, image persistence writer, command
+10. Should the P2 common engine (config, catalog, admission, scheduling, image persistence writer, command
     surface) be extracted into the planned reusable Rust protocol-adapter CLI template, and in which
     phase does that extraction land?
 

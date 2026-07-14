@@ -27,6 +27,7 @@ so a capture that starts and finishes between two collection intervals is still 
 | `failed` | Count | A capture reaches `FAILED`. |
 | `cancelled` | Count | A capture reaches `CANCELLED`. |
 | `interrupted` | Count | A capture reaches `INTERRUPTED`. |
+| `announcementFailed` | Count | A durable terminal result could not be announced. The capture is committed, its image is on disk, and the message is dropped rather than retried; this is the count of results nobody was told about. |
 
 `camera_queue` samples what the component is currently holding, every 30 seconds. These are levels rather
 than events, so there is nothing to miss between samples.
@@ -68,8 +69,12 @@ supervisors, at least one accepted enabled camera, available state capacity, and
 | Alarm | Severity | Raised when | Cleared when |
 |---|---|---|---|
 | `storage-low` | critical | Output or state root is unreadable or falls below the configured free-space floor. | Every configured root is usable again. |
-| `message-delivery-delayed` | warning | Durable terminal outbox pressure crosses its threshold. | The outbox recovers. |
+| `message-publish-degraded` | warning | A terminal announcement cannot be published. Capture results stay durable and `sb/capture-status` keeps answering; the announcements are dropped while it lasts. | A terminal announcement is published again. |
 
-Alarm context carries bounded storage/free-space or outbox-age/count information. It intentionally excludes
-camera URLs, file paths beyond the affected root, credentials, request metadata, and arbitrary camera error
-text. Capture-level outcomes belong in terminal application messages rather than metrics dimensions.
+Neither alarm gates readiness on messaging: a component that cannot reach its broker keeps capturing and
+keeps persisting.
+
+Alarm context carries bounded storage/free-space information, or the camera instance, capture ID, and
+stable error code of the announcement that failed. It intentionally excludes camera URLs, file paths beyond
+the affected root, credentials, request metadata, and arbitrary camera error text. Capture-level outcomes
+belong in terminal application messages rather than metrics dimensions.

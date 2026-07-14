@@ -1,7 +1,8 @@
 //! Schema-v1 terminal application-message bodies and exact routing metadata.
 //!
-//! The durable outbox owns the fully encoded EdgeCommons envelope. This module owns the domain
-//! body and the invariant that its convenience `correlationId` equals the envelope correlation.
+//! A terminal message is a kind (which fixes the header name and the `app/` channel) plus one
+//! validated schema-v1 body document. The body document is what the catalog commits as the durable
+//! terminal result and what the best-effort announcement carries, so the two can never disagree.
 
 use std::collections::BTreeMap;
 
@@ -18,8 +19,6 @@ use crate::{
 
 /// Current terminal-body schema version.
 pub const TERMINAL_SCHEMA_VERSION: u8 = 1;
-/// EdgeCommons application-envelope version used for terminal messages.
-pub const TERMINAL_ENVELOPE_VERSION: &str = "1.0";
 
 /// Terminal application-message kind and its exact routing contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,11 +244,16 @@ pub struct TerminalBody {
     pub backend_metadata: BTreeMap<String, Value>,
 }
 
-/// A validated terminal message before the EdgeCommons facade stamps its exact envelope.
+/// A validated terminal message before the EdgeCommons facade stamps its envelope.
+///
+/// The body is held as the serialized schema-v1 document rather than the typed struct, because that
+/// document is what is durably committed: a terminal that a later process must announce is rebuilt
+/// from the catalog through [`Self::from_committed_body`], and it has to be the same message the
+/// original process would have sent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalMessage {
     kind: TerminalKind,
-    body: TerminalBody,
+    body: Value,
 }
 
 impl TerminalMessage {
@@ -258,39 +262,62 @@ impl TerminalMessage {
         if body.schema_version != TERMINAL_SCHEMA_VERSION {
             return invalid("terminal schemaVersion must be 1");
         }
-        for (field, value) in [
-            ("eventId", body.event_id.as_str()),
-            ("captureId", body.capture_id.as_str()),
-            ("cameraId", body.camera_id.as_str()),
-            ("correlationId", body.correlation_id.as_str()),
-            ("captureProfile", body.capture_profile.as_str()),
+        let value = serde_json::to_value(&body).map_err(CameraError::from)?;
+        Self::from_committed_body(kind, value)
+    }
+
+    /// Rebuilds a terminal message from a body document the catalog already committed.
+    ///
+    /// This is the announcement path for a terminal whose message was never sent -- the crash-window
+    /// install recovery, which commits a terminal staged by a process that no longer exists. The body
+    /// is re-validated rather than trusted: the durable document is the contract.
+    pub fn from_committed_body(kind: TerminalKind, body: Value) -> Result<Self> {
+        let object = body
+            .as_object()
+            .ok_or_else(|| invalid_error("terminal body must be a JSON object"))?;
+        if object.get("schemaVersion").and_then(Value::as_u64) != Some(u64::from(TERMINAL_SCHEMA_VERSION)) {
+            return invalid("terminal schemaVersion must be 1");
+        }
+        for field in [
+            "eventId",
+            "captureId",
+            "cameraId",
+            "correlationId",
+            "captureProfile",
         ] {
-            if value.is_empty() {
-                return invalid(format!("terminal {field} must be non-empty"));
+            match object.get(field).and_then(Value::as_str) {
+                Some(value) if !value.is_empty() => {}
+                _ => return invalid(format!("terminal {field} must be non-empty")),
             }
         }
+        let has_image = object.get("image").is_some_and(|value| !value.is_null());
+        let has_failure = object.get("failure").is_some_and(|value| !value.is_null());
         match kind {
-            TerminalKind::Captured if body.image.is_none() || body.failure.is_some() => {
+            TerminalKind::Captured if !has_image || has_failure => {
                 return invalid("ImageCaptured requires image and forbids failure");
             }
-            TerminalKind::Failed if body.image.is_some() || body.failure.is_none() => {
+            TerminalKind::Failed if has_image || !has_failure => {
                 return invalid("ImageCaptureFailed requires failure and forbids image");
             }
-            TerminalKind::Cancelled if body.image.is_some() || body.failure.is_some() => {
+            TerminalKind::Cancelled if has_image || has_failure => {
                 return invalid("ImageCaptureCancelled forbids image and failure");
             }
             _ => {}
         }
-        match (&body.capture_group_id, body.group_size) {
+        let group_id = object.get("captureGroupId").and_then(Value::as_str);
+        let group_size = object.get("groupSize").and_then(Value::as_u64);
+        match (group_id, group_size) {
             (None, None) => {}
             (Some(_), Some(size)) if size >= 2 => {}
             _ => return invalid("captureGroupId and groupSize >= 2 must appear together"),
         }
-        if let CaptureTrigger::GroupCommand {
-            capture_group_id, ..
-        } = &body.trigger
+        if object.get("trigger").and_then(|trigger| trigger.get("type")) == Some(&json_group_command())
         {
-            if body.capture_group_id.as_deref() != Some(capture_group_id) {
+            let trigger_group = object
+                .get("trigger")
+                .and_then(|trigger| trigger.get("captureGroupId"))
+                .and_then(Value::as_str);
+            if trigger_group != group_id {
                 return invalid("group trigger and terminal captureGroupId must match");
             }
         }
@@ -324,33 +351,52 @@ impl TerminalMessage {
     /// Correlation that must be supplied to `AppFacade::prepare_correlated`.
     #[must_use]
     pub fn correlation_id(&self) -> &str {
-        &self.body.correlation_id
+        self.string_field("correlationId")
     }
 
-    /// Domain body for the EdgeCommons application facade.
-    pub fn body_value(&self) -> Result<Value> {
-        serde_json::to_value(&self.body).map_err(CameraError::from)
+    /// Stable event deduplication identifier of the validated body.
+    #[must_use]
+    pub fn event_id(&self) -> &str {
+        self.string_field("eventId")
     }
 
-    /// Prepares one identity-stamped exact envelope through the guarded EdgeCommons app facade.
+    /// The camera this terminal belongs to.
+    #[must_use]
+    pub fn camera_id(&self) -> &str {
+        self.string_field("cameraId")
+    }
+
+    /// Prepares one identity-stamped envelope through the guarded EdgeCommons app facade.
     ///
-    /// The caller persists `PreparedAppMessage::topic()` and `encoded()` in the same catalog
-    /// transaction as the terminal state before attempting publication.
+    /// Preparation is separate from publication: the announcement is best-effort, and a message that
+    /// cannot even be stamped must be reported the same way as one the transport refuses.
     pub fn prepare(&self, app: &AppFacade) -> Result<PreparedAppMessage> {
         app.prepare_correlated(
             self.header_name(),
             self.channel(),
-            self.body_value()?,
+            self.body.clone(),
             self.correlation_id(),
         )
         .map_err(|error| CameraError::Messaging(error.to_string()))
     }
 
-    /// Validated body view.
+    /// Validated schema-v1 body document.
     #[must_use]
-    pub const fn body(&self) -> &TerminalBody {
+    pub const fn body(&self) -> &Value {
         &self.body
     }
+
+    /// A body field validated as a non-empty string at construction.
+    fn string_field(&self, field: &str) -> &str {
+        self.body
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    }
+}
+
+fn json_group_command() -> Value {
+    Value::String("group-command".to_string())
 }
 
 fn serialize_error_code<S>(code: &ErrorCode, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -361,10 +407,11 @@ where
 }
 
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
-    Err(CameraError::rejected(
-        ErrorCode::InvalidRequest,
-        message.into(),
-    ))
+    Err(invalid_error(message))
+}
+
+fn invalid_error(message: impl Into<String>) -> CameraError {
+    CameraError::rejected(ErrorCode::InvalidRequest, message.into())
 }
 
 #[cfg(test)]
@@ -432,7 +479,7 @@ mod tests {
         assert_eq!(message.header_name(), "ImageCaptured");
         assert_eq!(message.channel(), "image/captured");
         assert_eq!(message.correlation_id(), "corr-1");
-        let value = message.body_value().unwrap();
+        let value = message.body();
         assert_eq!(value["schemaVersion"], 1);
         assert_eq!(value["correlationId"], "corr-1");
         assert_eq!(
@@ -500,7 +547,7 @@ mod tests {
             message: "process restarted".to_string(),
         });
         let message = TerminalMessage::new(TerminalKind::Failed, body).unwrap();
-        let value = message.body_value().unwrap();
+        let value = message.body();
         assert_eq!(value["failure"]["code"], "PROCESS_INTERRUPTED");
         assert!(value["timestamps"].get("persistedAt").is_none());
         assert_eq!(message.channel(), "image/failed");
@@ -542,8 +589,8 @@ mod tests {
         valid.group_size = Some(3);
         let value = TerminalMessage::new(TerminalKind::Cancelled, valid)
             .unwrap()
-            .body_value()
-            .unwrap();
+            .body()
+            .clone();
         assert_eq!(value["captureGroupId"], "grp_1");
         assert_eq!(value["groupSize"], 3);
         assert_eq!(
@@ -567,8 +614,8 @@ mod tests {
             .insert("exposureUs".to_string(), json!(1200));
         let value = TerminalMessage::new(TerminalKind::Cancelled, body)
             .unwrap()
-            .body_value()
-            .unwrap();
+            .body()
+            .clone();
         assert_eq!(
             value["trigger"],
             json!({

@@ -43,6 +43,7 @@ use tokio::{
 };
 
 use super::*;
+use crate::jobs::testing::RecordingAnnouncer;
 
 type RecordedMqttPublishes = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
@@ -160,30 +161,6 @@ impl CaptureWaiter for CountingWaiter {
     }
 }
 
-struct TestTerminalEncoder;
-
-impl crate::jobs::TerminalEnvelopeEncoder for TestTerminalEncoder {
-    fn encode(
-        &self,
-        terminal: &crate::messages::TerminalMessage,
-        created_at_ms: i64,
-    ) -> Result<crate::catalog::NewOutboxMessage> {
-        let message =
-            edgecommons::messaging::MessageBuilder::new(terminal.header_name(), "1.0")
-                .correlation_id(terminal.correlation_id())
-                .structured_payload(terminal.body_value()?)
-                .build();
-        crate::catalog::NewOutboxMessage::from_message(
-            terminal.body().event_id.clone(),
-            "terminal",
-            format!("ecv1/test/camera-adapter/main/app/{}", terminal.channel()),
-            &message,
-            created_at_ms,
-            created_at_ms,
-        )
-    }
-}
-
 fn core_config_value(root: &Path, cameras: &[&str], schedules: bool) -> serde_json::Value {
     let root = root.to_string_lossy();
     let instances = cameras
@@ -288,7 +265,7 @@ async fn runtime_with_storage_pressure_and_metrics(
                 catalog.clone(),
                 admission.clone(),
                 storage.clone(),
-                Arc::new(TestTerminalEncoder),
+                Arc::new(RecordingAnnouncer::default()) as Arc<dyn crate::jobs::TerminalAnnouncer>,
                 Arc::clone(&waiters) as Arc<dyn JobHooks>,
             )
             .with_acceptance_hook(Arc::clone(&waiters) as Arc<dyn AcceptanceHook>),
@@ -306,9 +283,10 @@ async fn runtime_with_storage_pressure_and_metrics(
         storage,
         registry,
         cameras: Arc::new(RwLock::new(new_slots(engines, BTreeMap::new()))),
-        outbox_events: None,
+        component_events: None,
         storage_pressure,
         storage_alarm: Arc::new(Mutex::new(StorageAlarmState::default())),
+        messaging_alarm: Arc::new(Mutex::new(MessagingAlarmState::default())),
         readiness: RuntimeReadiness::noop(),
         metrics: Arc::new(crate::observability::CaptureMetrics::new(metrics)),
         health: Arc::new(crate::observability::FleetHealth::default()),
@@ -318,7 +296,6 @@ async fn runtime_with_storage_pressure_and_metrics(
         scheduler,
         cancellation: CancellationToken::new(),
         tasks: Mutex::new(Vec::new()),
-        outbox_escalated: Arc::new(AtomicBool::new(false)),
         connect_gate: Arc::new(Semaphore::new(1)),
         waiters: Arc::clone(&waiters),
         cursors: CursorStore::default(),
@@ -3667,14 +3644,8 @@ async fn capture_lifecycle_events_are_opt_in_and_use_the_event_facade() {
     assert_eq!(started.body["context"]["captureProfile"], "main");
     assert_eq!(started.body["context"]["captureMode"], "simulated");
 
-    let outbox = runtime
-        .catalog
-        .pending_outbox(chrono::Utc::now().timestamp_millis(), 10)
-        .await
-        .unwrap();
-    assert_eq!(outbox.len(), 1);
-    assert_eq!(outbox[0].message_kind, "terminal");
-    assert!(outbox[0].topic.ends_with("/app/image/captured"));
+    let terminal = runtime.catalog.job(&capture_id).await.unwrap().unwrap();
+    assert_eq!(terminal.state, crate::model::JobState::Succeeded);
     runtime.shutdown().await;
 }
 
@@ -3723,14 +3694,10 @@ async fn disabled_capture_lifecycle_events_do_not_publish_or_change_terminal_del
         }),
         "disabled lifecycle diagnostics must not publish"
     );
-    let outbox = runtime
-        .catalog
-        .pending_outbox(chrono::Utc::now().timestamp_millis(), 10)
-        .await
-        .unwrap();
-    assert_eq!(outbox.len(), 1);
-    assert_eq!(outbox[0].message_kind, "terminal");
-    assert!(outbox[0].topic.ends_with("/app/image/captured"));
+    assert!(
+        terminal.terminal_result.is_some(),
+        "disabling the lifecycle diagnostics must not touch the durable terminal result"
+    );
     runtime.shutdown().await;
 }
 
@@ -3825,13 +3792,10 @@ async fn unavailable_lifecycle_event_routing_does_not_change_terminal_capture_ou
     };
     let terminal = wait_for_terminal(&runtime, &record.capture_id).await;
     assert_eq!(terminal.state, crate::model::JobState::Succeeded);
-    let outbox = runtime
-        .catalog
-        .pending_outbox(chrono::Utc::now().timestamp_millis(), 10)
-        .await
-        .unwrap();
-    assert_eq!(outbox.len(), 1);
-    assert_eq!(outbox[0].message_kind, "terminal");
+    assert!(
+        terminal.terminal_result.is_some(),
+        "a camera with no event facade still commits its durable terminal result"
+    );
     runtime.shutdown().await;
 }
 
@@ -4858,14 +4822,13 @@ async fn runtime_startup_router_and_deferred_capture_flows_use_real_core_facades
         RuntimeServices {
             apps,
             events,
-            outbox_events: core.events(),
+            component_events: core.events(),
             metrics: Arc::new(RecordingMetrics::default()),
             readiness: readiness.clone(),
             backend_context: BackendRuntimeContext::new(
                 None,
                 &crate::config::LimitsConfig::default(),
             ),
-            messaging: core.messaging().unwrap(),
         },
     )
     .await
@@ -5507,15 +5470,12 @@ async fn short_linux_capacity_proves_1024_configured_256_sessions_and_32_capture
         RuntimeServices {
             apps,
             events,
-            outbox_events: core.events(),
+            component_events: core.events(),
             readiness,
             backend_context: BackendRuntimeContext::new(
                 None,
                 &crate::config::LimitsConfig::default(),
             ),
-            messaging: core
-                .messaging()
-                .expect("capacity Core must expose messaging"),
         },
     )
     .await
@@ -5868,15 +5828,12 @@ async fn fifteen_minute_linux_capacity_smoke_exercises_mixed_runtime_traffic() {
         RuntimeServices {
             apps,
             events,
-            outbox_events: core.events(),
+            component_events: core.events(),
             readiness: RuntimeReadiness::noop(),
             backend_context: BackendRuntimeContext::new(
                 None,
                 &crate::config::LimitsConfig::default(),
             ),
-            messaging: core
-                .messaging()
-                .expect("capacity smoke Core must expose messaging"),
         },
     )
     .await
@@ -6082,43 +6039,30 @@ fn retention_terminal_for(
     group_id: Option<&str>,
     sequence: u8,
 ) -> crate::catalog::TerminalWrite {
-    let event_key = format!("retention-event-{sequence}");
-    let mut body = json!({
+    let mut result = json!({
         "schemaVersion": 1,
-        "eventId": event_key.clone(),
+        "eventId": format!("retention-event-{sequence}"),
         "captureId": capture_id,
         "cameraId": instance,
         "correlationId": format!("corr-{capture_id}"),
+        "state": "FAILED",
     });
     if let Some(group_id) = group_id {
-        body["captureGroupId"] = json!(group_id);
+        result["captureGroupId"] = json!(group_id);
     }
-    let message = MessageBuilder::new("ImageCaptureFailed", "1.0")
-        .correlation_id(format!("corr-{capture_id}"))
-        .payload(body)
-        .build();
     crate::catalog::TerminalWrite {
         state: crate::model::JobState::Failed,
-        result: json!({ "state": "FAILED" }),
+        result,
         error_code: Some("PROCESS_INTERRUPTED".to_owned()),
         error_message: Some("bounded failure".to_owned()),
         // Deliberately ancient: every sweep below uses the real clock, so these records
-        // are far outside both configured retention windows.
+        // are far outside the configured retention window.
         terminal_at_ms: 20_000 + i64::from(sequence),
-        outbox: crate::catalog::NewOutboxMessage::from_message(
-            event_key,
-            "terminal",
-            "ecv1/test/camera-adapter/main/app/image/failed",
-            &message,
-            20_000,
-            20_000,
-        )
-        .unwrap(),
     }
 }
 
 /// Seeds two terminal direct jobs, one terminal group with a terminal member, and one
-/// completed standalone command ledger, then marks every terminal message delivered.
+/// completed standalone command ledger.
 async fn seed_retained_state(catalog: &Catalog) {
     for (capture, sequence) in [("retention-a", 1_u8), ("retention-b", 2)] {
         catalog
@@ -6220,12 +6164,6 @@ async fn seed_retained_state(catalog: &Catalog) {
         .await
         .unwrap();
 
-    for record in catalog.pending_outbox(i64::MAX, 100).await.unwrap() {
-        catalog
-            .mark_outbox_delivered(record.id, 35_000)
-            .await
-            .unwrap();
-    }
 }
 
 // Every one of these records used to accumulate forever: the whole retention subsystem was
@@ -6243,7 +6181,6 @@ async fn retention_sweep_reclaims_state_past_its_windows_and_reports_the_counts(
         .retention_sweep(now_ms, RETENTION_BATCH, &CancellationToken::new())
         .await
         .unwrap();
-    assert_eq!(sweep.delivered_outbox, 4);
     assert_eq!(sweep.terminal_jobs, 2);
     assert_eq!(sweep.terminal_groups, 1);
     assert_eq!(sweep.command_ledgers, 1);
@@ -6251,7 +6188,7 @@ async fn retention_sweep_reclaims_state_past_its_windows_and_reports_the_counts(
         sweep.over_limit_jobs, 0,
         "a record count far below maxResultRecords must reclaim nothing"
     );
-    assert_eq!(sweep.reclaimed(), 8);
+    assert_eq!(sweep.reclaimed(), 4);
 
     assert!(catalog.job("retention-a").await.unwrap().is_none());
     assert!(catalog.job("retention-b").await.unwrap().is_none());
@@ -6285,12 +6222,6 @@ async fn retention_sweep_enforces_the_configured_result_record_maximum() {
         catalog.queue_job(capture, 2_000).await.unwrap();
         catalog
             .commit_terminal(capture, retention_terminal(capture, "camera-a", sequence))
-            .await
-            .unwrap();
-    }
-    for record in catalog.pending_outbox(i64::MAX, 100).await.unwrap() {
-        catalog
-            .mark_outbox_delivered(record.id, 35_000)
             .await
             .unwrap();
     }
@@ -6348,9 +6279,8 @@ async fn retention_sweep_reclaims_a_backlog_in_bounded_paced_batches() {
         )
         .await
         .unwrap();
-    assert_eq!(sweep.delivered_outbox, 4);
     assert_eq!(sweep.terminal_jobs, 2);
-    assert_eq!(sweep.reclaimed(), 8);
+    assert_eq!(sweep.reclaimed(), 4);
     assert!(catalog.job("retention-b").await.unwrap().is_none());
     runtime.shutdown().await;
 }
@@ -8509,71 +8439,6 @@ async fn an_expired_capture_is_retired_even_if_the_store_was_refusing_writes() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    runtime.shutdown().await;
-}
-
-/// An outbox that cannot keep up stops the component taking more work.
-///
-/// The escalation flag existed, tripped at eighty thousand pending messages, raised an alarm --
-/// and NOTHING SHED. The component carried on accepting captures at full rate, each one adding
-/// another durable message to a queue that was already losing ground.
-///
-/// There is no honest way to shed a durable message: it is the record of a capture that
-/// actually happened, and dropping it loses data an operator was promised. The only place load
-/// can be shed is where it is taken on, and a capture nobody can be told about is not a
-/// capture.
-#[tokio::test]
-async fn a_drowning_outbox_refuses_new_captures_rather_than_making_it_worse() {
-    let directory = TempDir::new().unwrap();
-    let runtime = runtime(config(directory.path(), &["camera-a"], false), &directory).await;
-
-    runtime
-        .submit_capture(
-            "camera-a".to_string(),
-            "before-the-flood".to_string(),
-            None,
-            None,
-            serde_json::Map::new(),
-            "shed-correlation".to_string(),
-            "sb/capture-submit",
-            crate::admission::CapturePriority::Submitted,
-        )
-        .await
-        .expect("a healthy component takes work");
-
-    // The outbox escalates: it cannot publish results as fast as they are being produced.
-    runtime.outbox_escalated.store(true, Ordering::Release);
-
-    let error = runtime
-        .submit_capture(
-            "camera-a".to_string(),
-            "during-the-flood".to_string(),
-            None,
-            None,
-            serde_json::Map::new(),
-            "shed-correlation-2".to_string(),
-            "sb/capture-submit",
-            crate::admission::CapturePriority::Submitted,
-        )
-        .await
-        .expect_err("a component that cannot publish must not keep producing");
-    assert_eq!(error.code(), crate::ErrorCode::ResourceLimit);
-
-    // And it takes work again the moment it recovers -- shedding is backpressure, not a fuse.
-    runtime.outbox_escalated.store(false, Ordering::Release);
-    runtime
-        .submit_capture(
-            "camera-a".to_string(),
-            "after-the-flood".to_string(),
-            None,
-            None,
-            serde_json::Map::new(),
-            "shed-correlation-3".to_string(),
-            "sb/capture-submit",
-            crate::admission::CapturePriority::Submitted,
-        )
-        .await
-        .expect("a recovered component takes work again");
     runtime.shutdown().await;
 }
 
