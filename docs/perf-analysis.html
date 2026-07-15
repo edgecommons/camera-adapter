@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>camera-adapter — performance analysis: central capture queue under a synchronized burst</title>
+<style>
+:root {
+  --bg:#f6f7fb; --surface:#ffffff; --surface2:#eef1f7; --border:#dde2ec; --text:#1a2233; --muted:#5c6780;
+  --iris:#4f5bd5; --iris-deep:#3a3f9e; --copper:#d67a4e; --good:#3f9e6b; --warn:#c88a35; --bad:#c95a61;
+  --catalog:#3a3f9e; --acquire:#4f8fd6; --catalog2:#7a83e0;
+  --mono:"JetBrains Mono","Cascadia Code",Consolas,ui-monospace,monospace;
+  --sans:"Manrope","Avenir Next","Segoe UI",system-ui,Arial,sans-serif;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#12141f; --surface:#1c2030; --surface2:#242a3d; --border:#333a52; --text:#e9ecf5; --muted:#9aa3bd;
+  --iris:#8b95ec; --copper:#e29368; --good:#5fbd8a; --warn:#d99a47; --bad:#e78088;
+  --catalog:#8b95ec; --acquire:#6fa8e0; --catalog2:#b0b6f0; }}
+:root[data-theme="dark"]{ --bg:#12141f;--surface:#1c2030;--surface2:#242a3d;--border:#333a52;--text:#e9ecf5;--muted:#9aa3bd;--iris:#8b95ec;--copper:#e29368;--good:#5fbd8a;--warn:#d99a47;--bad:#e78088;--catalog:#8b95ec;--acquire:#6fa8e0;--catalog2:#b0b6f0; }
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.6;-webkit-font-smoothing:antialiased}
+.wrap{max-width:900px;margin:0 auto;padding:48px 22px 90px}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:0 0 10px}
+h1{font-size:31px;line-height:1.15;margin:0 0 12px;letter-spacing:-.015em;text-wrap:balance}
+.sub{color:var(--muted);max-width:64ch;margin:0}
+h2{font-family:var(--mono);font-size:13px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:600;margin:52px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+p{max-width:66ch} b{font-weight:650}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:24px 0}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:15px 16px}
+.tile .n{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.15;color:var(--iris)}
+.tile .l{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-top:3px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px 20px;margin:16px 0}
+.chart{width:100%;height:auto;display:block;margin:6px 0 4px}
+.grid{stroke:var(--border);stroke-width:1} .axis{font-family:var(--mono);font-size:11px;fill:var(--muted)}
+.axis.dim{opacity:.7} .val{font-family:var(--mono);font-size:13px;font-weight:600;fill:var(--text)}
+.tiny{font-family:var(--mono);font-size:10.5px;fill:var(--text)}
+table{border-collapse:collapse;width:100%;font-size:14px;margin-top:8px} .scroll{overflow-x:auto}
+th,td{text-align:right;padding:8px 12px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
+th:first-child,td:first-child{text-align:left}
+th{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600}
+code{font-family:var(--mono);font-size:13px;background:var(--surface2);padding:1px 5px;border-radius:3px}
+ul{max-width:66ch}
+.call{background:var(--surface2);border:1px solid var(--border);border-left:3px solid var(--copper);border-radius:8px;padding:15px 18px;margin:20px 0}
+.call.good{border-left-color:var(--good)} .call p{margin:0;max-width:none} .call p+p{margin-top:9px}
+.foot{margin-top:56px;padding-top:18px;border-top:1px solid var(--border);color:var(--muted);font-size:13px}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<p class="eyebrow">edgecommons/camera-adapter &middot; two-box load test &middot; adapter on lab-5950x (NVMe SSD), fleet on a separate host &middot; 2026-07-15</p>
+<h1>How fast the adapter clears a line of cameras &mdash; and what actually gates it</h1>
+<p class="sub">A synchronized burst (every camera captures at once &mdash; the line-clearance pattern) at 75, 100 and 125 warm ONVIF-RTSP cameras, with the adapter alone on an NVMe SSD box and the camera fleet on another machine across the wire. Every camera captured; nothing was dropped, disconnected, or restarted at any scale.</p>
+
+<div class="tiles">
+  <div class="tile"><div class="n">3.2&ndash;4.9s</div><div class="l">clear 75&rarr;125 cameras</div></div>
+  <div class="tile"><div class="n">~25/s</div><div class="l">sustained throughput</div></div>
+  <div class="tile"><div class="n">0</div><div class="l">drops &middot; disconnects &middot; restarts</div></div>
+  <div class="tile"><div class="n">durable catalog</div><div class="l">the gating factor</div></div>
+</div>
+
+<h2>Clearance time &mdash; trigger to last image durably on disk</h2>
+<p>The whole line clears in a handful of seconds, and it scales gently: adding 50 cameras (75&rarr;125) adds ~1.7&nbsp;s, not proportionally more. This is the warm case &mdash; sessions already connected, the realistic line-clearance state.</p>
+<div class="card"><svg viewBox="0 0 520 200" class="chart" role="img"><line x1="44" y1="44" x2="476" y2="44" class="grid"/><text x="38" y="48" class="axis" text-anchor="end">6</text><line x1="44" y1="72" x2="476" y2="72" class="grid"/><text x="38" y="76" class="axis" text-anchor="end">4</text><line x1="44" y1="100" x2="476" y2="100" class="grid"/><text x="38" y="104" class="axis" text-anchor="end">3</text><line x1="44" y1="128" x2="476" y2="128" class="grid"/><text x="38" y="132" class="axis" text-anchor="end">1</text><line x1="44" y1="156" x2="476" y2="156" class="grid"/><text x="38" y="160" class="axis" text-anchor="end">0</text><rect x="73" y="92" width="86" height="64" rx="3" fill="var(--iris)"/><text x="116" y="85" class="val" text-anchor="middle">3.2s</text><text x="116" y="174" class="axis" text-anchor="middle">75</text><rect x="217" y="66" width="86" height="90" rx="3" fill="var(--iris)"/><text x="260" y="59" class="val" text-anchor="middle">4.5s</text><text x="260" y="174" class="axis" text-anchor="middle">100</text><rect x="361" y="59" width="86" height="97" rx="3" fill="var(--iris)"/><text x="404" y="52" class="val" text-anchor="middle">4.9s</text><text x="404" y="174" class="axis" text-anchor="middle">125</text><text x="476" y="194" class="axis dim" text-anchor="end">seconds</text></svg></div>
+
+<h2>Throughput is flat &mdash; the concurrency cap is not the limit</h2>
+<p>Throughput sits at ~22&ndash;25 captures/second <b>regardless of how many cameras</b>. The last bar (<code>125*</code>) is the same 125-camera burst with the in-flight concurrency cap raised from 32 to 125 &mdash; and it barely moved (25&rarr;27/s). If the 32-wide capture gate were the bottleneck, opening it 4&times; would have opened the throughput. It didn't. Something downstream is the real ceiling.</p>
+<div class="card"><svg viewBox="0 0 520 200" class="chart" role="img"><line x1="44" y1="44" x2="476" y2="44" class="grid"/><text x="38" y="48" class="axis" text-anchor="end">31</text><line x1="44" y1="72" x2="476" y2="72" class="grid"/><text x="38" y="76" class="axis" text-anchor="end">23</text><line x1="44" y1="100" x2="476" y2="100" class="grid"/><text x="38" y="104" class="axis" text-anchor="end">15</text><line x1="44" y1="128" x2="476" y2="128" class="grid"/><text x="38" y="132" class="axis" text-anchor="end">8</text><line x1="44" y1="156" x2="476" y2="156" class="grid"/><text x="38" y="160" class="axis" text-anchor="end">0</text><rect x="66" y="71" width="65" height="85" rx="3" fill="var(--copper)"/><text x="98" y="64" class="val" text-anchor="middle">23/s</text><text x="98" y="174" class="axis" text-anchor="middle">75</text><text x="98" y="188" class="axis dim" text-anchor="middle">gate 32</text><rect x="174" y="76" width="65" height="80" rx="3" fill="var(--copper)"/><text x="206" y="69" class="val" text-anchor="middle">22/s</text><text x="206" y="174" class="axis" text-anchor="middle">100</text><text x="206" y="188" class="axis dim" text-anchor="middle">gate 32</text><rect x="282" y="64" width="65" height="92" rx="3" fill="var(--copper)"/><text x="314" y="57" class="val" text-anchor="middle">25/s</text><text x="314" y="174" class="axis" text-anchor="middle">125</text><text x="314" y="188" class="axis dim" text-anchor="middle">gate 32</text><rect x="390" y="59" width="65" height="97" rx="3" fill="var(--copper)"/><text x="422" y="52" class="val" text-anchor="middle">27/s</text><text x="422" y="174" class="axis" text-anchor="middle">125*</text><text x="422" y="188" class="axis dim" text-anchor="middle">gate 125</text><text x="476" y="194" class="axis dim" text-anchor="end">captures / second</text></svg></div>
+
+<h2>Where each capture's time goes &mdash; the catalog dominates</h2>
+<p>With the concurrency cap wide open (so admission queueing is removed), the median capture still spends ~1&nbsp;second in <b>queue wait</b> &mdash; which here is not admission but writing the capture's <code>ACCEPTED</code> and <code>QUEUED</code> rows &mdash; and the <b>persist</b> stage carries the terminal catalog write. Both are the durable SQLite catalog (a 2-worker pool, WAL, <code>synchronous=FULL</code>, ~3 fsync'd transactions per capture). The middle stage, <b>acquire</b>, is the RTSP keyframe wait plus H.264 decode &mdash; a property of the camera stream, not the adapter.</p>
+<div class="card"><svg viewBox="0 0 560 150" class="chart" role="img"><rect x="30" y="48" width="295" height="46" fill="var(--catalog)"/><text x="178" y="70" class="tiny" fill="#fff" text-anchor="middle">queue wait</text><text x="178" y="86" class="tiny" fill="#fff" text-anchor="middle">1046ms</text><rect x="325" y="48" width="140" height="46" fill="var(--acquire)"/><text x="395" y="70" class="tiny" fill="#fff" text-anchor="middle">acquire</text><text x="395" y="86" class="tiny" fill="#fff" text-anchor="middle">494ms</text><rect x="465" y="48" width="65" height="46" fill="var(--catalog2)"/><text x="498" y="70" class="tiny" fill="#fff" text-anchor="middle">persist</text><text x="498" y="86" class="tiny" fill="#fff" text-anchor="middle">230ms</text><text x="30" y="38" class="axis dim">per-capture median, gate=125 (queue admission removed) &mdash; the two catalog stages dominate</text><rect x="30" y="106" width="11" height="11" rx="2" fill="var(--catalog)"/><text x="46" y="116" class="tiny">queue wait: catalog: accept + queue rows</text><rect x="216" y="106" width="11" height="11" rx="2" fill="var(--acquire)"/><text x="232" y="116" class="tiny">acquire: keyframe (GOP) wait + H.264 decode</text><rect x="402" y="106" width="11" height="11" rx="2" fill="var(--catalog2)"/><text x="418" y="116" class="tiny">persist: encode + write + catalog terminal</text></svg></div>
+<div class="call"><p><b>Gating factor: the durable catalog write.</b> A synchronized burst serializes through the 2-worker SQLite pool, one fsync barrier per state transition. Raising the capture-concurrency cap doesn't help because the captures still funnel through those two workers. This is the same mechanism finding B6 named and the edge-storage (X5) run confirmed &mdash; here it is the throughput ceiling on fast storage too, just at a much higher rate. Every capture is durably committed with a sha256 and a metadata sidecar, which is exactly what a 21&nbsp;CFR&nbsp;Part&nbsp;11 line-clearance record requires; the durability is the cost, and it is the cost that gates.</p></div>
+
+<h2>Per-capture latency &mdash; median vs the tail</h2>
+<p>Half the cameras have their image within ~1.8&ndash;2.4&nbsp;s of the trigger; the slowest (the last through the catalog) lands by ~3.2&ndash;4.6&nbsp;s. The tail widens with N because more captures queue behind the same two catalog workers.</p>
+<div class="card"><svg viewBox="0 0 560 230" class="chart" role="img"><line x1="46" y1="46" x2="514" y2="46" class="grid"/><text x="40" y="50" class="axis" text-anchor="end">5.3s</text><line x1="46" y1="80" x2="514" y2="80" class="grid"/><text x="40" y="84" class="axis" text-anchor="end">4.0s</text><line x1="46" y1="115" x2="514" y2="115" class="grid"/><text x="40" y="119" class="axis" text-anchor="end">2.6s</text><line x1="46" y1="150" x2="514" y2="150" class="grid"/><text x="40" y="154" class="axis" text-anchor="end">1.3s</text><line x1="46" y1="184" x2="514" y2="184" class="grid"/><text x="40" y="188" class="axis" text-anchor="end">0.0s</text><rect x="68" y="136" width="37" height="48" rx="2" fill="var(--good)"/><text x="87" y="132" class="tiny" text-anchor="middle">1.8</text><rect x="105" y="111" width="37" height="73" rx="2" fill="var(--warn)"/><text x="124" y="107" class="tiny" text-anchor="middle">2.8</text><rect x="143" y="101" width="37" height="83" rx="2" fill="var(--bad)"/><text x="161" y="97" class="tiny" text-anchor="middle">3.2</text><text x="124" y="202" class="axis" text-anchor="middle">75 cameras</text><rect x="224" y="127" width="37" height="57" rx="2" fill="var(--good)"/><text x="243" y="123" class="tiny" text-anchor="middle">2.2</text><rect x="261" y="98" width="37" height="86" rx="2" fill="var(--warn)"/><text x="280" y="94" class="tiny" text-anchor="middle">3.3</text><rect x="299" y="68" width="37" height="116" rx="2" fill="var(--bad)"/><text x="317" y="64" class="tiny" text-anchor="middle">4.5</text><text x="280" y="202" class="axis" text-anchor="middle">100 cameras</text><rect x="380" y="122" width="37" height="62" rx="2" fill="var(--good)"/><text x="399" y="118" class="tiny" text-anchor="middle">2.4</text><rect x="417" y="71" width="37" height="113" rx="2" fill="var(--warn)"/><text x="436" y="67" class="tiny" text-anchor="middle">4.3</text><rect x="455" y="64" width="37" height="120" rx="2" fill="var(--bad)"/><text x="473" y="60" class="tiny" text-anchor="middle">4.6</text><text x="436" y="202" class="axis" text-anchor="middle">125 cameras</text><rect x="54" y="10" width="11" height="11" rx="2" fill="var(--good)"/><text x="70" y="20" class="tiny">p50</text><rect x="118" y="10" width="11" height="11" rx="2" fill="var(--warn)"/><text x="134" y="20" class="tiny">p95</text><rect x="182" y="10" width="11" height="11" rx="2" fill="var(--bad)"/><text x="198" y="20" class="tiny">max</text></svg></div>
+
+<h2>Resource scaling &mdash; linear and modest</h2>
+<p>Memory and threads grow linearly with camera count: roughly <b>26&nbsp;MB and ~16 threads per warm RTSP session</b> (each holds a GStreamer pipeline). At 125 cameras the adapter used ~3.3&nbsp;GB and ~2,000 threads &mdash; comfortable on the 64&nbsp;GB / 32-core box. Nothing here is the bottleneck.</p>
+<div class="card"><svg viewBox="0 0 560 210" class="chart" role="img"><line x1="46" y1="46" x2="514" y2="46" class="grid"/><text x="40" y="50" class="axis" text-anchor="end">3.8G</text><line x1="46" y1="76" x2="514" y2="76" class="grid"/><text x="40" y="80" class="axis" text-anchor="end">2.9G</text><line x1="46" y1="105" x2="514" y2="105" class="grid"/><text x="40" y="109" class="axis" text-anchor="end">1.9G</text><line x1="46" y1="134" x2="514" y2="134" class="grid"/><text x="40" y="138" class="axis" text-anchor="end">1.0G</text><line x1="46" y1="164" x2="514" y2="164" class="grid"/><text x="40" y="168" class="axis" text-anchor="end">0.0G</text><rect x="62" y="105" width="66" height="59" rx="2" fill="var(--iris)"/><text x="94" y="101" class="tiny" text-anchor="middle">1.9G</text><text x="94" y="182" class="axis" text-anchor="middle">75</text><rect x="218" y="82" width="66" height="82" rx="2" fill="var(--iris)"/><text x="250" y="78" class="tiny" text-anchor="middle">2.7G</text><text x="250" y="182" class="axis" text-anchor="middle">100</text><rect x="374" y="66" width="66" height="98" rx="2" fill="var(--iris)"/><text x="406" y="62" class="tiny" text-anchor="middle">3.2G</text><text x="406" y="182" class="axis" text-anchor="middle">125</text><circle cx="160" cy="108" r="4" fill="var(--copper)"/><text x="160" y="100" class="tiny" text-anchor="middle">1175/s</text><circle cx="316" cy="84" r="4" fill="var(--copper)"/><text x="316" y="76" class="tiny" text-anchor="middle">1683/s</text><circle cx="472" cy="66" r="4" fill="var(--copper)"/><text x="472" y="58" class="tiny" text-anchor="middle">2074/s</text><polyline points="160,108 316,84 472,66" fill="none" stroke="var(--copper)" stroke-width="2"/><rect x="54" y="10" width="11" height="11" rx="2" fill="var(--iris)"/><text x="70" y="20" class="tiny">RSS (GB)</text><circle cx="166" cy="15" r="5" fill="var(--copper)"/><text x="176" y="20" class="tiny">throughput (captures/s)</text></svg></div>
+
+<h2>The numbers</h2>
+<div class="scroll"><table>
+<thead><tr><th>Cameras</th><th>Clearance</th><th>Throughput</th><th>p50 lat</th><th>p95 lat</th><th>max lat</th><th>RSS</th><th>Threads</th><th>Drops</th></tr></thead>
+<tbody>
+<tr><td>75</td><td>3.2 s</td><td>23.3/s</td><td>1.85 s</td><td>2.79 s</td><td>3.18 s</td><td>1.96 GB</td><td>1,175</td><td>0</td></tr>
+<tr><td>100</td><td>4.5 s</td><td>22.1/s</td><td>2.18 s</td><td>3.29 s</td><td>4.46 s</td><td>2.74 GB</td><td>1,683</td><td>0</td></tr>
+<tr><td>125</td><td>4.9 s</td><td>25.4/s</td><td>2.39 s</td><td>4.35 s</td><td>4.60 s</td><td>3.28 GB</td><td>2,074</td><td>0</td></tr>
+<tr><td>125 &middot; gate 125</td><td>4.7 s</td><td>26.8/s</td><td>1.61 s</td><td>4.03 s</td><td>4.67 s</td><td>3.84 GB</td><td>2,132</td><td>0</td></tr>
+</tbody></table></div>
+
+<h2>What this means for a 75-camera line clearance</h2>
+<div class="call good"><p><b>~3 seconds to capture and durably store all 75 images, with zero loss</b>, on an SSD adapter box with pre-connected cameras. 100 cameras &asymp; 4.5&nbsp;s, 125 &asymp; 5&nbsp;s. The line does not need to stagger for throughput &mdash; every camera captures in the same synchronized burst, and the adapter admits and clears them all.</p>
+<p>If you need it faster than ~25 captures/second, the lever is <b>not</b> more concurrency &mdash; it is the durable-write path: more catalog workers (the default is 2) or splitting the durable store. And if clearances are more than ~30&nbsp;s apart, warm RTSP sessions idle out and re-establish (the first burst above ran a touch slower, ~3.4 vs 3.2&nbsp;s, for that reason); keeping sessions warm, or using an ONVIF snapshot / GenICam trigger, avoids that.</p></div>
+
+<h2>Honesty about the method</h2>
+<p>This is a real cross-host measurement: the adapter ran alone on <code>lab-5950x</code> (AMD 5950X, NVMe SSD &mdash; <b>real disk, not tmpfs</b>) and the fleet on a separate machine, traffic over the LAN. Caveats worth stating plainly:</p>
+<ul style="color:var(--muted);font-size:14px">
+<li>Cameras were warm <b>ONVIF-RTSP</b> streams at 1280&times;720; the ~0.5&nbsp;s acquire is the stream's 1-second GOP. A machine-vision camera (GenICam trigger, or a shorter GOP) would acquire faster; the catalog ceiling would be unchanged.</li>
+<li>The fleet served one mediamtx stream fanned out to N readers &mdash; adapter-side concurrency is genuine, but source diversity is not. A first pass silently capped at 64 cameras: that was the <b>test simulator's</b> connection ceiling, not the adapter (found and made configurable).</li>
+<li>Storage was NVMe. On edge-class eMMC/SD the same burst is ~8&times; slower (measured separately) &mdash; the catalog gate scales with fsync latency.</li>
+<li>These are single-burst measurements at each N, not a sustained multi-hour soak.</li>
+</ul>
+<p class="foot">Adapter <code>camera-adapter:rtsp</code> on lab-5950x &middot; fleet (mediamtx + ONVIF sim + broker) on a separate host &middot; <code>maxConcurrentCaptures</code> 32 (and 125 for the last row) &middot; catalog 2-worker pool, WAL, synchronous=FULL &middot; reproduce with <code>simulators/two-box/</code>.</p>
+</div>
+</body>
+</html>
