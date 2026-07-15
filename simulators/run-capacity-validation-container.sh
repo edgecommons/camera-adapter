@@ -125,7 +125,27 @@ common_run=(
     -e CAMERA_ADAPTER_SOURCE_BUNDLE_SHA256="$source_bundle_sha256"
 )
 
-test_run=("${common_run[@]}" --network none -v "$artifact_mount")
+# THE LOCKFILE. `Cargo.lock` is untracked and gitignored, so a clean checkout has none -- and every
+# cargo run below passes `--locked`, which REFUSES to create one ("cannot create the lock file ...
+# because --locked was passed"). Dropping `--locked` does not rescue it either: the source is mounted
+# `:ro` on purpose and cargo writes the lock next to the workspace Cargo.toml (CARGO_TARGET_DIR does
+# not move it), so cargo would then die on "Read-only file system (os error 30)". Two walls, one
+# behind the other -- and that second error is verbatim the one 3c0d83d's own message quotes.
+#
+# So the lock is bind-mounted as a single FILE from OUTSIDE the source tree, generated once by the
+# networked prep run. The source tree is never written to -- the immutability this script depends on
+# holds exactly -- and `--locked` goes back to asserting something true. Generating it inside the
+# container also keeps the lockfile version within what the pinned toolchain can read, which a
+# host-side `cargo generate-lockfile` would not guarantee.
+lock_root="${TMPDIR:-/tmp}/camera-adapter-capacity-lock"
+mkdir -p -- "$lock_root"
+lock_file="$lock_root/Cargo.lock"
+# Docker creates a DIRECTORY at a bind source that does not exist; the file must exist first.
+[[ -f $lock_file ]] || : > "$lock_file"
+lock_mount_ro="$lock_file:/edgecommons/camera-adapter/Cargo.lock:ro"
+lock_mount_rw="$lock_file:/edgecommons/camera-adapter/Cargo.lock"
+
+test_run=("${common_run[@]}" --network none -v "$artifact_mount" -v "$lock_mount_ro")
 probe_name=".camera-adapter-capacity-artifact-probe-${host_uid}-${host_gid}-$$"
 probe_path="$artifact_root/$probe_name"
 cleanup_probe() {
@@ -147,7 +167,9 @@ trap - EXIT
 # Populate only named Cargo cache volumes before the isolated workload starts.
 # The source mount remains read-only, and `--locked` retains Cargo.lock as the
 # dependency authority. The capacity test itself below runs with --network none.
-prefetch_run=("${common_run[@]}" --network bridge)
+prefetch_run=("${common_run[@]}" --network bridge -v "$lock_mount_rw")
+"${prefetch_run[@]}" --entrypoint cargo "$image" generate-lockfile
+[[ -s $lock_file ]] || { echo "the prep run did not produce a Cargo.lock at $lock_file" >&2; exit 1; }
 "${prefetch_run[@]}" --entrypoint cargo "$image" fetch --locked
 
 inner_args=(

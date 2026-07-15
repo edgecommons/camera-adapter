@@ -82,5 +82,5 @@ production configuration also sets absolute durable `component.global.output.roo
 }
 ```
 
-The model/firmware and platform combinations in the physical compatibility register remain `NOT RUN`
-until evidence is recorded.
+Physical camera models are not certified. Validate your specific model and firmware before production
+use.

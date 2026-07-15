@@ -72,15 +72,16 @@ camera-adapter --platform HOST --transport MQTT /etc/edgecommons/camera-adapter.
 `/livez` reports that the process health server is running. `/readyz` and `/startupz` are `200`
 only after messaging is connected and the adapter has finished its durable startup gates; they are
 `503` during startup, shutdown, while the state directory is below its configured free-space floor
-or cannot be read, or while the catalog/outbox cannot safely complete a durable pass. The output
+or cannot be read, or while the catalog cannot safely complete a durable pass. The output
 and state roots use `minimumFreeBytes` and `minimumFreePercent`; either low/unreadable root raises
 the deduplicated critical `storage-low` alarm with its configured root and observed free space.
 New captures are rejected with `STORAGE_PRESSURE` until the affected root recovers. Output pressure
 does not itself make the catalog unready; state-directory pressure does.
-Temporary broker confirmation failures do not by themselves make the component unready: they remain
-in the durable outbox and, when its pressure threshold is reached, raise the stateful warning alarm
-`message-delivery-delayed`. The example exposes port 8081 only because it sets `health.enabled`
-explicitly.
+A broker the component cannot reach does not make it unready. It keeps capturing and persisting, and it
+retries the connection; the terminal announcements it cannot publish are dropped, counted as
+`camera_captures.announcementFailed`, and reported by the stateful warning alarm
+`message-publish-degraded`, which clears on the next successful announcement. The example exposes port
+8081 only because it sets `health.enabled` explicitly.
 
 For GigE Vision, set a non-empty `component.global.discovery.eligibleInterfaces` list of exact
 interface names. The adapter deliberately does not sweep all NICs. Size MTU, receive buffers,
@@ -138,8 +139,7 @@ icacls $root /grant:r `
 ```
 
 Keep the ownership/ACL record with the deployment. Windows GenICam and native GStreamer packaging
-are not claimed as release support. Physical-camera validation is waived for this project because no
-hardware is available; that waiver does not establish Windows service or hardware compatibility.
+are not supported. Physical cameras are not supported on Windows.
 
 ## Docker
 
@@ -148,12 +148,12 @@ The checked-in [Dockerfile](../../Dockerfile) has two explicit targets:
 - `onvif` (default): standalone ONVIF snapshot capture;
 - `rtsp`: ONVIF plus the packaged GStreamer runtime for RTSP frame capture.
 
-Build from the EdgeCommons umbrella because the adapter has a sibling path dependency on
-`core/libs/rust`:
+Build from this repository. The `edgecommons` library is a git dependency pinned by revision, so the
+image resolves it directly and needs no sibling checkout:
 
 ```bash
-docker build -f camera-adapter/Dockerfile --target onvif -t camera-adapter:onvif .
-docker build -f camera-adapter/Dockerfile --target rtsp -t camera-adapter:rtsp .
+docker build --target onvif -t camera-adapter:onvif .
+docker build --target rtsp -t camera-adapter:rtsp .
 ```
 
 Both base images and Debian package snapshots are pinned. The current base pins are Linux/amd64;
@@ -176,7 +176,7 @@ deployment recipe. Exercise a real MQTT command/reply capture after the stack is
 CAMERA_ADAPTER_DOCKER_E2E=1 \
 CAMERA_ADAPTER_DOCKER_E2E_HOST=127.0.0.1 \
 CAMERA_ADAPTER_DOCKER_E2E_PORT=1884 \
-cargo test --locked --no-default-features --features standalone --test docker_capture_submit
+cargo test --no-default-features --features standalone --test docker_capture_submit
 ```
 
 See [the simulator README](../../simulators/README.md) for protocol and native test commands.

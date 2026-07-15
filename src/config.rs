@@ -79,6 +79,52 @@ pub struct GlobalConfig {
     /// HTTP/XML/decompression safety limits.
     #[serde(default)]
     pub security: SecurityConfig,
+    /// Cron schedules that fire one synchronised capture across several cameras.
+    ///
+    /// A group schedule crosses instances, so it belongs to the component rather than to any one
+    /// camera -- which is why it lives here and not under `camera.schedules`.
+    #[serde(default)]
+    pub capture_group_schedules: Vec<CaptureGroupScheduleConfig>,
+}
+
+/// One cron schedule that captures several cameras as a single group.
+///
+/// An occurrence is submitted through the same path as the `sb/capture-group` command, so a
+/// scheduled group is indistinguishable from a commanded one: one durable group row, all-or-nothing
+/// acceptance, and one collated terminal notification.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureGroupScheduleConfig {
+    /// Stable schedule token, unique across group schedules.
+    pub id: String,
+    /// Whether future occurrences are admitted.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Required six-field expression including seconds.
+    pub cron: String,
+    /// IANA timezone identifier.
+    pub timezone: String,
+    /// The cameras captured together, in result order.
+    pub instances: Vec<String>,
+    /// Capture profile applied to every member without an override.
+    pub capture_profile: Option<String>,
+    /// Per-camera capture-profile overrides; every key must be a member.
+    #[serde(default)]
+    pub profile_overrides: BTreeMap<String, String>,
+    /// Missed-occurrence treatment.
+    #[serde(default)]
+    pub misfire_policy: MisfirePolicy,
+    /// Treatment when this schedule already has a nonterminal group.
+    ///
+    /// Evaluated against the group, not against individual members: a group is outstanding until
+    /// every one of its members is terminal.
+    #[serde(default)]
+    pub overlap_policy: OverlapPolicy,
+    /// Stable deterministic jitter bound.
+    #[serde(default)]
+    pub jitter_seconds: u32,
+    /// Optional per-member terminal deadline.
+    pub timeout_ms: Option<u64>,
 }
 
 /// Output path, atomic-file, and disk-pressure configuration.
@@ -120,8 +166,6 @@ pub struct StateConfig {
     pub result_retention_hours: u32,
     /// Soft terminal-record count cap.
     pub max_result_records: u64,
-    /// Delivered outbox retention.
-    pub outbox_retention_hours: u32,
     /// Restart treatment for queued jobs.
     pub queued_recovery_policy: QueuedRecoveryPolicy,
 }
@@ -132,7 +176,6 @@ impl Default for StateConfig {
             directory: None,
             result_retention_hours: 72,
             max_result_records: 100_000,
-            outbox_retention_hours: 168,
             queued_recovery_policy: QueuedRecoveryPolicy::Requeue,
         }
     }
@@ -177,6 +220,18 @@ pub struct LimitsConfig {
     pub max_deferred_waiters_per_capture: usize,
     /// Maximum group fan-out.
     pub max_cameras_per_group: usize,
+    /// Captures the whole component may hold waiting for a camera.
+    ///
+    /// The fleet-wide backlog bound, and it did not exist before: queueing was bounded only per
+    /// camera, so the real worst case was `cameras x 2 x maxQueuedCapturesPerCamera` -- 2,048
+    /// descriptors at the design target -- with no single number capping it and nothing able to see
+    /// the fleet's backlog at all.
+    pub max_pending_captures: usize,
+    /// How long a capture may wait for a camera when its profile sets no `queueExpiryMs`.
+    ///
+    /// A capture that waits does not spend its execution budget -- its clocks start when a camera
+    /// takes it. Something must still bound the wait, or a starved capture would queue forever.
+    pub max_queue_wait_ms: u64,
     /// Named shared transport bounds.
     pub resource_groups: BTreeMap<String, ResourceGroupConfig>,
 }
@@ -210,6 +265,8 @@ impl Default for LimitsConfig {
             max_frame_bytes_per_camera: 64 * MIB,
             max_metadata_bytes: 8 * 1024,
             max_queued_captures_per_camera: 4,
+            max_pending_captures: 256,
+            max_queue_wait_ms: 300_000,
             max_queued_controls_per_camera: 32,
             max_deferred_waiters_per_capture: 8,
             max_cameras_per_group: 32,
@@ -703,8 +760,52 @@ pub struct CaptureProfile {
     pub gain: Option<f64>,
     /// Required output encoding.
     pub output: ProfileOutputConfig,
+    /// Optional thumbnail of the captured frame. Absent means no thumbnail is produced.
+    pub thumbnail: Option<ThumbnailConfig>,
     /// Per-profile PTZ/capture interlock override.
     pub capture_interlock: Option<CaptureInterlock>,
+}
+
+/// Opt-in thumbnail settings for one capture profile.
+///
+/// Presence is the opt-in: a profile without a `thumbnail` section produces no thumbnail, and the
+/// terminal announcement carries no `thumbnail` key at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThumbnailConfig {
+    /// Which of the three sizes to produce.
+    pub size: ThumbnailSize,
+}
+
+/// The thumbnail's longest-edge bound.
+///
+/// The bound is the LONGEST EDGE, not a fixed width x height: cameras are 4:3 and 16:9, and a fixed
+/// frame would distort one of them or letterbox it. The other axis follows the aspect ratio, and a
+/// frame already smaller than the bound is carried at its own size rather than upscaled.
+///
+/// There is no quality and no format knob. The component owns that trade, because the encoded
+/// thumbnail has to fit inside the terminal announcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThumbnailSize {
+    /// 160 px longest edge -- a list row or a badge.
+    Small,
+    /// 320 px longest edge -- a preview card.
+    Medium,
+    /// 640 px longest edge -- enough to glance at and judge.
+    Large,
+}
+
+impl ThumbnailSize {
+    /// The longest edge, in pixels, that a thumbnail of this size may have.
+    #[must_use]
+    pub const fn longest_edge(self) -> u32 {
+        match self {
+            Self::Small => 160,
+            Self::Medium => 320,
+            Self::Large => 640,
+        }
+    }
 }
 
 /// Offline admission policy.
@@ -863,7 +964,7 @@ impl AdapterConfig {
                 "at least one enabled valid camera instance is required",
             );
         }
-        validate_cross_instance(&instances, &global)?;
+        validate_cross_instance(&instances, &global, &seen)?;
         Ok(InitialConfigLoad {
             config: Self { global, instances },
             skipped,
@@ -897,7 +998,7 @@ impl AdapterConfig {
                 "at least one enabled valid camera instance is required",
             );
         }
-        validate_cross_instance(&instances, &global)?;
+        validate_cross_instance(&instances, &global, &seen)?;
         Ok(Self { global, instances })
     }
 }
@@ -919,6 +1020,26 @@ fn validate_global(global: &GlobalConfig) -> Result<()> {
     )?;
     validate_template(&global.output.camera_directory_template, true)?;
     validate_template(&global.output.file_name_template, false)?;
+    // DESIGN §10.2 calls this field "collision-resistant", and nothing made it so. `{captureId}` is
+    // the only token that is: `{cameraId}` and the date parts repeat by design, and two captures of
+    // one camera inside the same second share every one of them.
+    //
+    // Without this an operator writes the most natural template imaginable -- `latest.{extension}` --
+    // and gets a component that works exactly once. The second capture, and every capture after it
+    // for the life of the deployment, refuses to overwrite the first and fails with
+    // PERSISTENCE_FAILED. The atomic-install path is right to refuse; the config should never have
+    // been accepted.
+    if !global.output.file_name_template.contains("{captureId}")
+        && !global
+            .output
+            .camera_directory_template
+            .contains("{captureId}")
+    {
+        return config_error(
+            "component.global.output.fileNameTemplate",
+            "must contain {captureId} so that two captures cannot resolve to the same file;              {cameraId} and the date parts repeat, and a capture that cannot be written without              overwriting another is refused and fails with PERSISTENCE_FAILED",
+        );
+    }
     range(
         u64::from(global.output.minimum_free_percent),
         0,
@@ -951,13 +1072,6 @@ fn validate_global(global: &GlobalConfig) -> Result<()> {
         10_000_000,
         "component.global.state.maxResultRecords",
     )?;
-    if global.state.outbox_retention_hours < global.state.result_retention_hours {
-        return config_error(
-            "component.global.state.outboxRetentionHours",
-            "must be at least resultRetentionHours",
-        );
-    }
-
     let limits = &global.limits;
     range_usize(
         limits.max_connected_cameras,
@@ -1033,6 +1147,26 @@ fn validate_global(global: &GlobalConfig) -> Result<()> {
     )?;
     // The byte budget must cover the concurrency the component ADVERTISES, not one frame of it.
     //
+    // The fleet backlog must be able to hold at least one camera's worth of queued work, or the
+    // per-camera bound is a lie: a single camera could never fill the queue it is allowed to fill.
+    // This is B2's lesson in a different costume -- a bound that is smaller than the thing it is
+    // supposed to hold does not fail loudly, it silently caps the system somewhere else.
+    if limits.max_pending_captures < limits.max_queued_captures_per_camera {
+        return config_error(
+            "component.global.limits.maxPendingCaptures",
+            format!(
+                "must be at least maxQueuedCapturesPerCamera ({}); {} would cap the component's                  whole backlog below what a single camera is permitted to queue",
+                limits.max_queued_captures_per_camera, limits.max_pending_captures,
+            ),
+        );
+    }
+    if limits.max_pending_captures == 0 || limits.max_queue_wait_ms == 0 {
+        return config_error(
+            "component.global.limits.maxPendingCaptures",
+            "maxPendingCaptures and maxQueueWaitMs must be positive".to_owned(),
+        );
+    }
+
     // A capture reserves `maxFrameBytesPerCamera` — the DECLARED cap, not the frame's actual size —
     // for its whole admission. So the number of captures that can hold a memory reservation at once
     // is floor(maxInFlightBytes / maxFrameBytesPerCamera), and THAT, not maxConcurrentCaptures, is
@@ -1690,13 +1824,138 @@ const fn safe_deserialization_message() -> &'static str {
     "contains an unknown field or a value with an invalid type"
 }
 
-fn validate_cross_instance(instances: &[CameraConfig], global: &GlobalConfig) -> Result<()> {
+fn validate_cross_instance(
+    instances: &[CameraConfig],
+    global: &GlobalConfig,
+    declared: &HashSet<String>,
+) -> Result<()> {
     let enabled = instances.iter().filter(|camera| camera.enabled).count();
     if enabled > global.limits.max_connected_cameras {
         return config_error(
             "component.instances",
             "enabled camera count exceeds limits.maxConnectedCameras",
         );
+    }
+    validate_group_schedules(instances, global, declared)
+}
+
+/// Validates `global.captureGroupSchedules` against the cameras the component declares.
+///
+/// The rules deliberately mirror [`crate::commands::GroupCaptureRequest::validate`], because an
+/// occurrence is submitted down that exact path: a group schedule that could only ever be rejected
+/// at fire time is a schedule that silently never fires, and the place to say so is startup.
+///
+/// Membership is checked against the cameras the operator *declared*, not against the ones that
+/// survived validation. A camera that fails its own validation is skipped at startup by design, and
+/// a group schedule naming it must not escalate that into a component that refuses to start -- the
+/// occurrence simply fails to admit, and says why. A camera that was never declared at all is a
+/// typo, and that is worth refusing to start for.
+fn validate_group_schedules(
+    instances: &[CameraConfig],
+    global: &GlobalConfig,
+    declared: &HashSet<String>,
+) -> Result<()> {
+    if global.capture_group_schedules.len() > 100 {
+        return config_error(
+            "component.global.captureGroupSchedules",
+            "must contain at most 100 group schedules",
+        );
+    }
+    let by_id: BTreeMap<&str, &CameraConfig> = instances
+        .iter()
+        .map(|camera| (camera.id.as_str(), camera))
+        .collect();
+    let mut schedule_ids = HashSet::new();
+    for (index, schedule) in global.capture_group_schedules.iter().enumerate() {
+        let path = format!("component.global.captureGroupSchedules[{index}]");
+        check_token(&schedule.id, &format!("{path}.id"))?;
+        if !schedule_ids.insert(&schedule.id) {
+            return config_error(format!("{path}.id"), "group schedule id is duplicated");
+        }
+        if schedule.cron.split_whitespace().count() != 6 || Cron::from_str(&schedule.cron).is_err()
+        {
+            return config_error(
+                format!("{path}.cron"),
+                "must be a valid six-field cron expression including seconds",
+            );
+        }
+        if schedule.timezone.parse::<Tz>().is_err() {
+            return config_error(
+                format!("{path}.timezone"),
+                "must be an IANA timezone identifier",
+            );
+        }
+        // A group is two or more cameras captured together; the command path rejects a shorter list
+        // and the scheduler must not be able to configure one it could never submit.
+        if schedule.instances.len() < 2 {
+            return config_error(
+                format!("{path}.instances"),
+                "must name at least two cameras",
+            );
+        }
+        if schedule.instances.len() > global.limits.max_cameras_per_group {
+            return config_error(
+                format!("{path}.instances"),
+                "exceeds limits.maxCamerasPerGroup",
+            );
+        }
+        let mut members = HashSet::with_capacity(schedule.instances.len());
+        for instance in &schedule.instances {
+            check_token(instance, &format!("{path}.instances"))?;
+            if !members.insert(instance.as_str()) {
+                return config_error(
+                    format!("{path}.instances"),
+                    "must not name the same camera twice",
+                );
+            }
+            if !declared.contains(instance) {
+                return config_error(
+                    format!("{path}.instances"),
+                    "must name cameras declared in component.instances",
+                );
+            }
+        }
+        if let Some(profile) = schedule.capture_profile.as_deref() {
+            check_token(profile, &format!("{path}.captureProfile"))?;
+        }
+        for (instance, profile) in &schedule.profile_overrides {
+            if !members.contains(instance.as_str()) {
+                return config_error(
+                    format!("{path}.profileOverrides"),
+                    "keys must be a subset of instances",
+                );
+            }
+            check_token(profile, &format!("{path}.profileOverrides"))?;
+        }
+        // Profiles are resolved per camera at fire time. Check the ones we can see now: a camera
+        // that was skipped is absent from `by_id` and is checked when it comes back.
+        for instance in &schedule.instances {
+            let Some(camera) = by_id.get(instance.as_str()) else {
+                continue;
+            };
+            let selected = schedule
+                .profile_overrides
+                .get(instance)
+                .map(String::as_str)
+                .or(schedule.capture_profile.as_deref());
+            if let Some(selected) = selected {
+                if !camera.capture_profiles.contains_key(selected) {
+                    return config_error(
+                        format!("{path}.captureProfile"),
+                        format!("camera '{instance}' has no capture profile named '{selected}'"),
+                    );
+                }
+            }
+        }
+        range(
+            u64::from(schedule.jitter_seconds),
+            0,
+            3_600,
+            &format!("{path}.jitterSeconds"),
+        )?;
+        if let Some(timeout_ms) = schedule.timeout_ms {
+            range(timeout_ms, 1_000, 1_800_000, &format!("{path}.timeoutMs"))?;
+        }
     }
     Ok(())
 }
@@ -1926,6 +2185,285 @@ mod tests {
                 }]
             }
         })
+    }
+
+    /// A two-camera config with one valid group schedule, for the group-schedule cases below.
+    fn group_schedule_config() -> Value {
+        let mut value = valid_config();
+        value["component"]["instances"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id": "camera-b",
+                "backend": { "type": "sim" },
+                "defaultCaptureProfile": "main",
+                "captureProfiles": { "main": { "output": { "encoding": "png" } } }
+            }));
+        value["component"]["global"]["captureGroupSchedules"] = json!([{
+            "id": "line-a-sync",
+            "cron": "0 */5 * * * *",
+            "timezone": "America/New_York",
+            "instances": ["camera-a", "camera-b"],
+            "captureProfile": "main"
+        }]);
+        value
+    }
+
+    #[test]
+    fn a_valid_group_schedule_is_accepted_with_its_defaults() {
+        let config = AdapterConfig::from_core_reload(&core(group_schedule_config())).unwrap();
+        let schedules = &config.global.capture_group_schedules;
+        assert_eq!(schedules.len(), 1);
+        let schedule = &schedules[0];
+        assert_eq!(schedule.id, "line-a-sync");
+        assert!(schedule.enabled);
+        assert_eq!(schedule.instances, vec!["camera-a", "camera-b"]);
+        assert_eq!(schedule.capture_profile.as_deref(), Some("main"));
+        assert_eq!(schedule.misfire_policy, MisfirePolicy::Skip);
+        assert_eq!(schedule.overlap_policy, OverlapPolicy::Skip);
+        assert_eq!(schedule.jitter_seconds, 0);
+        assert_eq!(schedule.timeout_ms, None);
+    }
+
+    /// Every way a group schedule can be written such that it could only ever fail at fire time.
+    ///
+    /// The rules mirror `GroupCaptureRequest::validate`, because an occurrence is submitted down
+    /// that exact path. A group schedule the command path would reject is a schedule that silently
+    /// never fires -- so it is rejected here, at startup, where somebody is looking.
+    #[test]
+    fn group_schedule_validation_rejects_what_the_command_path_would_reject() {
+        let cases: Vec<(&str, ConfigMutation, &str)> = vec![
+            (
+                "a fleet backlog smaller than one camera is allowed to queue",
+                Box::new(|value| {
+                    value["component"]["global"]["limits"] = json!({
+                        "maxPendingCaptures": 2,
+                        "maxQueuedCapturesPerCamera": 4
+                    });
+                }),
+                "component.global.limits.maxPendingCaptures",
+            ),
+            (
+                "a fleet backlog of zero",
+                Box::new(|value| {
+                    value["component"]["global"]["limits"] = json!({ "maxPendingCaptures": 0 });
+                }),
+                "component.global.limits.maxPendingCaptures",
+            ),
+            (
+                "a queue wait of zero",
+                Box::new(|value| {
+                    value["component"]["global"]["limits"] = json!({ "maxQueueWaitMs": 0 });
+                }),
+                "component.global.limits.maxPendingCaptures",
+            ),
+            (
+                "a camera that is not declared anywhere",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["instances"] =
+                        json!(["camera-a", "camera-typo"]);
+                }),
+                "component.global.captureGroupSchedules[0].instances",
+            ),
+            (
+                "a group of one",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["instances"] =
+                        json!(["camera-a"]);
+                }),
+                "component.global.captureGroupSchedules[0].instances",
+            ),
+            (
+                "the same camera twice",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["instances"] =
+                        json!(["camera-a", "camera-a"]);
+                }),
+                "component.global.captureGroupSchedules[0].instances",
+            ),
+            (
+                "an override for a camera that is not a member",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["profileOverrides"] =
+                        json!({ "camera-c": "main" });
+                }),
+                "component.global.captureGroupSchedules[0].profileOverrides",
+            ),
+            (
+                "a capture profile no member camera has",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["captureProfile"] =
+                        json!("wide");
+                }),
+                "component.global.captureGroupSchedules[0].captureProfile",
+            ),
+            (
+                "a five-field cron",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["cron"] =
+                        json!("*/5 * * * *");
+                }),
+                "component.global.captureGroupSchedules[0].cron",
+            ),
+            (
+                "a timezone that is not IANA",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["timezone"] =
+                        json!("EST5EDT-ish");
+                }),
+                "component.global.captureGroupSchedules[0].timezone",
+            ),
+            (
+                "jitter beyond an hour",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["jitterSeconds"] =
+                        json!(3_601);
+                }),
+                "component.global.captureGroupSchedules[0].jitterSeconds",
+            ),
+            (
+                "a timeout the command path would refuse",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["timeoutMs"] =
+                        json!(999);
+                }),
+                "component.global.captureGroupSchedules[0].timeoutMs",
+            ),
+            (
+                "more cameras than a group may hold",
+                Box::new(|value| {
+                    value["component"]["global"]["limits"] = json!({ "maxCamerasPerGroup": 2 });
+                    value["component"]["instances"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({
+                            "id": "camera-c",
+                            "backend": { "type": "sim" },
+                            "defaultCaptureProfile": "main",
+                            "captureProfiles": { "main": { "output": { "encoding": "png" } } }
+                        }));
+                    value["component"]["global"]["captureGroupSchedules"][0]["instances"] =
+                        json!(["camera-a", "camera-b", "camera-c"]);
+                }),
+                "component.global.captureGroupSchedules[0].instances",
+            ),
+            (
+                "a capture profile name that is not a UNS token",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["captureProfile"] =
+                        json!("not a token");
+                }),
+                "component.global.captureGroupSchedules[0].captureProfile",
+            ),
+            (
+                "an override profile name that is not a UNS token",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["profileOverrides"] =
+                        json!({ "camera-b": "not a token" });
+                }),
+                "component.global.captureGroupSchedules[0].profileOverrides",
+            ),
+            (
+                "an id that is not a UNS token",
+                Box::new(|value| {
+                    value["component"]["global"]["captureGroupSchedules"][0]["id"] =
+                        json!("line a sync");
+                }),
+                "component.global.captureGroupSchedules[0].id",
+            ),
+            (
+                "more group schedules than the component admits",
+                Box::new(|value| {
+                    let one = value["component"]["global"]["captureGroupSchedules"][0].clone();
+                    let mut many = Vec::new();
+                    for index in 0..101 {
+                        let mut copy = one.clone();
+                        copy["id"] = json!(format!("line-{index}"));
+                        many.push(copy);
+                    }
+                    value["component"]["global"]["captureGroupSchedules"] = json!(many);
+                }),
+                "component.global.captureGroupSchedules",
+            ),
+            (
+                "two schedules sharing an id",
+                Box::new(|value| {
+                    let first = value["component"]["global"]["captureGroupSchedules"][0].clone();
+                    value["component"]["global"]["captureGroupSchedules"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(first);
+                }),
+                "component.global.captureGroupSchedules[1].id",
+            ),
+        ];
+        for (name, mutate, expected_path) in cases {
+            let mut value = group_schedule_config();
+            mutate(&mut value);
+            assert_eq!(
+                reload_error_path(value),
+                expected_path,
+                "group schedule with {name} must be rejected at {expected_path}"
+            );
+        }
+    }
+
+    /// A skipped camera must not escalate into a component that refuses to start.
+    ///
+    /// Startup deliberately tolerates a bad camera by skipping it. A group schedule naming that
+    /// camera is still a *declared* camera, so the config stands: the schedule simply fails to admit
+    /// its occurrences, and says so, until the camera is fixed. Only a camera that was never
+    /// declared -- a typo -- is a config error.
+    #[test]
+    fn a_group_schedule_naming_a_skipped_camera_does_not_stop_the_component() {
+        let mut value = group_schedule_config();
+        value["component"]["instances"][1]["captureProfiles"] = json!({});
+        let loaded = AdapterConfig::from_core_initial(&core(value)).unwrap();
+        assert_eq!(
+            loaded.skipped.len(),
+            1,
+            "the camera with no capture profiles is skipped"
+        );
+        assert_eq!(loaded.config.instances.len(), 1);
+        assert_eq!(
+            loaded.config.global.capture_group_schedules.len(),
+            1,
+            "the group schedule naming it survives -- it is declared, just not currently valid"
+        );
+    }
+
+    /// The most natural filename an operator could write is the one that breaks the component.
+    ///
+    /// `latest.{extension}` works exactly once. The second capture refuses to overwrite the first and
+    /// fails with PERSISTENCE_FAILED, and so does every capture after it, forever. The install path is
+    /// right to refuse -- the config should never have been accepted. DESIGN §10.2 has always called
+    /// this field "collision-resistant"; it simply was not.
+    #[test]
+    fn an_output_template_that_cannot_be_collision_free_is_refused() {
+        let mut value = valid_config();
+        value["component"]["global"]["output"]["fileNameTemplate"] = json!("latest.{extension}");
+        assert_eq!(
+            reload_error_path(value),
+            "component.global.output.fileNameTemplate"
+        );
+
+        // A timestamp is not collision resistance: two captures of one camera in the same second
+        // share every part of it.
+        let mut value = valid_config();
+        value["component"]["global"]["output"]["fileNameTemplate"] =
+            json!("{yyyy}{MM}{dd}-{cameraId}.{extension}");
+        assert_eq!(
+            reload_error_path(value),
+            "component.global.output.fileNameTemplate"
+        );
+
+        // The capture id may live in the directory instead -- the PATH is what has to be unique.
+        let mut value = valid_config();
+        value["component"]["global"]["output"]["cameraDirectoryTemplate"] =
+            json!("{cameraId}/{captureId}");
+        value["component"]["global"]["output"]["fileNameTemplate"] = json!("latest.{extension}");
+        AdapterConfig::from_core_reload(&core(value))
+            .expect("a unique directory makes the path unique");
     }
 
     #[test]
@@ -2215,9 +2753,12 @@ mod tests {
             Box::new(|value| {
                 value["component"]["global"]["state"] = json!({"resultRetentionHours": 0});
             }),
+            // The durable outbox is gone, and so is its retention knob. A configuration that still
+            // sets it is REJECTED rather than quietly ignored: an operator who wrote it down was
+            // expecting delivery to be retried, and it no longer is.
             Box::new(|value| {
                 value["component"]["global"]["state"] =
-                    json!({"resultRetentionHours": 24, "outboxRetentionHours": 1});
+                    json!({"resultRetentionHours": 24, "outboxRetentionHours": 168});
             }),
             Box::new(|value| {
                 value["component"]["global"]["limits"] = json!({

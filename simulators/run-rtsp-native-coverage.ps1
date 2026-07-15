@@ -48,6 +48,48 @@ $registryMount = "${registryVolume}:/usr/local/cargo/registry"
 $gitMount = "${gitVolume}:/usr/local/cargo/git"
 $artifactMount = "${coverageRoot}:/coverage-artifacts"
 
+# THE LOCKFILE. `Cargo.lock` is untracked and gitignored (see the note in .github/workflows/ci.yml), so
+# a clean checkout has none -- and every run below passes `--locked`, which REFUSES to create one:
+#
+#     error: cannot create the lock file ... because --locked was passed to prevent this
+#
+# Dropping `--locked` does not rescue it. The source is mounted `:ro` on purpose, and cargo writes the
+# lock next to the workspace `Cargo.toml` (CARGO_TARGET_DIR does not move it), so cargo would then die
+# on `Read-only file system (os error 30)` instead. Two walls, one behind the other.
+#
+# So the lock is bind-mounted as a single FILE from outside the source tree, and generated once, in a
+# container, by the prep run below. The source tree itself is never written to -- the immutability this
+# script depends on is preserved exactly -- and `--locked` goes back to meaning what it says. Generating
+# it in the container also keeps the lockfile version inside what the pinned toolchain can read, which a
+# host-side `cargo generate-lockfile` would not guarantee.
+$lockRoot = Join-Path $coverageRoot 'lock'
+New-Item -ItemType Directory -Force -Path $lockRoot | Out-Null
+$lockFile = Join-Path $lockRoot 'Cargo.lock'
+if (-not (Test-Path -LiteralPath $lockFile)) {
+    # Docker creates a DIRECTORY at a bind source that does not exist; the file must be there first.
+    New-Item -ItemType File -Path $lockFile | Out-Null
+}
+$lockMountRw = "${lockFile}:/edgecommons/camera-adapter/Cargo.lock"
+$lockMount = "${lockFile}:/edgecommons/camera-adapter/Cargo.lock:ro"
+
+# Resolve dependencies once, with the lock writable and the network up. Every run after this one is
+# hardened and offline-shaped: `:ro` source, `:ro` lock, `--locked`.
+Invoke-Docker -Arguments @(
+    'run', '--rm', '--network', $Network,
+    '-v', $sourceMount,
+    '-v', $lockMountRw,
+    '-v', $targetMount,
+    '-v', $registryMount,
+    '-v', $gitMount,
+    '-w', '/edgecommons/camera-adapter',
+    '-e', 'CARGO_TARGET_DIR=/coverage-target',
+    $Image,
+    '+1.87.0', 'generate-lockfile'
+)
+if ((Get-Item -LiteralPath $lockFile).Length -eq 0) {
+    throw "the prep run did not produce a Cargo.lock at $lockFile"
+}
+
 foreach ($fixture in @(
     @{ Name = 'h264'; Path = 'camera' },
     @{ Name = 'h265'; Path = 'camera-h265' }
@@ -60,6 +102,7 @@ foreach ($fixture in @(
         Invoke-Docker -Arguments @(
             'run', '--rm', '--network', $Network,
             '-v', $sourceMount,
+        '-v', $lockMount,
             '-v', $targetMount,
             '-v', $registryMount,
             '-v', $gitMount,
@@ -89,6 +132,7 @@ $summaryArtifact = '/coverage-artifacts/rtsp-native-summary.json'
 Invoke-Docker -Arguments @(
     'run', '--rm', '--network', $Network,
     '-v', $sourceMount,
+    '-v', $lockMount,
     '-v', $targetMount,
     '-v', $registryMount,
     '-v', $gitMount,
@@ -101,6 +145,7 @@ Invoke-Docker -Arguments @(
 Invoke-Docker -Arguments @(
     'run', '--rm', '--network', $Network,
     '-v', $sourceMount,
+    '-v', $lockMount,
     '-v', $targetMount,
     '-v', $registryMount,
     '-v', $gitMount,
@@ -119,6 +164,7 @@ foreach ($fixture in @(
     Invoke-Docker -Arguments @(
         'run', '--rm', '--network', $Network,
         '-v', $sourceMount,
+        '-v', $lockMount,
         '-v', $targetMount,
         '-v', $registryMount,
         '-v', $gitMount,
@@ -130,12 +176,18 @@ foreach ($fixture in @(
         '+1.87.0', 'llvm-cov', 'test', '--no-clean', '--locked',
         '--no-default-features', '--features', 'standalone,onvif,rtsp', '--lib',
         '--json', '--summary-only', '--output-path', $summaryArtifact,
-        'backend::rtsp::tests::pinned_mediamtx', '--', '--ignored'
+        # SERIALIZED, and it must be. This filter matches BOTH live fixtures, and they share one
+        # MediaMTX stream -- run concurrently, the warm-session test's second capture starves behind
+        # the cold test's session and dies on CAPTURE_TIMEOUT. The isolated runs above never showed it
+        # because `--exact` gives each of them a single test. Serialized, both pass in under two
+        # seconds; in parallel, one of them fails. The product is fine; the harness was racing itself.
+        'backend::rtsp::tests::pinned_mediamtx', '--', '--ignored', '--test-threads', '1'
     )
 }
 Invoke-Docker -Arguments @(
     'run', '--rm', '--network', $Network,
     '-v', $sourceMount,
+    '-v', $lockMount,
     '-v', $targetMount,
     '-v', $registryMount,
     '-v', $gitMount,

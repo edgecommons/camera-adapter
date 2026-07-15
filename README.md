@@ -8,16 +8,20 @@ disk rather than sent over MQTT or Greengrass IPC.
 ## Current implementation status
 
 The component has a functional durable startup path, command-router startup gate, SQLite-backed
-catalog/outbox, deterministic simulated backend, ONVIF snapshot/RTSP backend, and an optional
+catalog, deterministic simulated backend, ONVIF snapshot/RTSP backend, and an optional
 Linux GenICam/Aravis backend. It is **not a general-release component yet**: the 256-camera/24-hour
 capacity validation is being built as a separate simulator harness; its short 1,024-configured/256-session/
 32-capture proof and optional 15-minute partial mixed-traffic smoke are runnable on a true Linux host,
 while execution of the 24-hour soak is explicitly deferred to a later phase and is not a current gate.
-Greengrass and Kubernetes deployments, file-replicator and
-bottling-company integration, deployment threat review, and combined native-feature coverage gates remain.
+A deployed Greengrass regression runs on a real nucleus (`--platform GREENGRASS -c GG_CONFIG`, IPC
+transport): the component reaches RUNNING, captures on its own schedule, the delivered images match the
+frames the camera produced byte for byte against independently computed digests, and a corrupted catalog is
+quarantined without stopping capture. The PTZ command path over Greengrass IPC and cross-language IPC
+interop are not covered by it. Kubernetes deployment, file-replicator and bottling-company integration,
+deployment threat review, and combined native-feature coverage gates remain.
 Physical-camera validation is waived for this project because no hardware is available; the component must
 not be represented as hardware-certified based on simulator results. The live status is the
-[acceptance matrix](docs/acceptance-matrix.md).
+[acceptance matrix](ACCEPTANCE-MATRIX.md).
 
 Configured output and state roots are monitored against the output free-space floors. A low or
 unreadable root raises the stateful critical `storage-low` alarm and rejects new captures with
@@ -34,17 +38,17 @@ The default build is the standalone ONVIF snapshot path. It does not include nat
 GenICam libraries.
 
 ```powershell
-cargo build --locked --release
+cargo build --release
 ```
 
 Feature choices are explicit:
 
 ```powershell
 # ONVIF plus native GStreamer RTSP capture (Linux native dependencies required)
-cargo build --locked --release --no-default-features --features standalone,onvif,rtsp
+cargo build --release --no-default-features --features standalone,onvif,rtsp
 
 # Linux Aravis GenICam support (Aravis 0.8.36 or newer required)
-cargo build --locked --release --no-default-features --features standalone,onvif,genicam
+cargo build --release --no-default-features --features standalone,onvif,genicam
 ```
 
 The Rust package declares MSRV 1.85. Use the locked dependency graph; do not update native or

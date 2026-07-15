@@ -54,17 +54,59 @@ struct InterfaceEndpoint {
     target: SocketAddr,
 }
 
-#[derive(Debug, Clone)]
-enum EndpointSource {
-    System(Arc<[String]>),
-    #[cfg(test)]
-    Fixed(Arc<[InterfaceEndpoint]>),
+/// Where a probe's per-interface sockets come from.
+///
+/// This used to be an `enum` with a `#[cfg(test)] Fixed(..)` variant, and the production code forked
+/// on it in two places. Every functional test built the transport that way, so the shipped path --
+/// `enumerate_interfaces_bounded`, its limiter, its timeout and cancellation guards, and binding to a
+/// real NIC address to multicast at `239.255.255.250:3702` -- was executed by NO test at all. The tests
+/// did loopback unicast; production does per-interface multicast.
+///
+/// Worse, the fork reached DOWNSTREAM: `explicit_interfaces()` answered `Some(names)` in production and
+/// `None` under test, so the ONVIF code that consumes it genuinely took a different branch in the test
+/// binary than in the shipped one.
+///
+/// A seam already existed -- `WsDiscovery` is a trait with production implementors injected through
+/// `OnvifBackendDependencies`. The endpoint source is now injected the same way, so a test can supply
+/// sockets AND still answer `explicit_interfaces()` exactly as production does.
+#[async_trait]
+trait InterfaceEndpoints: std::fmt::Debug + Send + Sync {
+    /// The interfaces to probe from, resolved fresh for every probe.
+    async fn resolve(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<InterfaceEndpoint>>;
+
+    /// The exact interface names this source is constrained to.
+    fn names(&self) -> &[String];
+}
+
+/// The shipped source: exact OS interface names, resolved against the host's real NICs.
+#[derive(Debug)]
+struct SystemInterfaces {
+    names: Arc<[String]>,
+}
+
+#[async_trait]
+impl InterfaceEndpoints for SystemInterfaces {
+    async fn resolve(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<InterfaceEndpoint>> {
+        enumerate_interfaces_bounded(Arc::clone(&self.names), deadline, cancellation).await
+    }
+
+    fn names(&self) -> &[String] {
+        &self.names
+    }
 }
 
 /// Production WS-Discovery transport constrained to exact OS interface names.
 #[derive(Debug, Clone)]
 pub struct ExplicitInterfaceWsDiscovery {
-    source: EndpointSource,
+    source: Arc<dyn InterfaceEndpoints>,
 }
 
 impl ExplicitInterfaceWsDiscovery {
@@ -74,23 +116,14 @@ impl ExplicitInterfaceWsDiscovery {
     /// Rejects an empty, duplicate, overlong, control-bearing, or oversized interface list.
     pub fn new(eligible_interfaces: Vec<String>) -> Result<Self> {
         validate_interface_names(&eligible_interfaces)?;
-        Ok(Self {
-            source: EndpointSource::System(eligible_interfaces.into()),
-        })
+        Ok(Self::with_source(Arc::new(SystemInterfaces {
+            names: eligible_interfaces.into(),
+        })))
     }
 
-    #[cfg(test)]
-    fn fixed(local: SocketAddr, target: SocketAddr) -> Self {
-        Self {
-            source: EndpointSource::Fixed(
-                vec![InterfaceEndpoint {
-                    interface_name: "test-loopback".to_string(),
-                    local,
-                    target,
-                }]
-                .into(),
-            ),
-        }
+    /// Builds a transport over an injected endpoint source.
+    fn with_source(source: Arc<dyn InterfaceEndpoints>) -> Self {
+        Self { source }
     }
 
     async fn endpoints(
@@ -98,24 +131,14 @@ impl ExplicitInterfaceWsDiscovery {
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<Vec<InterfaceEndpoint>> {
-        match &self.source {
-            EndpointSource::System(names) => {
-                enumerate_interfaces_bounded(Arc::clone(names), deadline, cancellation).await
-            }
-            #[cfg(test)]
-            EndpointSource::Fixed(endpoints) => Ok(endpoints.to_vec()),
-        }
+        self.source.resolve(deadline, cancellation).await
     }
 }
 
 #[async_trait]
 impl WsDiscovery for ExplicitInterfaceWsDiscovery {
     fn explicit_interfaces(&self) -> Option<&[String]> {
-        match &self.source {
-            EndpointSource::System(names) => Some(names.as_ref()),
-            #[cfg(test)]
-            EndpointSource::Fixed(_) => None,
-        }
+        Some(self.source.names())
     }
 
     async fn probe(
@@ -1010,6 +1033,140 @@ fn rejected(code: ErrorCode, message: &'static str) -> CameraError {
 
 #[cfg(test)]
 mod tests {
+
+    /// The transport reports the interfaces it is constrained to -- in a test as in production.
+    ///
+    /// The old `Fixed` variant answered `None` here while the shipped one answered `Some(names)`, and
+    /// the ONVIF code downstream branches on exactly this. So the tests were exercising a component
+    /// that does not ship.
+    #[test]
+    fn the_transport_names_its_interfaces_the_same_way_a_test_or_not() {
+        let production = ExplicitInterfaceWsDiscovery::new(vec!["eth0".to_string()]).unwrap();
+        assert_eq!(
+            production.explicit_interfaces(),
+            Some(["eth0".to_string()].as_slice())
+        );
+
+        let injected = ExplicitInterfaceWsDiscovery::fixed(
+            SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), 0),
+            SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), 3702),
+        );
+        assert!(
+            injected.explicit_interfaces().is_some(),
+            "a test transport that answers None makes the ONVIF code below it take a branch the              shipped binary never takes"
+        );
+    }
+
+    /// The SHIPPED interface lookup honours its deadline and its cancellation.
+    ///
+    /// `enumerate_interfaces_bounded` -- the limiter, the timeout, the cancellation, the blocking NIC
+    /// enumeration behind them -- was executed by no test at all: every functional test replaced it
+    /// with a fixed loopback list. These are the guards that stop a probe wedging the actor that
+    /// called it, and they were taken entirely on trust.
+    #[tokio::test]
+    async fn the_system_interface_lookup_honours_its_deadline_and_its_cancellation() {
+        let names: Arc<[String]> = vec!["eth0".to_string()].into();
+
+        let elapsed = Instant::now() - Duration::from_secs(1);
+        let error =
+            enumerate_interfaces_bounded(Arc::clone(&names), elapsed, &CancellationToken::new())
+                .await
+                .expect_err("a deadline that has already passed cannot be waited on");
+        assert_eq!(error.code(), ErrorCode::CaptureTimeout);
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let error = enumerate_interfaces_bounded(
+            Arc::clone(&names),
+            Instant::now() + Duration::from_secs(30),
+            &cancelled,
+        )
+        .await
+        .expect_err("a cancelled probe must not go and enumerate the host's interfaces");
+        assert_eq!(error.code(), ErrorCode::CaptureCancelled);
+    }
+
+    /// An interface the host does not have yields no endpoint to probe from.
+    ///
+    /// This runs the real NIC enumeration -- the code that binds to a local address to multicast at
+    /// 239.255.255.250:3702 -- rather than a fixed list standing in for it. The name is one no host
+    /// has, so the result is stable on any machine, and the path is the shipped one.
+    #[tokio::test]
+    async fn an_interface_the_host_does_not_have_yields_nothing_to_probe_from() {
+        let transport =
+            ExplicitInterfaceWsDiscovery::new(vec!["camera-adapter-no-such-nic".to_string()])
+                .unwrap();
+        let endpoints = transport
+            .endpoints(
+                Instant::now() + Duration::from_secs(10),
+                &CancellationToken::new(),
+            )
+            .await;
+        match endpoints {
+            Ok(endpoints) => assert!(
+                endpoints.is_empty(),
+                "an interface that does not exist cannot be probed from: {endpoints:?}"
+            ),
+            Err(error) => assert_eq!(
+                error.code(),
+                ErrorCode::BackendError,
+                "and if it refuses outright, it must refuse for a reason an operator can read"
+            ),
+        }
+    }
+
+    /// An endpoint source a test can hand the transport, in place of the host's real NICs.
+    ///
+    /// It answers `names()` exactly as the production source does -- which is the point. The old
+    /// `#[cfg(test)] Fixed` variant answered `explicit_interfaces()` with `None` while production
+    /// answered `Some(names)`, so the ONVIF code downstream took a DIFFERENT BRANCH in the test binary
+    /// than in the shipped one. A fake that lies about its own shape tests a component that does not
+    /// exist.
+    #[derive(Debug)]
+    struct FakeInterfaces {
+        names: Vec<String>,
+        endpoints: Vec<InterfaceEndpoint>,
+    }
+
+    #[async_trait]
+    impl InterfaceEndpoints for FakeInterfaces {
+        async fn resolve(
+            &self,
+            deadline: Instant,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<InterfaceEndpoint>> {
+            if cancellation.is_cancelled() {
+                return Err(rejected(
+                    ErrorCode::CaptureCancelled,
+                    "WS-Discovery cancelled",
+                ));
+            }
+            if deadline <= Instant::now() {
+                return Err(rejected(
+                    ErrorCode::CaptureTimeout,
+                    "WS-Discovery interface lookup timed out",
+                ));
+            }
+            Ok(self.endpoints.clone())
+        }
+
+        fn names(&self) -> &[String] {
+            &self.names
+        }
+    }
+
+    impl ExplicitInterfaceWsDiscovery {
+        fn fixed(local: SocketAddr, target: SocketAddr) -> Self {
+            Self::with_source(Arc::new(FakeInterfaces {
+                names: vec!["test-loopback".to_string()],
+                endpoints: vec![InterfaceEndpoint {
+                    interface_name: "test-loopback".to_string(),
+                    local,
+                    target,
+                }],
+            }))
+        }
+    }
     use super::*;
 
     fn response(message_id: &str, endpoint: &str, xaddrs: &str) -> String {

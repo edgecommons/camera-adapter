@@ -132,6 +132,35 @@ for volume in "$target_volume" "$registry_volume" "$git_volume"; do
     docker volume create "$volume" >/dev/null
 done
 
+# THE LOCKFILE. `Cargo.lock` is untracked and gitignored, so a clean checkout has none -- and every
+# cargo run below passes `--locked`, which REFUSES to create one. It must therefore be generated once,
+# before the hardened runs, by the networked prep run below.
+#
+# The prep run needs a WRITABLE workspace directory, and a file-only bind mount is not enough: the
+# validation image's cargo writes `Cargo.lock` ATOMICALLY -- a temp file beside it, then a rename --
+# so the *directory* must be writable, not just the file. So the prep run mounts the adapter directory
+# `:rw`, nested over the `:ro` workspace, and cargo writes the lock into the real (gitignored) tree.
+# Every hardened coverage run below then mounts the workspace `:ro`, sees that same lock, and asserts
+# `--locked` against it. The lock is removed at exit; the tree is untouched by the time the script ends,
+# and the measured coverage runs never had write access to a single source byte.
+adapter_host_dir="$workspace_root/camera-adapter"
+cleanup_generated_lock() { rm -f -- "$adapter_host_dir/Cargo.lock"; }
+trap cleanup_generated_lock EXIT
+cleanup_generated_lock
+
+# The one step with a network and a writable adapter directory. Everything after it is hardened `:ro`.
+docker run --rm --network bridge --read-only --tmpfs /tmp:size=64m,mode=1777 \
+    --cap-drop ALL --security-opt no-new-privileges:true \
+    -v "$workspace_root:/edgecommons:ro" \
+    -v "$adapter_host_dir:/edgecommons/camera-adapter:rw" \
+    -v "$target_volume:/coverage-target" \
+    -v "$registry_volume:/usr/local/cargo/registry" \
+    -v "$git_volume:/usr/local/cargo/git" \
+    -w /edgecommons/camera-adapter \
+    -e CARGO_TARGET_DIR=/coverage-target \
+    "$image" +1.87.0 generate-lockfile
+[[ -s $adapter_host_dir/Cargo.lock ]] || { echo "the prep run did not produce a Cargo.lock" >&2; exit 1; }
+
 run_coverage_command() {
     local tmpfs_size=$1
     shift

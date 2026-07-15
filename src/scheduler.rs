@@ -10,16 +10,55 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CameraError, Result,
-    config::{MisfirePolicy, OverlapPolicy, ScheduleConfig},
+    config::{CaptureGroupScheduleConfig, MisfirePolicy, OverlapPolicy, ScheduleConfig},
 };
 
 const MAX_OCCURRENCES_PER_EVALUATION: usize = 10_000;
 
+/// What a compiled schedule fires for.
+///
+/// A schedule belongs either to one camera (`camera.schedules`) or to a set of them
+/// (`global.captureGroupSchedules`). Both compile to the same [`SchedulePlan`] and are evaluated by
+/// the same [`SchedulePlan::evaluate`] -- the cron, DST, misfire, overlap and jitter rules are
+/// identical and must not be forked -- but they are not interchangeable, and the type says so: a
+/// group occurrence has no single camera to submit to, and asking it for one returns `None` rather
+/// than a plausible wrong answer.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ScheduleScope {
+    /// One camera, identified by its instance token.
+    Camera(String),
+    /// A group schedule, identified by its `captureGroupSchedules[].id`.
+    Group(String),
+}
+
+impl ScheduleScope {
+    /// The token identifying this scope in durable keys, task keys, and the jitter hash.
+    ///
+    /// Camera and group tokens cannot collide: instance tokens and schedule ids are both UNS tokens
+    /// (`[A-Za-z0-9._-]`), and `:` is not in that set, so no camera can be named `group:anything`.
+    #[must_use]
+    pub fn token(&self) -> String {
+        match self {
+            Self::Camera(instance) => instance.clone(),
+            Self::Group(schedule_id) => format!("group:{schedule_id}"),
+        }
+    }
+
+    /// The camera this scope names, or `None` for a group schedule.
+    #[must_use]
+    pub fn camera(&self) -> Option<&str> {
+        match self {
+            Self::Camera(instance) => Some(instance),
+            Self::Group(_) => None,
+        }
+    }
+}
+
 /// One unjittered durable occurrence plus its deterministic admission time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleOccurrence {
-    /// Camera instance token.
-    pub instance: String,
+    /// What this occurrence fires for: one camera, or a group schedule.
+    pub scope: ScheduleScope,
     /// Configured schedule token.
     pub schedule_id: String,
     /// Unjittered cron occurrence; this is the durable deduplication time.
@@ -28,14 +67,6 @@ pub struct ScheduleOccurrence {
     pub admit_at: DateTime<Utc>,
     /// Stable jitter applied to the occurrence.
     pub jitter: Duration,
-}
-
-impl ScheduleOccurrence {
-    /// Durable schedule-occurrence key components.
-    #[must_use]
-    pub fn key(&self) -> (&str, &str, DateTime<Utc>) {
-        (&self.instance, &self.schedule_id, self.intended_fire_time)
-    }
 }
 
 /// Result of one bounded scheduler evaluation.
@@ -83,7 +114,7 @@ impl ScheduleDecision {
 /// Compiled immutable schedule plan.
 #[derive(Debug, Clone)]
 pub struct SchedulePlan {
-    instance: String,
+    scope: ScheduleScope,
     schedule_id: String,
     cron: Cron,
     timezone: Tz,
@@ -93,40 +124,83 @@ pub struct SchedulePlan {
 }
 
 impl SchedulePlan {
-    /// Compiles an already component-validated schedule.
+    /// Compiles an already component-validated camera schedule.
     pub fn compile(instance: impl Into<String>, config: &ScheduleConfig) -> Result<Self> {
-        if config.cron.split_whitespace().count() != 6 {
+        Self::build(
+            ScheduleScope::Camera(instance.into()),
+            &config.id,
+            &config.cron,
+            &config.timezone,
+            config.jitter_seconds,
+            config.misfire_policy,
+            config.overlap_policy,
+        )
+    }
+
+    /// Compiles an already component-validated group schedule.
+    ///
+    /// A group schedule fires one synchronised capture across several cameras. Its cron, timezone,
+    /// misfire, overlap and jitter rules are exactly a camera schedule's, so it compiles to the same
+    /// plan and runs through the same evaluation. What differs is the scope, and therefore what an
+    /// admitted occurrence is submitted as.
+    pub fn compile_group(config: &CaptureGroupScheduleConfig) -> Result<Self> {
+        Self::build(
+            ScheduleScope::Group(config.id.clone()),
+            &config.id,
+            &config.cron,
+            &config.timezone,
+            config.jitter_seconds,
+            config.misfire_policy,
+            config.overlap_policy,
+        )
+    }
+
+    fn build(
+        scope: ScheduleScope,
+        id: &str,
+        cron_expression: &str,
+        timezone: &str,
+        jitter_seconds: u32,
+        misfire_policy: MisfirePolicy,
+        overlap_policy: OverlapPolicy,
+    ) -> Result<Self> {
+        if cron_expression.split_whitespace().count() != 6 {
             return schedule_error("cron must contain exactly six fields including seconds");
         }
-        let cron = Cron::from_str(&config.cron).map_err(|error| CameraError::Config {
+        let cron = Cron::from_str(cron_expression).map_err(|error| CameraError::Config {
             path: "schedule.cron".to_string(),
             message: format!("invalid six-field cron: {error}"),
         })?;
-        let timezone = config
-            .timezone
+        let timezone = timezone
             .parse::<Tz>()
             .map_err(|error| CameraError::Config {
                 path: "schedule.timezone".to_string(),
                 message: format!("invalid IANA timezone: {error}"),
             })?;
-        if config.jitter_seconds > 3_600 {
+        if jitter_seconds > 3_600 {
             return schedule_error("jitterSeconds must be in range 0..=3600");
         }
         Ok(Self {
-            instance: instance.into(),
-            schedule_id: config.id.clone(),
+            scope,
+            schedule_id: id.to_owned(),
             cron,
             timezone,
-            jitter_seconds: config.jitter_seconds,
-            misfire_policy: config.misfire_policy,
-            overlap_policy: config.overlap_policy,
+            jitter_seconds,
+            misfire_policy,
+            overlap_policy,
         })
     }
 
-    /// Returns the durable `(instance, scheduleId)` identity of this compiled plan.
+    /// What this plan fires for.
+    #[must_use]
+    pub fn scope(&self) -> &ScheduleScope {
+        &self.scope
+    }
+
+    /// Returns the durable `(scopeToken, scheduleId)` identity of this compiled plan.
     #[must_use]
     pub fn key_parts(&self) -> (String, String) {
-        (self.instance.clone(), self.schedule_id.clone())
+        (self.scope.token(), self.schedule_id.clone())
     }
 
     /// Whether an overlap observation can change this plan's decision at all.
@@ -216,7 +290,7 @@ impl SchedulePlan {
 
     fn occurrence(&self, intended_fire_time: DateTime<Utc>) -> Result<ScheduleOccurrence> {
         let jitter_seconds = stable_jitter_seconds(
-            &self.instance,
+            &self.scope.token(),
             &self.schedule_id,
             intended_fire_time,
             self.jitter_seconds,
@@ -225,7 +299,7 @@ impl SchedulePlan {
         let chrono_jitter = chrono::Duration::from_std(jitter)
             .map_err(|_| CameraError::Catalog("schedule jitter is too large".to_string()))?;
         Ok(ScheduleOccurrence {
-            instance: self.instance.clone(),
+            scope: self.scope.clone(),
             schedule_id: self.schedule_id.clone(),
             intended_fire_time,
             admit_at: intended_fire_time + chrono_jitter,
@@ -237,14 +311,14 @@ impl SchedulePlan {
 /// Stable jitter defined by the binding addendum.
 #[must_use]
 pub fn stable_jitter_seconds(
-    instance: &str,
+    scope_token: &str,
     schedule_id: &str,
     intended_fire_time: DateTime<Utc>,
     jitter_seconds: u32,
 ) -> u32 {
     let canonical_time = intended_fire_time.to_rfc3339_opts(SecondsFormat::Secs, true);
     let mut digest = Sha256::new();
-    digest.update(instance.as_bytes());
+    digest.update(scope_token.as_bytes());
     digest.update([0]);
     digest.update(schedule_id.as_bytes());
     digest.update([0]);
@@ -277,6 +351,154 @@ fn schedule_error<T>(message: impl Into<String>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Occurrences missed while the component was down are skipped, not fired hours late.
+    ///
+    /// `now` is passed in, so this decides the rule on a clock the test owns. The integration test
+    /// that used to cover this took its `now` from the wall clock and asked whether the last hourly
+    /// occurrence was older than the five-second misfire grace -- which is true for 3595 seconds out
+    /// of every 3600, and false for the five seconds after the hour. CI ran it at 23:00:01.
+    #[test]
+    fn occurrences_missed_while_the_component_was_down_are_skipped() {
+        let hourly = crate::config::CaptureGroupScheduleConfig {
+            id: "line-a-sync".to_string(),
+            enabled: true,
+            cron: "0 0 * * * *".to_string(),
+            timezone: "UTC".to_string(),
+            instances: vec!["cam-01".to_string(), "cam-02".to_string()],
+            capture_profile: None,
+            profile_overrides: std::collections::BTreeMap::new(),
+            misfire_policy: MisfirePolicy::Skip,
+            overlap_policy: OverlapPolicy::Skip,
+            jitter_seconds: 0,
+            timeout_ms: None,
+        };
+        let plan = SchedulePlan::compile_group(&hourly).unwrap();
+
+        // The component stopped just after 20:00 and came back at 23:30. Three occurrences came due
+        // while it was down, and the most recent of them is half an hour stale.
+        let last_consumed = "2026-07-13T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let now = "2026-07-13T23:30:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        let decision = plan
+            .evaluate(last_consumed, now, Duration::from_secs(5), false)
+            .unwrap();
+        match decision {
+            ScheduleDecision::SkippedMisfire { latest, consumed } => {
+                assert_eq!(
+                    consumed, 3,
+                    "21:00, 22:00 and 23:00 all came due while it was down"
+                );
+                assert_eq!(
+                    latest.intended_fire_time,
+                    "2026-07-13T23:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+                    "the cursor moves to the most recent of them, so they are not offered again"
+                );
+            }
+            other => {
+                panic!("a half-hour-stale occurrence must not be fired at a live line: {other:?}")
+            }
+        }
+
+        // `coalesce` is the operator saying they DO want the latest missed one -- exactly one of it.
+        let coalescing = crate::config::CaptureGroupScheduleConfig {
+            misfire_policy: MisfirePolicy::Coalesce,
+            ..hourly
+        };
+        let plan = SchedulePlan::compile_group(&coalescing).unwrap();
+        match plan
+            .evaluate(last_consumed, now, Duration::from_secs(5), false)
+            .unwrap()
+        {
+            ScheduleDecision::Admit {
+                occurrence,
+                consumed,
+            } => {
+                assert_eq!(consumed, 3);
+                assert_eq!(
+                    occurrence.intended_fire_time,
+                    "2026-07-13T23:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+                    "coalesce admits the LATEST missed occurrence, not the oldest, and not all three"
+                );
+            }
+            other => panic!("coalesce must admit the latest missed occurrence: {other:?}"),
+        }
+    }
+
+    /// A camera token and a group token can never be mistaken for one another.
+    ///
+    /// The scope token keys the jitter hash, the scheduler task map, and the durable cursor. If a
+    /// camera could be named such that it collided with a group schedule, two unrelated schedules
+    /// would share a jitter stream and a task slot. They cannot: both are UNS tokens, and `:` is not
+    /// a legal character in one.
+    #[test]
+    fn camera_and_group_scope_tokens_cannot_collide() {
+        let camera = ScheduleScope::Camera("line-a-sync".to_string());
+        let group = ScheduleScope::Group("line-a-sync".to_string());
+        assert_eq!(camera.token(), "line-a-sync");
+        assert_eq!(group.token(), "group:line-a-sync");
+        assert_ne!(camera.token(), group.token());
+        assert_eq!(camera.camera(), Some("line-a-sync"));
+        assert_eq!(
+            group.camera(),
+            None,
+            "a group occurrence has no single camera, and must not offer a plausible one"
+        );
+    }
+
+    /// A group schedule compiles to the same plan a camera schedule does, and keeps its scope.
+    #[test]
+    fn a_group_schedule_compiles_to_a_group_scoped_plan() {
+        let config = crate::config::CaptureGroupScheduleConfig {
+            id: "line-a-sync".to_string(),
+            enabled: true,
+            cron: "0 */5 * * * *".to_string(),
+            timezone: "America/New_York".to_string(),
+            instances: vec!["cam-01".to_string(), "cam-02".to_string()],
+            capture_profile: Some("inspect".to_string()),
+            profile_overrides: std::collections::BTreeMap::new(),
+            misfire_policy: MisfirePolicy::Skip,
+            overlap_policy: OverlapPolicy::Skip,
+            jitter_seconds: 0,
+            timeout_ms: None,
+        };
+        let plan = SchedulePlan::compile_group(&config).unwrap();
+        assert_eq!(
+            plan.scope(),
+            &ScheduleScope::Group("line-a-sync".to_string())
+        );
+        assert_eq!(
+            plan.key_parts(),
+            ("group:line-a-sync".to_string(), "line-a-sync".to_string())
+        );
+        assert!(plan.skips_on_overlap());
+
+        let occurrence = plan.next_after(Utc::now()).unwrap();
+        assert_eq!(
+            occurrence.scope,
+            ScheduleScope::Group("line-a-sync".to_string())
+        );
+        assert!(occurrence.scope.camera().is_none());
+    }
+
+    /// A six-field cron is required of a group schedule exactly as it is of a camera schedule.
+    #[test]
+    fn a_group_schedule_rejects_a_five_field_cron() {
+        let config = crate::config::CaptureGroupScheduleConfig {
+            id: "line-a-sync".to_string(),
+            enabled: true,
+            cron: "*/5 * * * *".to_string(),
+            timezone: "UTC".to_string(),
+            instances: vec!["cam-01".to_string(), "cam-02".to_string()],
+            capture_profile: None,
+            profile_overrides: std::collections::BTreeMap::new(),
+            misfire_policy: MisfirePolicy::Skip,
+            overlap_policy: OverlapPolicy::Skip,
+            jitter_seconds: 0,
+            timeout_ms: None,
+        };
+        assert!(SchedulePlan::compile_group(&config).is_err());
+    }
     use chrono::TimeZone;
 
     use super::*;

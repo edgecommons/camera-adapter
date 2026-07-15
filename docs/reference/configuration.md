@@ -10,35 +10,36 @@ configuration, messaging, credentials, and platform fields follow the core schem
 |---|---:|---|
 | `output.rootDirectory` | required | Absolute output root. |
 | `output.cameraDirectoryTemplate` | `{cameraId}/{yyyy}/{MM}/{dd}` | Relative per-camera directory template. |
-| `output.fileNameTemplate` | `{timestamp}-{captureId}.{extension}` | Relative final image name template. |
+| `output.fileNameTemplate` | `{timestamp}-{captureId}.{extension}` | Relative final image name template. Must contain `{captureId}` (or the camera directory must), because two captures that resolve to the same path cannot both be written: the second is refused and fails with `PERSISTENCE_FAILED`. |
 | `output.writeMetadataSidecar` | `false` | Write and finalize JSON metadata before exposing the image. |
 | `output.minimumFreeBytes` | 1 GiB | Free-byte floor after reservations. |
 | `output.minimumFreePercent` | 5 | Free-space percentage floor after reservations. |
 | `output.directoryMode` | `0750` | Mode for new output directories on Unix. |
 | `output.fileMode` | `0640` | Mode for final images and sidecars on Unix. |
-| `state.directory` | platform-dependent | Explicit durable catalog/outbox root; mandatory for Greengrass. |
+| `state.directory` | platform-dependent | Explicit durable catalog root; mandatory for Greengrass. |
 | `state.resultRetentionHours` | 72 | Terminal ledger retention. |
 | `state.maxResultRecords` | 100000 | Soft cap for terminal records. |
-| `state.outboxRetentionHours` | 168 | Delivered outbox retention. |
-| `state.queuedRecoveryPolicy` | `requeue` | `requeue` valid work after restart or `interrupt` it. |
+| `state.queuedRecoveryPolicy` | `requeue` | What becomes of captures still queued when the component stopped. `requeue` puts them back on the queue, provided the capture had not yet reached a camera, its deadlines have not passed, and its camera is still configured, enabled, and on the same backend. `interrupt` retires them all with `PROCESS_INTERRUPTED`. Anything a camera had already started is retired either way. |
 | `limits.maxConnectedCameras` | 256 | Maximum enabled camera supervisors. |
-| `limits.maxConcurrentCaptures` | 32 | Global acquisition concurrency. |
+| `limits.maxConcurrentCaptures` | 32 | Captures the component runs at once, fleet-wide. A capture holds one of these from the moment a camera takes it until it is terminal. |
 | `limits.maxConcurrentEncodes` | `min(CPU,8)` | Global encoding concurrency. |
 | `limits.maxConcurrentWrites` | 8 | Global persistence concurrency. |
 | `limits.maxConcurrentConnects` | 16 | Global connection-attempt concurrency. |
-| `limits.maxInFlightBytes` | 1 GiB | Global raw-frame reservation cap. |
-| `limits.maxFrameBytesPerCamera` | 256 MiB | Per-camera frame ceiling. |
+| `limits.maxInFlightBytes` | 2 GiB | Global raw-frame reservation cap. Must be at least `maxConcurrentCaptures` x `maxFrameBytesPerCamera`, because a capture reserves the declared ceiling rather than its frame's real size. |
+| `limits.maxFrameBytesPerCamera` | 64 MiB | Per-camera frame ceiling. |
 | `limits.maxMetadataBytes` | 8192 | Encoded caller metadata cap. |
 | `limits.maxQueuedCapturesPerCamera` | 4 | Capture queue cap per camera. |
+| `limits.maxPendingCaptures` | 256 | Captures the fleet queue holds in total. Must be at least `maxQueuedCapturesPerCamera`. Submitting past it is rejected with `QUEUE_FULL`. |
+| `limits.maxQueueWaitMs` | 300000 | How long a capture may wait for a camera when its profile sets no `queueExpiryMs`. A capture that waits longer expires without running. |
 | `limits.maxQueuedControlsPerCamera` | 32 | Ordinary control queue cap per camera. |
-| `limits.maxDeferredWaitersPerCapture` | 8 | Deferred direct-waiter cap. |
+| `limits.maxDeferredWaitersPerCapture` | 8 | How many callers may wait on one in-flight capture. A retried deferred capture attaches another caller to the same job; past this bound the retry is rejected with `RESOURCE_LIMIT`. |
 | `limits.maxCamerasPerGroup` | 32 | Group capture fan-out cap. |
 | `limits.resourceGroups.{name}.maxConcurrentCaptures` | required when named | Shared NIC/USB acquisition cap for cameras selecting that resource group. |
 | `timeouts.captureMs` | 30000 | Acquisition-stage cap. |
 | `timeouts.encodeMs` | 30000 | Encoding-stage cap. |
 | `timeouts.persistMs` | 30000 | Persistence-stage cap. |
 | `timeouts.ptzMs` | 10000 | PTZ response cap. |
-| `timeouts.jobTerminalMs` | 90000 | Default acceptance-to-terminal cap. |
+| `timeouts.jobTerminalMs` | 90000 | Deadline covering every stage, measured from the moment a camera takes the capture. The wait beforehand is bounded by `queueExpiryMs` or `limits.maxQueueWaitMs`. |
 | `timeouts.connectMs` | 10000 | One backend connection-attempt cap. |
 | `timeouts.reconnectBackoffMinMs` / `reconnectBackoffMaxMs` | 1000 / 60000 | Jittered reconnect range. |
 | `timeouts.replyMarginMs` | 5000 | Reserved margin before a direct reply deadline. |
@@ -49,10 +50,15 @@ configuration, messaging, credentials, and platform fields follow the core schem
 | `discovery.intervalSeconds` / `maxResults` | 60 / 1000 | Periodic discovery cadence and retained-result cap. |
 | `discovery.eligibleInterfaces` | `[]` | Exact OS interfaces permitted for WS-Discovery; no wildcard fallback. |
 | `operatorEvents.captureLifecycle` | `false` | Emit capture queued/started operator diagnostics. |
-| `healthThresholds.staleSignalSecs` | 300 | Mark a camera stale after this interval without observation. |
+| `healthThresholds.staleSignalSecs` | 300 | How long a camera may produce nothing before `southbound_health.staleSignals` reports it stale. A camera can be connected and stale. |
 | `security.maxHeaderBytes` | 65536 | ONVIF HTTP header/status limit. |
 | `security.maxDecompressionRatio` | 100 | Decoded/compressed response ratio limit. |
 | `security.allowBasicOverPlaintext` | `false` | Development-only exception for Basic auth over HTTP. |
+| `captureGroupSchedules` | `[]` | Cron schedules that capture several cameras together as one group. |
+
+`state` accepts exactly the four fields listed above. Any other key under it — `outboxRetentionHours`, for
+example — is an unknown key: the configuration is rejected rather than ignored, and the adapter does not
+start (or, on reload, keeps running the configuration it already has). Remove the key.
 
 ## Camera instance fields
 
@@ -71,10 +77,36 @@ offset/exposure/gain, and motion interlock. The profile's `captureInterlock` is 
 or `allow`. Unsupported Bayer/PFNC input is rejected as `UNSUPPORTED_PIXEL_FORMAT`; raw bytes are never
 mislabeled as RGB.
 
+A capture profile may also ask for a thumbnail. It is off unless the profile carries a `thumbnail`
+object:
+
+```json
+"captureProfiles": {
+  "inspection": {
+    "output": { "encoding": "jpeg" },
+    "thumbnail": { "size": "medium" }
+  }
+}
+```
+
+`size` is `small`, `medium`, or `large`, bounding the thumbnail's **longest edge** at 160, 320, or 640
+pixels.
+
+What the messaging transport can carry decides which sizes are usable. On the **IPC** transport
+(`--platform GREENGRASS`) the component's Greengrass IPC client encodes a whole message into a fixed
+10,000-byte buffer, so only `small` is carried; a profile asking for `medium` or `large` is reduced to
+`small`, and the component says so once for each camera at startup. On the **MQTT** transport
+(`--platform HOST` and `--platform KUBERNETES`) all three sizes are carried. The aspect ratio is preserved and a frame smaller than the bound is carried at its own size,
+never enlarged. The thumbnail is always JPEG, whatever the profile's own output encoding, and it travels
+with the published capture result — it is not written to disk and not stored in the catalog. A thumbnail
+that cannot be rendered, or that will not fit the message's byte ceiling, is left out of the result; the
+capture still succeeds and its image is still installed.
+
 An ONVIF backend defaults to `captureMode: "snapshot-uri"`, `rtspFallback: false`,
 `rtspSessionPolicy: "on-demand"`, `mediaService: "auto"`, and `authenticationMode: "auto"`.
 `maxSoapBytes`, `maxSnapshotBytes`, and `maxXmlDepth` default to 1 MiB, 64 MiB, and 64. `allowInsecure`
-defaults to false. Use `allowedUriHosts` and `allowedUriCidrs` only for deliberate additional endpoint
+defaults to false. A snapshot whose image data ends before the picture does is treated as a corrupt
+snapshot: with `rtspFallback: true` the capture falls back to the RTSP stream, and otherwise it fails. Use `allowedUriHosts` and `allowedUriCidrs` only for deliberate additional endpoint
 authority; they do not disable per-connection address validation.
 
 `ptz` defaults to `enabled: false`, `maximumContinuousMoveMs: 10000`, `captureInterlock: "reject"`,
@@ -95,5 +127,50 @@ Each schedule requires `id`, six-field seconds-inclusive `cron`, IANA `timezone`
 `jitterSeconds` defaults zero. `coalesce` admits only the latest missed occurrence and `queue` permits one
 ordinary bounded queued overlap.
 
+## Group schedules
+
+A schedule under a camera captures that camera. A schedule under `global.captureGroupSchedules` captures
+several cameras together, as one group:
+
+```json
+"captureGroupSchedules": [{
+  "id": "line-a-sync",
+  "cron": "0 */5 * * * *",
+  "timezone": "America/New_York",
+  "instances": ["cam-01", "cam-02", "cam-03"],
+  "captureProfile": "inspect",
+  "profileOverrides": { "cam-03": "inspect-wide" },
+  "timeoutMs": 30000
+}]
+```
+
+An occurrence is submitted exactly as an `sb/capture-group` command is: acceptance is all-or-nothing, the
+members share one durable group, and one collated terminal notification reports them together.
+
+`id`, `cron`, `timezone`, and `instances` are required, and `instances` names at least two cameras declared
+in `component.instances`, at most `limits.maxCamerasPerGroup`, each once. `captureProfile` applies to every
+member; `profileOverrides` replaces it per camera and its keys must be members. `enabled` defaults true,
+`misfirePolicy` and `overlapPolicy` default to `skip`, and `jitterSeconds` defaults to zero. `timeoutMs`
+bounds each member and ranges from 1000 to 1800000.
+
+`overlapPolicy` is evaluated against the group: the schedule holds an occurrence back while any member of
+its previous group is still running, so a group is never torn into halves that fire a cycle apart.
+
+A group larger than the component's spare capacity is sequenced rather than failed. Members wait in the
+fleet queue, and each one's stage deadlines start when a camera takes it -- so an oversized group takes
+longer, and every member still runs. A member waits at most its profile's `queueExpiryMs`, or
+`limits.maxQueueWaitMs`.
+
 `ptz` defaults to disabled. Its policy bounds continuous movement and disables preset mutation by default.
+
+A continuous move is stopped by its own deadline. `sb/ptz continuous` requires a `timeoutMs`, which may
+not exceed the camera's `ptz.maximumContinuousMoveMs`, and the adapter arms a stop for that instant
+before it replies -- the reply's `stopDeadline` is that instant. The camera is told the timeout as well,
+but the adapter does not rely on it: the move stops on time whether or not the camera honours its own
+timeout, and whether or not the requester is still there. An explicit stop, or any other PTZ command,
+retires the armed stop.
+
+The stop takes the camera's safety lane, which is served before queued controls and before captures: a
+capture in progress is cancelled to let it through, because a camera that has been told to stop moving
+matters more than an image.
 Use the [sample configurations](../sample-configurations.md) for complete shapes.

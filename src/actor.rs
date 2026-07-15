@@ -83,6 +83,16 @@ impl CameraActorHandle {
         self.shared.slots.used.load(Ordering::Acquire)
     }
 
+    /// Whether this camera has a free capture slot right now.
+    ///
+    /// The fleet scheduler asks before it pops: taking the globally best capture for a camera that
+    /// cannot hold it would strand the descriptor -- off the queue, unbounded, owned by nobody.
+    #[must_use]
+    pub fn can_accept_capture(&self) -> bool {
+        self.shared.accepting.load(Ordering::Acquire)
+            && self.shared.slots.used.load(Ordering::Acquire) < self.shared.slots.maximum
+    }
+
     /// Current ordinary-control count, excluding the independent safety lane.
     #[must_use]
     pub fn queued_controls(&self) -> usize {
@@ -91,7 +101,13 @@ impl CameraActorHandle {
 }
 
 impl CaptureDispatcher for CameraActorHandle {
-    fn reserve(&self) -> Result<Box<dyn DispatchReservation>> {
+    fn reserve(&self, camera_id: &str) -> Result<Box<dyn DispatchReservation>> {
+        if camera_id != self.shared.instance {
+            return Err(CameraError::rejected(
+                ErrorCode::UnknownInstance,
+                "capture was dispatched to the wrong camera actor",
+            ));
+        }
         if !self.shared.accepting.load(Ordering::Acquire) {
             return Err(CameraError::rejected(
                 ErrorCode::ComponentStopping,
@@ -115,12 +131,17 @@ pub struct CameraActor {
 
 impl CameraActor {
     /// Creates an actor and non-owning command/dispatch handle.
+    ///
+    /// `capacity_changed` is the fleet scheduler's wake-up: the actor raises it whenever a capture
+    /// slot is freed, so the scheduler can hand this camera its next capture immediately instead of
+    /// polling to find out.
     pub fn new(
         instance: impl Into<String>,
         session: Box<dyn CameraSession>,
         engine: JobEngine,
         max_queued_captures: usize,
         max_queued_controls: usize,
+        capacity_changed: Arc<Notify>,
     ) -> Result<(Self, CameraActorHandle)> {
         let instance = instance.into();
         if instance.is_empty() || max_queued_captures == 0 {
@@ -140,6 +161,7 @@ impl CameraActor {
             slots: Arc::new(DescriptorSlots {
                 used: AtomicUsize::new(0),
                 maximum: max_queued_captures,
+                released: Arc::clone(&capacity_changed),
             }),
             accepting: AtomicBool::new(true),
             notify: Notify::new(),
@@ -185,9 +207,49 @@ impl CameraActor {
                     let Some(queued) = queued else { break; };
                     let descriptor = queued.payload.into_descriptor();
                     let panic_descriptor = descriptor.clone();
-                    let result = AssertUnwindSafe(
-                        self.engine.execute(self.session.as_mut(), descriptor)
-                    ).catch_unwind().await;
+                    let capture_id = descriptor.capture_id().to_owned();
+                    // The capture owns the camera session for as long as it runs, so an emergency
+                    // stop cannot be delivered alongside it -- it can only be delivered INSTEAD of
+                    // it. Racing the two is therefore the whole of the fix: the lane is watched
+                    // while the capture runs, and a stop pre-empts it rather than queueing behind
+                    // it for up to `jobTerminalMs`. A capture is worth strictly less than a camera
+                    // that has been told to stop moving and has not.
+                    let controls = Arc::clone(&self.shared.controls);
+                    // Scoped so the capture future -- and with it the exclusive borrow of the camera
+                    // session -- is released before the result is handled.
+                    let result = {
+                    let engine = &self.engine;
+                    let capture = AssertUnwindSafe(
+                        engine.execute(self.session.as_mut(), descriptor)
+                    ).catch_unwind();
+                    tokio::pin!(capture);
+                    let mut pre_empted = false;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            finished = &mut capture => break finished,
+                            () = controls.safety_stop_arrived(), if !pre_empted => {
+                                pre_empted = true;
+                                // Cancelling releases the session at the capture's next await point
+                                // and durably terminalizes it as CANCELLED, with a reason an operator
+                                // can read. The stop itself is delivered at the top of the loop, which
+                                // pops the safety lane before anything else -- so it goes out the
+                                // moment the capture lets go, not when it would have finished.
+                                tracing::warn!(
+                                    instance = %self.shared.instance,
+                                    capture = %capture_id,
+                                    "an emergency stop pre-empted a running capture"
+                                );
+                                let _ = engine
+                                    .cancel_active(
+                                        &capture_id,
+                                        "capture was pre-empted by an emergency stop",
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                    };
                     match result {
                         Ok(Ok(_)) => {}
                         // The durable store failed, not the camera. Fail this capture and keep
@@ -373,6 +435,9 @@ impl QueuedDescriptor {
 struct DescriptorSlots {
     used: AtomicUsize,
     maximum: usize,
+    /// Raised whenever a slot is released, so the fleet scheduler learns this camera can take work
+    /// again instead of discovering it on the next tick of a timer.
+    released: Arc<Notify>,
 }
 
 impl DescriptorSlots {
@@ -401,6 +466,9 @@ impl Drop for DescriptorSlot {
         if !self.released {
             self.slots.used.fetch_sub(1, Ordering::AcqRel);
             self.released = true;
+            // Tell the scheduler. A camera that has just freed a slot is a camera that can be given
+            // the next capture, and the alternative to saying so is polling for it.
+            self.slots.released.notify_waiters();
         }
     }
 }
@@ -449,7 +517,6 @@ mod tests {
 
     use async_trait::async_trait;
     use chrono::Utc;
-    use edgecommons::messaging::{Message, MessageBuilder};
     use serde_json::{Map, Value, json};
     use tempfile::TempDir;
 
@@ -461,7 +528,6 @@ mod tests {
     };
     use crate::catalog::{
         AcceptJobOutcome, Catalog, CatalogOptions, InstallOutcome, JobDeadlines, LedgerKey, NewJob,
-        NewOutboxMessage,
     };
     use crate::config::{
         BackendConfig, CaptureInterlock, CaptureProfile, OfflinePolicy, OutputConfig,
@@ -469,11 +535,12 @@ mod tests {
         SimPtzConfig,
     };
     use crate::idempotency::canonical_request_hash;
+    use crate::jobs::testing::RecordingAnnouncer;
     use crate::jobs::{
         AvailabilityGate, CaptureJobSpec, JobHooks, JobProfileSnapshot, JobSubmission,
-        TerminalEnvelopeEncoder,
+        TerminalAnnouncer,
     };
-    use crate::messages::{CameraSummary, CaptureTrigger, TerminalMessage};
+    use crate::messages::{CameraSummary, CaptureTrigger};
     use crate::model::{
         BackendKind, CameraCapabilities, CaptureFrame, CaptureMode, JobState, OutputEncoding,
         PixelFormat, PtzVector,
@@ -481,33 +548,6 @@ mod tests {
     use crate::storage::{
         InstallDecision, InstallGate, OutputPathVariables, StorageRoot, render_output_path,
     };
-
-    struct TestEnvelopeEncoder;
-
-    impl TerminalEnvelopeEncoder for TestEnvelopeEncoder {
-        fn encode(
-            &self,
-            terminal: &TerminalMessage,
-            created_at_ms: i64,
-        ) -> Result<NewOutboxMessage> {
-            let message = MessageBuilder::new(terminal.header_name(), "1.0")
-                .correlation_id(terminal.correlation_id())
-                .payload(terminal.body_value()?)
-                .build();
-            NewOutboxMessage::from_message(
-                terminal.body().event_id.clone(),
-                "terminal",
-                format!(
-                    "ecv1/device/camera-adapter/{}/app/{}",
-                    terminal.body().camera_id,
-                    terminal.channel()
-                ),
-                &message,
-                created_at_ms,
-                created_at_ms,
-            )
-        }
-    }
 
     #[derive(Default)]
     struct RecordingHooks {
@@ -607,7 +647,12 @@ mod tests {
             panic!("injected backend panic")
         }
 
-        async fn ptz(&mut self, _request: PtzRequest) -> Result<PtzResult> {
+        async fn ptz_bounded(
+            &mut self,
+            _request: PtzRequest,
+            _deadline: Instant,
+            _cancellation: &CancellationToken,
+        ) -> Result<PtzResult> {
             Ok(PtzResult::Commanded)
         }
 
@@ -636,18 +681,27 @@ mod tests {
             unreachable!("the control-lane regression test does not capture")
         }
 
-        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
-            match request {
-                PtzRequest::Continuous { .. } => {
-                    self.ordinary_started.store(true, Ordering::Release);
-                    std::future::pending().await
+        async fn ptz_bounded(
+            &mut self,
+            request: PtzRequest,
+            deadline: Instant,
+            cancellation: &CancellationToken,
+        ) -> Result<PtzResult> {
+            // The continuous move hangs forever on purpose. The bound is what must end it.
+            let operation = async move {
+                match request {
+                    PtzRequest::Continuous { .. } => {
+                        self.ordinary_started.store(true, Ordering::Release);
+                        std::future::pending().await
+                    }
+                    PtzRequest::Stop { .. } => {
+                        self.safety_stops.fetch_add(1, Ordering::AcqRel);
+                        Ok(PtzResult::Commanded)
+                    }
+                    _ => unreachable!("the control-lane regression test only moves then stops"),
                 }
-                PtzRequest::Stop { .. } => {
-                    self.safety_stops.fetch_add(1, Ordering::AcqRel);
-                    Ok(PtzResult::Commanded)
-                }
-                _ => unreachable!("the control-lane regression test only moves then stops"),
-            }
+            };
+            crate::backend::bounded_ptz(operation, deadline, cancellation).await
         }
 
         async fn close(&mut self) -> Result<()> {
@@ -661,6 +715,7 @@ mod tests {
         actor: CameraActor,
         handle: CameraActorHandle,
         hooks: Arc<RecordingHooks>,
+        announcer: Arc<RecordingAnnouncer>,
         pause: Option<Arc<PausingInstallGate>>,
         output: OutputConfig,
         _output_directory: TempDir,
@@ -693,12 +748,14 @@ mod tests {
                 .unwrap();
         let storage = StorageRoot::open(&output).unwrap();
         let hooks = Arc::new(RecordingHooks::default());
+        let announcer = Arc::new(RecordingAnnouncer::default());
         let mut engine = JobEngine::new(
             catalog.clone(),
             admission,
             storage,
-            Arc::new(TestEnvelopeEncoder),
+            Arc::clone(&announcer) as Arc<dyn TerminalAnnouncer>,
             hooks.clone(),
+            crate::thumbnail::ThumbnailPolicy::for_transport(edgecommons::platform::Transport::Mqtt),
         );
         let pause = pause_install.then(|| {
             Arc::new(PausingInstallGate {
@@ -727,6 +784,7 @@ mod tests {
             engine.clone(),
             capture_capacity,
             control_capacity,
+            Arc::new(Notify::new()),
         )
         .unwrap();
         Harness {
@@ -735,6 +793,7 @@ mod tests {
             actor,
             handle,
             hooks,
+            announcer,
             pause,
             output,
             _output_directory: output_directory,
@@ -804,6 +863,7 @@ mod tests {
                     encoding,
                     jpeg_quality: 90,
                 },
+                thumbnail: None,
                 capture_interlock: Some(CaptureInterlock::Allow),
             },
             offline_policy: OfflinePolicy::WaitUntilDeadline,
@@ -933,8 +993,62 @@ mod tests {
         found
     }
 
+    /// A capture whose announcement cannot be published still SUCCEEDS, and the image is still there.
+    ///
+    /// This is the consequence of making the terminal announcement volatile, stated as an assertion:
+    /// the announcement is observability, and the capture is the product. A broker that is down costs
+    /// the announcement and NOTHING else -- not the image, not the sidecar, not the durable
+    /// SUCCEEDED that `sb/capture-status` answers with, and not the caller's reply.
     #[tokio::test]
-    async fn sim_capture_runs_end_to_end_with_sidecar_and_one_terminal_outbox() {
+    async fn a_capture_whose_announcement_cannot_be_published_still_succeeds() {
+        let harness = harness(sim(5, false, false), 2, 2, true, false).await;
+        harness.announcer.set_failing(true);
+        let shutdown = CancellationToken::new();
+        let actor_task = tokio::spawn(harness.actor.run(shutdown.clone()));
+        assert!(matches!(
+            harness
+                .engine
+                .accept_and_queue(
+                    &harness.handle,
+                    submission(&harness.output, "cap-broker-down", OutputEncoding::Png)
+                )
+                .await
+                .unwrap(),
+            AcceptJobOutcome::Inserted(_)
+        ));
+
+        let record = terminal(&harness.catalog, "cap-broker-down").await;
+        assert_eq!(
+            record.state,
+            JobState::Succeeded,
+            "a capture is not a publication: the broker was down, and the capture still happened"
+        );
+        assert!(record.error_code.is_none(), "the capture did not fail");
+        let body = record.terminal_result.as_ref().unwrap();
+        let image_path = body["image"]["absolutePath"].as_str().unwrap();
+        assert!(
+            Path::new(image_path).exists(),
+            "the image must be on disk whatever the broker did"
+        );
+        assert!(
+            Path::new(&format!("{image_path}.json")).exists(),
+            "the sidecar -- which IS the data path to file-replicator -- must be on disk too"
+        );
+        assert_eq!(
+            harness.announcer.for_capture("cap-broker-down").len(),
+            1,
+            "the announcement is attempted once, fails, and is dropped"
+        );
+        // The deferred caller is still settled: the reply comes from the durable terminal, not from
+        // the announcement.
+        assert_eq!(harness.hooks.waiters.load(Ordering::SeqCst), 1);
+
+        shutdown.cancel();
+        actor_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sim_capture_runs_end_to_end_with_sidecar_and_one_terminal_announcement() {
         let harness = harness(sim(5, false, false), 2, 2, true, false).await;
         let Harness {
             catalog,
@@ -942,6 +1056,7 @@ mod tests {
             actor,
             handle,
             hooks,
+            announcer,
             output,
             _output_directory,
             _state_directory,
@@ -968,13 +1083,17 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&sidecar_path).unwrap()).unwrap();
         assert_eq!(sidecar, *record.terminal_result.as_ref().unwrap());
         assert!(sidecar["timestamps"]["persistedAt"].is_string());
-        let outbox = catalog
-            .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-            .await
-            .unwrap();
-        assert_eq!(outbox.len(), 1);
-        let envelope = Message::from_slice(&outbox[0].encoded_envelope).unwrap();
-        assert_eq!(envelope.body, sidecar);
+        let announced = announcer.for_capture("cap-e2e");
+        assert_eq!(announced.len(), 1, "one terminal, one announcement");
+        assert_eq!(announced[0].header_name, "ImageCaptured");
+        assert_eq!(announced[0].channel, "image/captured");
+        assert_eq!(
+            announced[0].event_id,
+            record.terminal_result.as_ref().unwrap()["eventId"]
+                .as_str()
+                .unwrap(),
+            "the announcement carries the durable terminal body, not a rebuilt one"
+        );
         assert_eq!(hooks.waiters.load(Ordering::SeqCst), 1);
         shutdown.cancel();
         actor_task.await.unwrap().unwrap();
@@ -1004,15 +1123,9 @@ mod tests {
         assert_eq!(cancelled.state, JobState::Cancelled);
         let record = terminal(&harness.catalog, "cap-cancel").await;
         assert_eq!(record.state, JobState::Cancelled);
-        assert_eq!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        let announced = harness.announcer.for_capture("cap-cancel");
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].header_name, "ImageCaptureCancelled");
         shutdown.cancel();
         actor_task.await.unwrap().unwrap();
     }
@@ -1046,13 +1159,9 @@ mod tests {
             JobState::Succeeded
         );
         assert_eq!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
+            harness.announcer.for_capture("cap-install").len(),
+            1,
+            "the installation winner announces, and the cancellation that lost does not"
         );
         shutdown.cancel();
         actor_task.await.unwrap().unwrap();
@@ -1086,12 +1195,8 @@ mod tests {
         assert!(record.install_started);
         assert_eq!(record.state, JobState::Persisting);
         assert!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .is_empty()
+            harness.announcer.announcements().is_empty(),
+            "nothing is announced until a terminal is durable"
         );
         shutdown.cancel();
         actor_task.await.unwrap().unwrap();
@@ -1136,23 +1241,20 @@ mod tests {
                 .unwrap();
             assert_eq!(terminal.state, JobState::Succeeded);
             assert!(terminal.pending_success.is_none());
-            let outbox = harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap();
-            assert_eq!(outbox.len(), 1);
-            let envelope = Message::from_slice(&outbox[0].encoded_envelope).unwrap();
-            assert_eq!(envelope.body, terminal.terminal_result.clone().unwrap());
+            // The staged success belonged to a process that died before it could tell anyone. The
+            // recovery that commits it is the one that announces it -- rebuilt from the durable
+            // body, because the message the original process would have sent died with it.
+            let announced = harness.announcer.for_capture(capture_id);
+            assert_eq!(announced.len(), 1, "the recovered terminal is announced once");
+            let body = terminal.terminal_result.clone().unwrap();
+            assert_eq!(announced[0].header_name, "ImageCaptured");
+            assert_eq!(announced[0].event_id, body["eventId"].as_str().unwrap());
             if sidecar {
-                let image_path =
-                    terminal.terminal_result.as_ref().unwrap()["image"]["absolutePath"]
-                        .as_str()
-                        .unwrap();
+                let image_path = body["image"]["absolutePath"].as_str().unwrap();
                 let sidecar_body: Value =
                     serde_json::from_slice(&std::fs::read(format!("{image_path}.json")).unwrap())
                         .unwrap();
-                assert_eq!(sidecar_body, envelope.body);
+                assert_eq!(sidecar_body, body);
             }
             shutdown.cancel();
             actor_task.await.unwrap().unwrap();
@@ -1205,12 +1307,8 @@ mod tests {
         assert_eq!(retained.state, JobState::Persisting);
         assert!(retained.pending_success.is_some());
         assert!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .is_empty()
+            harness.announcer.announcements().is_empty(),
+            "a recovery that refused to commit must announce nothing"
         );
 
         shutdown.cancel();
@@ -1249,6 +1347,92 @@ mod tests {
         assert!(partials(Path::new(&harness.output.root_directory)).is_empty());
         shutdown.cancel();
         actor_task.await.unwrap().unwrap();
+    }
+
+    /// An emergency stop pre-empts the capture that is holding the camera.
+    ///
+    /// The capture owns the session for as long as it runs, so the stop cannot be delivered
+    /// alongside it -- only instead of it. Before this, the actor polled the safety lane between
+    /// pieces of work and nowhere else, so a stop pushed during a capture was not seen until the
+    /// capture finished: up to `jobTerminalMs`, at a camera that is physically moving. The lane was
+    /// documented as "independent" and "non-evictable", and it was neither of any use.
+    ///
+    /// The capture here takes two seconds. The stop must not take two seconds.
+    #[tokio::test]
+    async fn a_safety_stop_pre_empts_the_capture_that_is_holding_the_camera() {
+        let harness = harness(sim(2_000, false, true), 2, 2, false, false).await;
+        let shutdown = CancellationToken::new();
+        let handle = harness.handle.clone();
+        let catalog = harness.catalog.clone();
+        let actor_task = tokio::spawn(harness.actor.run(shutdown.clone()));
+
+        harness
+            .engine
+            .accept_and_queue(
+                &handle,
+                submission(&harness.output, "cap-pre-empted", OutputEncoding::Raw),
+            )
+            .await
+            .unwrap();
+
+        // Let the capture take the camera.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let started = std::time::Instant::now();
+        handle
+            .safety_stop(SafetyStop {
+                pan: true,
+                tilt: true,
+                zoom: true,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            })
+            .expect("the safety lane always accepts a stop");
+
+        // The stop reaches the camera when the capture lets go of it -- which must be at once, not
+        // when the capture would have finished.
+        let status = tokio::time::timeout(Duration::from_millis(1_200), async {
+            loop {
+                if let Ok(PtzResult::Status(status)) = handle
+                    .ptz(
+                        PtzRequest::Status,
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                        &CancellationToken::new(),
+                    )
+                    .await
+                {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an emergency stop must not wait out the capture that is holding the camera");
+        assert_eq!(
+            status.moving,
+            Some(false),
+            "the camera must have been stopped"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "the stop took {:?}; the capture it pre-empted was two seconds long",
+            started.elapsed()
+        );
+
+        // And the capture it pre-empted is durably retired, with a reason, rather than left running
+        // against a camera that has been told to stop.
+        let record = terminal(&catalog, "cap-pre-empted").await;
+        assert_eq!(record.state, JobState::Cancelled);
+        assert!(
+            record
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("emergency stop")),
+            "an operator must be able to see why the capture died: {:?}",
+            record.error_message
+        );
+
+        shutdown.cancel();
+        let _ = actor_task.await;
     }
 
     #[tokio::test]
@@ -1366,9 +1550,15 @@ mod tests {
             ordinary_started: Arc::clone(&ordinary_started),
             safety_stops: Arc::clone(&safety_stops),
         };
-        let (actor, handle) =
-            CameraActor::new("cam-a", Box::new(session), harness.engine.clone(), 2, 2)
-                .expect("test actor");
+        let (actor, handle) = CameraActor::new(
+            "cam-a",
+            Box::new(session),
+            harness.engine.clone(),
+            2,
+            2,
+            Arc::new(Notify::new()),
+        )
+        .expect("test actor");
         let shutdown = CancellationToken::new();
         let actor_task = tokio::spawn(actor.run(shutdown.clone()));
         let control_handle = handle.clone();
@@ -1422,7 +1612,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deterministic_sim_stage_failure_commits_one_failed_outbox() {
+    async fn deterministic_sim_stage_failure_commits_and_announces_one_failure() {
         let harness = harness(sim(1, true, false), 2, 2, false, false).await;
         let shutdown = CancellationToken::new();
         let actor_task = tokio::spawn(harness.actor.run(shutdown.clone()));
@@ -1441,15 +1631,10 @@ mod tests {
             record.terminal_result.as_ref().unwrap()["failure"]["stage"],
             "ACQUIRING"
         );
-        assert_eq!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        let announced = harness.announcer.for_capture("cap-fail");
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].header_name, "ImageCaptureFailed");
+        assert_eq!(announced[0].channel, "image/failed");
         shutdown.cancel();
         actor_task.await.unwrap().unwrap();
     }
@@ -1574,6 +1759,60 @@ mod tests {
         actor_task.await.unwrap().unwrap();
     }
 
+    /// An actor serves exactly one camera, and only while it is up.
+    ///
+    /// `reserve` is the fleet scheduler's two-phase handshake: capacity is taken here, BEFORE the
+    /// descriptor leaves the queue, so a refusal has to be a refusal -- the caller still holds the
+    /// work and can put it back. Both guards protect that.
+    ///
+    /// The instance check is not paranoia about a typo. The scheduler looks an actor up by camera id
+    /// and a reload swaps actors underneath it, so the handle it holds can belong to a camera that is
+    /// no longer the one it thinks it is. Reserving anyway would hand `camera-b`'s capture to
+    /// `camera-a`'s session -- a frame taken by the wrong physical camera, filed under the right
+    /// capture id, and reported as a success. Nothing downstream could ever detect that.
+    ///
+    /// The accepting check is the shutdown counterpart: an actor that has drained its queue and closed
+    /// its session must not accept a descriptor it will never run, because the reservation is what
+    /// makes the scheduler let go of it.
+    #[tokio::test]
+    async fn an_actor_reserves_for_its_own_camera_only_and_for_none_once_it_has_stopped() {
+        let harness = harness(sim(1, false, false), 2, 2, false, false).await;
+
+        let misrouted = harness
+            .handle
+            .reserve("cam-b")
+            .err()
+            .expect("a capture for another camera must never be run by this one");
+        assert_eq!(misrouted.code(), ErrorCode::UnknownInstance);
+        assert_eq!(
+            harness.handle.queued_captures(),
+            0,
+            "a refused reservation must not have taken a capture slot with it"
+        );
+
+        drop(
+            harness
+                .handle
+                .reserve("cam-a")
+                .expect("its own camera is exactly what this actor is for"),
+        );
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        harness
+            .actor
+            .run(shutdown)
+            .await
+            .expect("a cancelled actor stops cleanly");
+
+        let stopped = harness
+            .handle
+            .reserve("cam-a")
+            .err()
+            .expect("an actor that has closed its session cannot promise to run anything");
+        assert_eq!(stopped.code(), ErrorCode::ComponentStopping);
+    }
+
     #[tokio::test]
     async fn backend_panic_is_terminalized_and_isolated_to_its_actor() {
         let mut harness = harness(sim(1, false, false), 2, 2, false, false).await;
@@ -1593,15 +1832,7 @@ mod tests {
         let record = terminal(&harness.catalog, "cap-panic").await;
         assert_eq!(record.state, JobState::Failed);
         assert_eq!(record.error_code.as_deref(), Some("BACKEND_ERROR"));
-        assert_eq!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(harness.announcer.for_capture("cap-panic").len(), 1);
     }
 
     #[tokio::test]
@@ -1626,15 +1857,11 @@ mod tests {
                 terminal(&harness.catalog, capture_id).await.state,
                 JobState::Cancelled
             );
+            assert_eq!(
+                harness.announcer.for_capture(capture_id).len(),
+                1,
+                "a capture cancelled by shutdown is still announced once"
+            );
         }
-        assert_eq!(
-            harness
-                .catalog
-                .pending_outbox(Utc::now().timestamp_millis() + 1000, 10)
-                .await
-                .unwrap()
-                .len(),
-            2
-        );
     }
 }

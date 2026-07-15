@@ -756,9 +756,97 @@ async fn send_http_bounded(
     }
 }
 
+/// What makes one HTTP client different from another.
+///
+/// The client cannot simply be a singleton: the address is PINNED into it (`resolve`), and the TLS
+/// posture -- hostname verification, certificate acceptance, a private CA -- belongs to the camera,
+/// not to the component. Two cameras with different trust settings must not share a client. Two
+/// requests to the SAME camera must.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HttpClientKey {
+    host: String,
+    socket: SocketAddr,
+    verify_hostname: bool,
+    allow_invalid_certificates: bool,
+    /// The private CA bundle, digested. The bytes themselves are a secret handle and are not kept.
+    ca_digest: Option<[u8; 32]>,
+}
+
+/// The number of distinct client configurations kept alive.
+///
+/// One per camera at the design's 256, plus room for a camera whose address moves. Past it the cache
+/// is emptied rather than grown: a bounded miss costs a handshake, and an unbounded map costs the
+/// process.
+const MAX_POOLED_CLIENTS: usize = 1_024;
+
 /// Production reqwest transport with per-request address pinning and redirects disabled.
+///
+/// The client used to be built INSIDE `send()`, per request. A fresh connection pool, a fresh rustls
+/// configuration, a fresh root-certificate store -- built, used once, and dropped. Keep-alive was not
+/// merely unused, it was structurally impossible: every SOAP call and every snapshot GET paid a full
+/// TCP and TLS handshake and left a socket in TIME_WAIT. Connecting to one camera is about nine
+/// requests. At 256 cameras snapshotting every ten seconds that is ~26 connections a second sustained,
+/// north of 1,500 sockets held continuously, and a TLS handshake per snapshot on hardware that has to
+/// decode video with what is left.
+///
+/// Clients are now kept, keyed by the configuration that makes them different. Same camera, same
+/// posture, same client -- and reqwest's pool does what it was built to do.
 #[derive(Debug, Default)]
-pub struct ReqwestOnvifTransport;
+pub struct ReqwestOnvifTransport {
+    clients: std::sync::Mutex<std::collections::HashMap<HttpClientKey, reqwest::Client>>,
+}
+
+impl ReqwestOnvifTransport {
+    /// The client for this request's camera and trust posture, built once and then reused.
+    fn client(&self, request: &OnvifHttpRequest, socket: SocketAddr) -> Result<reqwest::Client> {
+        let key = HttpClientKey {
+            host: request.target.host().to_owned(),
+            socket,
+            verify_hostname: request.tls.verify_hostname,
+            allow_invalid_certificates: request.tls.allow_invalid_certificates,
+            ca_digest: request.tls.ca_pem.as_ref().map(|pem| {
+                let mut digest = Sha256::new();
+                digest.update(pem.expose());
+                digest.finalize().into()
+            }),
+        };
+
+        if let Ok(clients) = self.clients.lock() {
+            if let Some(client) = clients.get(&key) {
+                return Ok(client.clone());
+            }
+        }
+
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve(request.target.host(), socket)
+            .tls_danger_accept_invalid_hostnames(!request.tls.verify_hostname)
+            .tls_danger_accept_invalid_certs(request.tls.allow_invalid_certificates);
+        if let Some(ca_pem) = &request.tls.ca_pem {
+            let certificates = reqwest::Certificate::from_pem_bundle(ca_pem.expose())
+                .map_err(|_| security_error("private CA bundle is invalid"))?;
+            if certificates.is_empty() {
+                return Err(security_error("private CA bundle contains no certificates"));
+            }
+            for certificate in certificates {
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
+        let client = builder
+            .build()
+            .map_err(|_| backend_error("HTTP client construction failed"))?;
+
+        if let Ok(mut clients) = self.clients.lock() {
+            // A camera that keeps moving must not be able to grow this without bound. Emptying it
+            // costs one handshake per camera; keeping it costs the process.
+            if clients.len() >= MAX_POOLED_CLIENTS {
+                clients.clear();
+            }
+            clients.insert(key, client.clone());
+        }
+        Ok(client)
+    }
+}
 
 fn collect_bounded_response_headers(
     source: &reqwest::header::HeaderMap,
@@ -815,24 +903,7 @@ impl OnvifHttpTransport for ReqwestOnvifTransport {
             return Err(security_error("HTTP response bounds must be non-zero"));
         }
         let socket = SocketAddr::new(request.target.address, request.target.port);
-        let mut builder = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve(request.target.host(), socket)
-            .tls_danger_accept_invalid_hostnames(!request.tls.verify_hostname)
-            .tls_danger_accept_invalid_certs(request.tls.allow_invalid_certificates);
-        if let Some(ca_pem) = &request.tls.ca_pem {
-            let certificates = reqwest::Certificate::from_pem_bundle(ca_pem.expose())
-                .map_err(|_| security_error("private CA bundle is invalid"))?;
-            if certificates.is_empty() {
-                return Err(security_error("private CA bundle contains no certificates"));
-            }
-            for certificate in certificates {
-                builder = builder.add_root_certificate(certificate);
-            }
-        }
-        let client = builder
-            .build()
-            .map_err(|_| backend_error("HTTP client construction failed"))?;
+        let client = self.client(&request, socket)?;
         let method = match request.method {
             OnvifHttpMethod::Get => reqwest::Method::GET,
             OnvifHttpMethod::Post => reqwest::Method::POST,
@@ -2526,7 +2597,7 @@ impl Default for OnvifBackendDependencies {
         Self {
             resolver: Arc::new(SystemResolver),
             discovery: Arc::new(DisabledWsDiscovery),
-            transport: Arc::new(ReqwestOnvifTransport),
+            transport: Arc::new(ReqwestOnvifTransport::default()),
             credentials: None,
             clock: Arc::new(SystemOnvifClock),
             nonce_source: Arc::new(SystemNonceSource),
@@ -3584,15 +3655,6 @@ impl CameraSession for OnvifSession {
         }
     }
 
-    async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
-        self.ptz_call(
-            &request,
-            Instant::now() + DEFAULT_PTZ_REQUEST_TIMEOUT,
-            &CancellationToken::new(),
-        )
-        .await
-    }
-
     async fn ptz_bounded(
         &mut self,
         request: PtzRequest,
@@ -3666,6 +3728,34 @@ async fn decode_snapshot_at_safe_boundary(
             Ok(result) => result,
             Err(_) => Err(SnapshotAttemptFailure::fatal(backend_error("snapshot decoder task failed"))),
         },
+    }
+}
+
+/// Whether an encoded image actually carries a whole picture.
+///
+/// Decoding is NOT this check, and that is the trap. `image`'s JPEG decoder is lenient about a
+/// truncated entropy-coded scan: it returns the rows it managed to reconstruct rather than failing. And
+/// `snapshot_to_frame` only ever used the decode as a dimension/format sanity check before passing the
+/// ORIGINAL body through as the frame -- so a snapshot whose scan simply stopped arriving decoded to the
+/// declared dimensions, passed every guard, and was DELIVERED. A half-picture, structurally valid,
+/// reported as a success, and self-consistent with its own digest at every link downstream.
+///
+/// The only thing that caught a mid-scan cut was HTTP framing. A camera or middlebox that truncates
+/// without breaking `Content-Length` was invisible.
+///
+/// A container that never wrote its terminal marker never finished writing the picture:
+///
+/// * **JPEG** ends at `FF D9` (End Of Image). This is exact rather than heuristic -- inside
+///   entropy-coded data every `0xFF` is byte-stuffed as `FF 00`, so a genuine `FF D9` CANNOT occur
+///   within the scan. Trailing padding after it (which some cameras append) is fine: the marker is
+///   searched for, not required to be the final byte.
+/// * **PNG** ends with the `IEND` chunk.
+fn image_carries_a_whole_picture(body: &[u8], format: ImageFormat) -> bool {
+    match format {
+        ImageFormat::Jpeg => body.windows(2).any(|pair| pair == [0xFF, 0xD9]),
+        ImageFormat::Png => body.windows(4).any(|chunk| chunk == b"IEND"),
+        // Any other format is rejected on its own terms further down; do not veto it here.
+        _ => true,
     }
 }
 
@@ -3753,6 +3843,14 @@ fn snapshot_to_frame(
             ErrorCode::ResourceLimit,
             "decoded snapshot exceeds the decompression-ratio bound",
         )));
+    }
+    // The picture must be WHOLE, not merely decodable. A scan that stopped arriving still decodes to the
+    // declared dimensions, and used to be delivered as a success.
+    if !image_carries_a_whole_picture(&response.body, declared_format) {
+        return Err(SnapshotAttemptFailure::fallback(
+            SnapshotFallbackReason::CorruptImage,
+            backend_error("snapshot ended before the image did; the picture is incomplete"),
+        ));
     }
     let decoded =
         image::load_from_memory_with_format(&response.body, declared_format).map_err(|_| {
@@ -4219,6 +4317,30 @@ fn cancelled_error(stage: &'static str) -> CameraError {
 
 #[cfg(test)]
 mod tests {
+    /// A generously-bounded PTZ call, for tests that are not about the bound.
+    ///
+    /// `CameraSession` deliberately offers only `ptz_bounded`: an unbounded variant is an invitation to
+    /// fabricate the deadline and the cancellation token, which is precisely what the old required
+    /// `ptz` drove `OnvifSession` to do. Tests that are exercising PTZ BEHAVIOUR still want to say
+    /// `session.ptz(request)` without inventing a deadline in every line, so they say it here, once,
+    /// where the deadline is obviously a test's and not a protocol's.
+    #[async_trait]
+    trait GenerouslyBoundedPtz {
+        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult>;
+    }
+
+    #[async_trait]
+    impl<T: CameraSession + ?Sized> GenerouslyBoundedPtz for T {
+        async fn ptz(&mut self, request: PtzRequest) -> Result<PtzResult> {
+            self.ptz_bounded(
+                request,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+        }
+    }
+
     use std::collections::{BTreeMap, VecDeque};
     use std::net::IpAddr;
     use std::str::FromStr;
@@ -4728,9 +4850,287 @@ mod tests {
         assert!(find_auth_scheme("NotDigest realm=\"camera\"", "digest").is_none());
     }
 
+    /// One camera, one HTTP client -- so keep-alive is possible at all.
+    ///
+    /// The client was built INSIDE `send()`, per request: a fresh connection pool, a fresh rustls
+    /// configuration, a fresh root-certificate store, used once and dropped. Keep-alive was not merely
+    /// unused, it was structurally impossible, and every SOAP call and snapshot GET paid a full TCP and
+    /// TLS handshake and left a socket in TIME_WAIT. Connecting to one camera is about nine requests;
+    /// at 256 cameras snapshotting every ten seconds that is ~26 connections a second, sustained.
+    ///
+    /// The client cannot be a singleton either: the address is pinned into it and the TLS posture
+    /// belongs to the camera. Two cameras that trust different certificate authorities must never
+    /// share one -- which is the assertion that actually matters here.
+    #[tokio::test]
+    async fn one_camera_keeps_one_http_client_and_a_different_trust_posture_gets_its_own() {
+        let transport = ReqwestOnvifTransport::default();
+        let socket = SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), 8_443);
+        let plain = loopback_http_request(8_443, OnvifHttpMethod::Post, 32);
+
+        let first = transport.client(&plain, socket).expect("a client is built");
+        let second = transport.client(&plain, socket).expect("and then reused");
+        assert_eq!(
+            transport.clients.lock().unwrap().len(),
+            1,
+            "the same camera, asked twice, must not build a second connection pool"
+        );
+        // `reqwest::Client` is a handle to one pool; cloning shares it. Same pool, same keep-alive.
+        drop((first, second));
+
+        // A camera that trusts a different CA is a different client, and must be.
+        let mut private_ca = loopback_http_request(8_443, OnvifHttpMethod::Post, 32);
+        private_ca.tls.allow_invalid_certificates = true;
+        let _ = transport
+            .client(&private_ca, socket)
+            .expect("its own client");
+        assert_eq!(
+            transport.clients.lock().unwrap().len(),
+            2,
+            "a different trust posture must never share a client with a stricter one"
+        );
+    }
+
+    /// A self-signed CA, valid until 2126. Nothing connects to it -- it only has to be a real
+    /// certificate, because the code under test parses it.
+    const TEST_CA_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIIDJTCCAg2gAwIBAgIUXQLMJIHNs1dimp6pKLD7Sh6kAxUwDQYJKoZIhvcNAQEL
+BQAwITEfMB0GA1UEAwwWY2FtZXJhLWFkYXB0ZXItdGVzdC1jYTAgFw0yNjA3MTQw
+NDMyMDRaGA8yMTI2MDYyMDA0MzIwNFowITEfMB0GA1UEAwwWY2FtZXJhLWFkYXB0
+ZXItdGVzdC1jYTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANvNVlGx
+9XyS10ojUtyx0BSYWpx7nwvw0ToiTPvCDKdoeAX12IwY5Zr6Tuj8+Sj8rnzqloYA
+6aJX1ydGy6HjzjygxTUo2o/6V1X7UCk1h0VdRWP1hXqY5pCQdYhfefBIwT4LkoZC
+AgfnO/WoUXRVP+s7dtFEem8mFDZsfW6fNMBlQPeb6a96rrDUHa5aZfDrG2AKq7gF
+MqjSSgEm6oICdopEvM312z3m0L38/UILEWO/HDc8tmqI2jwGmTmqDx6c8yn9TrBy
+cJuZVgmXQS2470yV7jL+nkrAnedw9Et3AdTTYmtfc0xYfyWZp50VqDBDlwP5VeJR
+9NKOd4WEo4Eg6G0CAwEAAaNTMFEwHQYDVR0OBBYEFOoUND3o4j6sQstQHFL9fyJc
+R+9PMB8GA1UdIwQYMBaAFOoUND3o4j6sQstQHFL9fyJcR+9PMA8GA1UdEwEB/wQF
+MAMBAf8wDQYJKoZIhvcNAQELBQADggEBAAs/y4F6013kYX8aeJ9xp63HtAfV4mgM
+8N0LD2CDvF34y5R8nP4D75jMih2N5miI6swfj1dYq+0/wn6Wbnx5R4eOQoGVesb7
+YX1Ehi8lxMiytt80tNAlcgGgPU8NkCZ+ttiY3Y8Y4eXfOy16caZ1Hvqo/2JGVhN0
+IygJCv51DJWcf8KPLIeCdwix8iHgR5EAOZM4BiFPgP6DgXXKIuPA/nr24dkAeXt8
+cvm/OTzEVSowjneTcURg3GfcT41yJ58NIaNmjh+KiziZ6yby70MdBa0+mNY/ZM/j
+KZqUk5o8OZ+5KRGSwv2Fwj0XMp6CIDX/2TflMDHcrGp+USYwJhWXnc4=
+-----END CERTIFICATE-----
+";
+
+    /// A second, unrelated self-signed CA. Different bytes, therefore a different camera trust root.
+    const OTHER_CA_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----
+MIIDJzCCAg+gAwIBAgIUH/5w8MMMpIgIvYIDPGmfRZVjnXIwDQYJKoZIhvcNAQEL
+BQAwIjEgMB4GA1UEAwwXY2FtZXJhLWFkYXB0ZXItb3RoZXItY2EwIBcNMjYwNzE0
+MDQ0MjM2WhgPMjEyNjA2MjAwNDQyMzZaMCIxIDAeBgNVBAMMF2NhbWVyYS1hZGFw
+dGVyLW90aGVyLWNhMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyaox
+0TcwrnTCV7E7Tgn6a0bNRxLX0IfAlBs540D+MRunBCyW33cvCEB/p+zk4kF+VX1R
+LoNK6DqZpM9JbJMLUrcX5kEdQw5pNdEmCvmSwVz6tUtH59LEieKbE84mCat2Z5R3
+h/TWl/tm3kfROT0A/cmObasFuLDb2niPt+5qovH+cNgHk646zF+kbEnRD4Wj/Sdp
+dgsXoBHZxAB8AtMMSGGXzWNl5VxGE7ekTyx7v7a4MOhYYCYHigcDl39U9nJh4lfy
+vJD86kijF4Z0aiEE0t49AEvroGXkR3HFC5LWBH3hkbAHI8kAf8ibFa3mpYpQmWgs
++0YcKGCniN7v+iO+QQIDAQABo1MwUTAdBgNVHQ4EFgQUA8vTzPi5uGEhm384HopP
+8quaet8wHwYDVR0jBBgwFoAUA8vTzPi5uGEhm384HopP8quaet8wDwYDVR0TAQH/
+BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAJv7zvtE1kQwEPz67+r26hoLF7zVN
+j0DZr5eyaxayW0DbskIEWQhRzegHWDM/TV/DrlPcgz+nnDbROWsiWfz12e9ooxwv
+ndP7ub6FXCozZjIMOw0GglraaraDTw17h88q7De9HD7eMh9SDD+2IuGlSLRE+GP2
+VgOt+CtnpoCLyVVejBgNIteFmsFfwuSt2HV3TeWbR/05IzBIP/89JQDO9YDtKPBT
+/EXZJ+ZnurKVLVCTZdNH8larh2ThxKvQLw8f74HdFTV2GLDzj+IYb0iY94lTJflj
+wkWsh7u3nnr9fXRpWsamYEAKGzNo0istMB6rD6cMzNfRZCMk4rXuokYWOw==
+-----END CERTIFICATE-----
+";
+
+    fn request_trusting(ca_pem: &[u8]) -> OnvifHttpRequest {
+        let mut request = loopback_http_request(8_443, OnvifHttpMethod::Post, 32);
+        request.tls.ca_pem = Some(Arc::new(SecretBytes::new(ca_pem)));
+        request
+    }
+
+    /// Two cameras behind two private CAs must not end up sharing one client.
+    ///
+    /// The client is what holds the trust decision -- the root store is baked into it at build time.
+    /// If the cache key ignored the CA, the SECOND camera to ask would silently be handed the FIRST
+    /// camera's client, and would then be validated against a certificate authority that has nothing
+    /// to do with it. That is a trust boundary quietly dissolving inside a performance optimisation,
+    /// so the key digests the bundle: same bytes, same client; different bytes, never.
+    ///
+    /// The digest is also why the bundle itself is not kept. It is a secret handle, and a cache of
+    /// them, alive for the life of the process, is exactly what `SecretBytes` exists to prevent.
+    #[tokio::test]
+    async fn two_cameras_that_trust_different_certificate_authorities_never_share_a_client() {
+        let transport = ReqwestOnvifTransport::default();
+        let socket = SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), 8_443);
+
+        let private = request_trusting(TEST_CA_PEM);
+        transport
+            .client(&private, socket)
+            .expect("a private CA bundle must produce a client that trusts it");
+        transport
+            .client(&request_trusting(TEST_CA_PEM), socket)
+            .expect("and the same bundle must reuse it");
+        assert_eq!(
+            transport.clients.lock().unwrap().len(),
+            1,
+            "the same camera and the same trust root must not build a second connection pool"
+        );
+
+        transport
+            .client(&request_trusting(OTHER_CA_PEM), socket)
+            .expect("a different CA bundle is a different camera trust root");
+        assert_eq!(
+            transport.clients.lock().unwrap().len(),
+            2,
+            "a camera behind a different certificate authority must never be validated against \
+             another camera's root store"
+        );
+
+        // The public-roots posture is a third, distinct key: no private CA is not the same trust
+        // decision as some private CA.
+        transport
+            .client(
+                &loopback_http_request(8_443, OnvifHttpMethod::Post, 32),
+                socket,
+            )
+            .expect("a camera with no private CA gets its own client");
+        assert_eq!(transport.clients.lock().unwrap().len(), 3);
+
+        // And the secret itself is never retained -- only its digest.
+        let keys = transport.clients.lock().unwrap();
+        assert_eq!(
+            keys.keys().filter(|key| key.ca_digest.is_some()).count(),
+            2,
+            "a private CA must be remembered as a digest, and the two must not collide"
+        );
+    }
+
+    /// A private CA that cannot be parsed fails the request; it does not fall back to the public roots.
+    ///
+    /// Silently ignoring an unusable `tls.ca` would take a camera an operator has deliberately pinned
+    /// to their own certificate authority and validate it against Mozilla's root store instead. The
+    /// component would keep working, and the trust boundary the operator configured would simply not
+    /// exist -- which is the failure mode this refuses.
+    #[tokio::test]
+    async fn a_private_ca_bundle_that_cannot_be_used_fails_the_request_rather_than_trusting_anything_else()
+     {
+        let transport = ReqwestOnvifTransport::default();
+        let socket = SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), 8_443);
+
+        let empty = transport
+            .client(
+                &request_trusting(b"# a comment, and not one certificate\n"),
+                socket,
+            )
+            .expect_err("a bundle with no certificate in it cannot be a trust root");
+        assert_eq!(empty.code(), ErrorCode::BackendError);
+        assert!(
+            empty.to_string().contains("no certificates"),
+            "an operator must be told their CA bundle is empty, not merely that something failed: \
+             {empty}"
+        );
+
+        let malformed = transport
+            .client(
+                &request_trusting(
+                    b"-----BEGIN CERTIFICATE-----\nAAAAAAAA\n-----END CERTIFICATE-----\n",
+                ),
+                socket,
+            )
+            .expect_err("a PEM block whose contents are not a certificate cannot be a trust root");
+        assert_eq!(malformed.code(), ErrorCode::BackendError);
+
+        assert!(
+            transport.clients.lock().unwrap().is_empty(),
+            "a bundle that was refused must not leave a client cached under its key"
+        );
+    }
+
+    /// A camera whose address keeps moving must not be able to grow the cache without bound.
+    ///
+    /// The address is PINNED into the client (`resolve`), so every address a camera is seen at is a
+    /// new key. A camera on DHCP, or a fleet behind a NAT that renumbers, would otherwise add an
+    /// entry -- and a whole rustls configuration and connection pool -- forever, for the life of the
+    /// process. The bound is deliberately crude: emptying the cache costs one handshake per camera,
+    /// and an unbounded map costs the process.
+    #[tokio::test]
+    async fn the_client_cache_empties_rather_than_growing_without_bound() {
+        let transport = ReqwestOnvifTransport::default();
+        let socket = SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), 8_443);
+        let request = loopback_http_request(8_443, OnvifHttpMethod::Post, 32);
+        let client = transport
+            .client(&request, socket)
+            .expect("one real client to fill the cache with");
+
+        // Stand in for a camera that has been seen at MAX_POOLED_CLIENTS distinct addresses. Building
+        // that many real clients would prove nothing extra and cost a rustls configuration each.
+        {
+            let mut clients = transport.clients.lock().unwrap();
+            for index in 0..u16::try_from(MAX_POOLED_CLIENTS).expect("the bound fits a port") {
+                clients.insert(
+                    HttpClientKey {
+                        host: "127.0.0.1".to_owned(),
+                        socket: SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), index),
+                        verify_hostname: true,
+                        allow_invalid_certificates: false,
+                        ca_digest: None,
+                    },
+                    client.clone(),
+                );
+            }
+            assert!(clients.len() >= MAX_POOLED_CLIENTS);
+        }
+
+        let moved = SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 2]), 8_443);
+        transport
+            .client(&request, moved)
+            .expect("a camera that has moved again must still get a client");
+
+        assert_eq!(
+            transport.clients.lock().unwrap().len(),
+            1,
+            "past the bound the cache is emptied and restarted, not grown"
+        );
+    }
+
+    /// A panic somewhere else in the process must not take the camera transport with it.
+    ///
+    /// `clients` is a `std::sync::Mutex`, so a thread that panics while holding it poisons it
+    /// permanently. `client()` reads it with `if let Ok(..)` rather than `unwrap()` on purpose: the
+    /// cache is an optimisation, and losing it must cost a TLS handshake, not every subsequent ONVIF
+    /// request the component will ever make.
+    #[tokio::test]
+    async fn a_poisoned_client_cache_costs_a_handshake_and_nothing_more() {
+        let transport = Arc::new(ReqwestOnvifTransport::default());
+        let socket = SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), 8_443);
+        let request = loopback_http_request(8_443, OnvifHttpMethod::Post, 32);
+
+        transport
+            .client(&request, socket)
+            .expect("a client is cached first, so the poisoned read has something to lose");
+
+        let poisoner = Arc::clone(&transport);
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner
+                .clients
+                .lock()
+                .expect("the cache is not yet poisoned");
+            panic!("a thread died holding the client cache");
+        })
+        .join();
+        std::panic::set_hook(previous);
+        assert!(
+            panicked.is_err(),
+            "the poisoning thread must actually panic"
+        );
+        assert!(
+            transport.clients.lock().is_err(),
+            "the client cache must really be poisoned, or this test proves nothing"
+        );
+
+        transport
+            .client(&request, socket)
+            .expect("a poisoned cache must cost a handshake, not the camera");
+    }
+
     #[tokio::test]
     async fn production_http_transport_uses_pinned_loopback_and_enforces_response_bounds() {
-        let transport = ReqwestOnvifTransport;
+        let transport = ReqwestOnvifTransport::default();
         let (port, server) = serve_loopback_http(
             b"HTTP/1.1 200 OK\r\nX-Result: one\r\nX-Result: two\r\nContent-Length: 5\r\n\r\nhello"
                 .to_vec(),
@@ -6886,5 +7286,424 @@ mod tests {
             vec![CaptureMode::RtspFrame]
         );
         assert!(onvif_capture_modes(false, false).is_empty());
+    }
+
+    /// A JPEG the "camera" will serve. Distinct per pixel, so a reordered or padded frame cannot
+    /// accidentally compare equal to the original.
+    fn jpeg(width: u32, height: u32) -> Vec<u8> {
+        let image = RgbImage::from_fn(width, height, |x, y| {
+            Rgb([
+                (x % 251) as u8,
+                (y % 241) as u8,
+                ((x * 7 + y * 13) % 233) as u8,
+            ])
+        });
+        let mut output = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut output, ImageFormat::Jpeg)
+            .expect("encode test JPEG");
+        output.into_inner()
+    }
+
+    /// A well-framed HTTP/1.1 200 carrying exactly `body` under `content_type`.
+    ///
+    /// The Content-Length is the length of what is actually written, so a truncated image is a
+    /// truncated IMAGE on an otherwise perfectly valid HTTP response -- which is the defect that
+    /// matters here, not a broken socket.
+    fn http_image_response(content_type: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    /// A protocol client whose snapshot endpoint is a real loopback socket, reached through the real
+    /// `ReqwestOnvifTransport`.
+    ///
+    /// The camera is `camera.test` -- the pinned-DNS answer is `127.0.0.1`, so the production
+    /// address-pinning path (`resolve` + the endpoint-address allowance) is what puts the request on
+    /// the fixture's socket. Nothing about the HTTP client is mocked.
+    async fn loopback_snapshot_client(port: u16) -> (OnvifProtocolClient, PinnedUri) {
+        let config = test_config(Some(&format!("http://camera.test:{port}/snapshot")));
+        test_client(
+            Arc::new(SequenceResolver::new(&[(
+                "camera.test",
+                port,
+                &["127.0.0.1"],
+            )])),
+            Arc::new(ReqwestOnvifTransport::default()),
+            &config,
+            None,
+            SecurityConfig::default(),
+        )
+        .await
+    }
+
+    /// A snapshot-only ONVIF session over `client`, whose snapshot URI is `endpoint`.
+    fn snapshot_session(client: OnvifProtocolClient, endpoint: PinnedUri) -> OnvifSession {
+        OnvifSession {
+            instance_id: "camera-a".to_owned(),
+            client,
+            media_endpoint: endpoint.clone(),
+            media_version: MediaVersion::Media1,
+            media_profile_token: "main".to_owned(),
+            snapshot_endpoint: Some(endpoint),
+            #[cfg(feature = "rtsp")]
+            snapshot_unavailable: None,
+            max_snapshot_bytes: 1_048_576,
+            #[cfg(feature = "rtsp")]
+            rtsp: None,
+            ptz_endpoint: None,
+            ptz_ranges: None,
+            ptz_home: false,
+            capabilities: CameraCapabilities {
+                capture_modes: vec![CaptureMode::SnapshotUri],
+                pixel_formats: vec![PixelFormat::Jpeg],
+                software_trigger: false,
+                snapshot_uri: true,
+                rtsp: false,
+                ptz: false,
+                ptz_status: false,
+                presets: false,
+                preset_mutation: false,
+                vendor: None,
+                model: None,
+                firmware: None,
+                serial: None,
+                warnings: Vec::new(),
+            },
+            closed: false,
+        }
+    }
+
+    /// A snapshot capture request with room to spare, so nothing here is about a bound.
+    fn snapshot_capture_request() -> CaptureRequest {
+        let profile: CaptureProfile = serde_json::from_value(json!({
+            "captureMode": "snapshot-uri",
+            "output": { "encoding": "jpeg" }
+        }))
+        .expect("capture profile");
+        CaptureRequest {
+            capture_id: "byte-fidelity".to_owned(),
+            profile,
+            maximum_frame_bytes: 1_048_576,
+            timeout: Duration::from_secs(5),
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    /// The JPEG the frame carries is the JPEG the camera put on the wire. Byte for byte.
+    ///
+    /// Nothing proved this for the ONVIF path. Downstream, storage computes the artifact's SHA-256 by
+    /// RE-READING the file it just wrote and then verifies the file against that same digest -- every
+    /// link checks the bytes against themselves, and not one checks them against the CAMERA. A frame
+    /// truncated, padded, reordered or swapped anywhere between the HTTP body and `CaptureFrame` would
+    /// produce a perfectly self-consistent digest OF THE WRONG IMAGE, and the whole suite would stay
+    /// green. For an adapter whose entire purpose is to deliver the picture the camera took, this is
+    /// the property worth pinning.
+    ///
+    /// For JPEG the claim is exact rather than approximate: `snapshot_to_frame` hands the frame
+    /// `Bytes::from(response.body)` -- the camera's ORIGINAL bytes -- and decodes only to sanity-check
+    /// the dimensions and the declared format. So the delivered bytes must equal the served bytes
+    /// EXACTLY, and their digests must agree.
+    ///
+    /// The camera here is a real `TcpListener` reached through the real `ReqwestOnvifTransport` and
+    /// the real `fetch_snapshot` + decode path: a mock transport handing back a `Vec<u8>` it was given
+    /// could not see a body mangled by the HTTP client, and that is exactly where a frame can rot.
+    #[tokio::test]
+    async fn the_jpeg_frame_delivered_over_real_http_is_the_jpeg_the_camera_served() {
+        use sha2::Digest as _;
+
+        let served = jpeg(64, 48);
+        let (port, server) = serve_loopback_http(http_image_response("image/jpeg", &served)).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let cancellation = CancellationToken::new();
+        let (response, target) = client
+            .fetch_snapshot(endpoint, 1_048_576, deadline, &cancellation)
+            .await
+            .expect("the loopback camera must serve its snapshot over real HTTP");
+        let frame = decode_snapshot_at_safe_boundary(
+            response,
+            1_048_576,
+            SecurityConfig::default().max_decompression_ratio,
+            FixedClock.now(),
+            target.host().to_owned(),
+            deadline,
+            &cancellation,
+        )
+        .await
+        .expect("a well-formed JPEG snapshot must become a frame");
+
+        let request =
+            String::from_utf8(server.await.expect("HTTP server task")).expect("HTTP request text");
+        assert!(
+            request.starts_with("GET /snapshot HTTP/1.1\r\n"),
+            "the frame must have come from a real HTTP GET against the camera, not from thin air: \
+             {request:?}"
+        );
+
+        assert_eq!(
+            frame.bytes.len(),
+            served.len(),
+            "the delivered frame is a different SIZE from the JPEG the camera served"
+        );
+        assert!(
+            frame.bytes.as_ref() == served.as_slice(),
+            "the delivered frame is not the image the camera served -- same length, different bytes, \
+             which is precisely the corruption a self-referential digest cannot see"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(frame.bytes.as_ref())),
+            hex::encode(Sha256::digest(&served)),
+            "the digest of the frame must be the digest of the CAMERA'S bytes; a digest recomputed \
+             from whatever was carried forward would agree with a corrupted frame just as happily"
+        );
+        assert_eq!(
+            (frame.pixel_format, frame.width, frame.height),
+            (PixelFormat::Jpeg, 64, 48),
+            "a JPEG snapshot is delivered as the camera's own JPEG at the camera's own dimensions"
+        );
+        assert_eq!(
+            frame.capture_mode,
+            CaptureMode::SnapshotUri,
+            "and it must say it came from the snapshot URI"
+        );
+    }
+
+    /// The same claim, end to end through `OnvifSession::capture`: what a caller of the backend gets
+    /// back is the camera's own JPEG, byte for byte.
+    ///
+    /// The transport-level test above pins the fetch/decode pair. This one pins the surface the rest of
+    /// the adapter actually calls, with the bounds, the deadline, the capture-mode dispatch and the
+    /// fallback plumbing of `capture()` in the way. A regression that mangled a frame anywhere in that
+    /// wrapping -- re-encoding it, copying it through a fixed-size buffer, truncating it to the
+    /// declared bound -- would leave every existing ONVIF test green and this one red.
+    #[tokio::test]
+    async fn session_capture_delivers_the_exact_jpeg_bytes_the_camera_put_on_the_wire() {
+        use sha2::Digest as _;
+
+        let served = jpeg(80, 60);
+        let (port, server) = serve_loopback_http(http_image_response("image/jpeg", &served)).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+        let mut session = snapshot_session(client, endpoint);
+
+        let frame = session
+            .capture(snapshot_capture_request())
+            .await
+            .expect("a snapshot capture against a healthy camera must succeed");
+        let _ = server.await.expect("HTTP server task");
+
+        assert_eq!(
+            frame.bytes.len(),
+            served.len(),
+            "capture() delivered a frame of a different SIZE from the JPEG the camera served"
+        );
+        assert!(
+            frame.bytes.as_ref() == served.as_slice(),
+            "capture() did not deliver the image the camera took -- the bytes handed to the caller \
+             differ from the bytes the camera served over HTTP"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(frame.bytes.as_ref())),
+            hex::encode(Sha256::digest(&served)),
+            "the digest of the captured frame must be the digest of the camera's served JPEG"
+        );
+        assert_eq!(
+            frame.backend_metadata.get("sourceEncoding"),
+            Some(&Value::String("jpeg".to_owned())),
+            "and the frame must declare the encoding it is actually carrying"
+        );
+    }
+
+    /// For PNG the frame is NOT the file: `snapshot_to_frame` carries `decoded.to_rgb8().into_raw()`.
+    /// So the property is that the delivered raster is exactly the raster an INDEPENDENT decode of the
+    /// same PNG produces -- pinned here against `image`'s own decoder, run outside the capture path.
+    ///
+    /// Asserting byte equality with the PNG file would be asserting the wrong thing and would fail on
+    /// correct code. Asserting only "some RGB8 bytes of the right length arrived" would be asserting
+    /// nothing: a raster with two rows swapped, a channel rotated, or a stale buffer reused has exactly
+    /// the right length. This asserts the pixels.
+    #[tokio::test]
+    async fn session_capture_of_a_png_delivers_the_raster_an_independent_decode_produces() {
+        let served = png(32, 24);
+        let expected = image::load_from_memory_with_format(&served, ImageFormat::Png)
+            .expect("the fixture PNG must decode independently of the capture path")
+            .to_rgb8()
+            .into_raw();
+
+        let (port, server) = serve_loopback_http(http_image_response("image/png", &served)).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+        let mut session = snapshot_session(client, endpoint);
+
+        let frame = session
+            .capture(snapshot_capture_request())
+            .await
+            .expect("a PNG snapshot capture must succeed");
+        let _ = server.await.expect("HTTP server task");
+
+        assert_eq!(
+            (frame.pixel_format, frame.width, frame.height),
+            (PixelFormat::Rgb8, 32, 24),
+            "a PNG snapshot is delivered as an RGB8 raster at the camera's dimensions"
+        );
+        assert_eq!(
+            frame.bytes.len(),
+            expected.len(),
+            "the delivered raster is a different SIZE from the raster the served PNG decodes to"
+        );
+        assert!(
+            frame.bytes.as_ref() == expected.as_slice(),
+            "the delivered raster is not the picture the camera sent -- same length, different \
+             pixels, which is exactly what a swapped, shifted or stale buffer looks like"
+        );
+        assert!(
+            frame.bytes.as_ref() != served.as_slice(),
+            "and the PNG claim really is about the DECODED raster, not the file: if the frame were \
+             the file's bytes, this test would be pinning the wrong property"
+        );
+    }
+
+    /// The offset of the JPEG Start-of-Scan marker: everything before it is header, everything after
+    /// it is the picture itself.
+    fn start_of_scan(jpeg: &[u8]) -> usize {
+        jpeg.windows(2)
+            .position(|window| window == [0xFF, 0xDA])
+            .expect("a JPEG the encoder produced must contain a Start-of-Scan marker")
+    }
+
+    /// A snapshot that never carried a whole picture must be REFUSED, not delivered.
+    ///
+    /// Three ways the wire lies, and the adapter must call all three:
+    ///
+    /// * the HTTP body stops short of its declared `Content-Length` -- a camera or a middlebox that
+    ///   drops the connection mid-response. The bytes that DID arrive are a valid JPEG prefix; nothing
+    ///   downstream would ever notice, because storage digests whatever it is handed and then verifies
+    ///   that digest against itself.
+    /// * the image data never arrived at all: the headers are complete, the dimensions read cleanly,
+    ///   but the entropy-coded scan is absent. A decoder that shrugged and returned a blank frame would
+    ///   hand the operator a picture the camera never took.
+    /// * the `Content-Type` disagrees with the bytes (a PNG served as `image/jpeg`). That header is what
+    ///   decides whether the ORIGINAL bytes are passed through (JPEG) or re-decoded to a raster (PNG),
+    ///   so believing a camera that lies about it means delivering bytes that are not what they claim.
+    ///
+    /// Producing a frame at all in any of these cases is the failure.
+    #[tokio::test]
+    async fn a_snapshot_that_never_carried_a_whole_picture_is_refused_rather_than_delivered() {
+        let whole = jpeg(64, 48);
+
+        // The camera promises a whole JPEG and then hangs up half way through it.
+        let mut short_body = http_image_response("image/jpeg", &whole);
+        short_body.truncate(short_body.len() - (whole.len() / 2));
+        let (port, server) = serve_loopback_http(short_body).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+        let mut session = snapshot_session(client, endpoint);
+        let error = session
+            .capture(snapshot_capture_request())
+            .await
+            .expect_err(
+                "a body that stops short of its declared Content-Length must not become a frame",
+            );
+        let _ = server.await.expect("short-body server task");
+        assert_eq!(
+            error.code(),
+            ErrorCode::BackendError,
+            "an HTTP body cut short of its own Content-Length is a transport failure and must be \
+             reported as one, never silently delivered as a picture -- got {error}"
+        );
+
+        // Complete headers -- the dimensions read perfectly -- and no picture behind them.
+        let headers_only = whole[..start_of_scan(&whole)].to_vec();
+        let (port, server) =
+            serve_loopback_http(http_image_response("image/jpeg", &headers_only)).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+        let mut session = snapshot_session(client, endpoint);
+        let error = session
+            .capture(snapshot_capture_request())
+            .await
+            .expect_err("a JPEG whose scan data never arrived must not become a frame");
+        let _ = server.await.expect("headers-only server task");
+        assert_eq!(
+            error.code(),
+            ErrorCode::UnsupportedCapability,
+            "a corrupt snapshot is a fallback-eligible failure; with no RTSP stream configured the \
+             capture must fail rather than deliver a picture the camera never sent -- got {error}"
+        );
+
+        // A PNG wearing a JPEG's Content-Type.
+        let served = png(32, 24);
+        let (port, server) = serve_loopback_http(http_image_response("image/jpeg", &served)).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+        let mut session = snapshot_session(client, endpoint);
+        let error = session
+            .capture(snapshot_capture_request())
+            .await
+            .expect_err("bytes that disagree with their Content-Type must never become a frame");
+        let _ = server.await.expect("mislabelled-snapshot server task");
+        assert!(
+            error
+                .to_string()
+                .contains("snapshot Content-Type does not match its bytes"),
+            "the refusal must name the lie -- the camera's Content-Type disagreed with its bytes -- \
+             got {error}"
+        );
+    }
+
+    /// A picture that stopped arriving is refused, not delivered.
+    ///
+    /// This test used to assert the opposite, because the adapter used to do the opposite. Once the
+    /// entropy-coded scan has begun, `image`'s JPEG decoder is deliberately lenient: a truncated scan
+    /// does not error, it yields the rows it could reconstruct. `snapshot_to_frame` consulted that
+    /// decode only as a dimension/format sanity check and then passed the ORIGINAL body through -- so
+    /// the frame reaching the caller was a partial picture, with valid JPEG structure, the right
+    /// dimensions, and a digest that verified against itself at every downstream link. A half-image,
+    /// reported as a success.
+    ///
+    /// The only thing standing between the operator and that half-image was HTTP framing, which fires
+    /// only when `Content-Length` disagrees. A camera that hangs up mid-scan, or a middlebox that
+    /// truncates a chunked body without breaking framing, was invisible.
+    ///
+    /// A JPEG that never wrote its `FF D9` end-of-image marker never finished writing the picture, and
+    /// that test is exact rather than heuristic: inside entropy-coded data every `0xFF` is byte-stuffed
+    /// as `FF 00`, so a genuine `FF D9` cannot occur within the scan. It is now refused, and refusal on
+    /// a snapshot is not a dead end -- `CorruptImage` is the fallback reason that sends the capture down
+    /// the RTSP path instead.
+    #[tokio::test]
+    async fn a_picture_that_stopped_arriving_is_refused_rather_than_delivered_half_finished() {
+        let whole = jpeg(64, 48);
+        let scan = start_of_scan(&whole);
+        // Well inside the picture data: every header is intact, half the picture is missing.
+        let truncated = whole[..(scan + (whole.len() - scan) / 2)].to_vec();
+        assert!(
+            truncated.len() < whole.len(),
+            "the fixture must actually be missing picture data"
+        );
+        assert!(
+            !truncated.windows(2).any(|pair| pair == [0xFF, 0xD9]),
+            "and it must be missing its end-of-image marker, which is what makes it detectable"
+        );
+
+        let (port, server) =
+            serve_loopback_http(http_image_response("image/jpeg", &truncated)).await;
+        let (client, endpoint) = loopback_snapshot_client(port).await;
+        let mut session = snapshot_session(client, endpoint);
+        let outcome = session.capture(snapshot_capture_request()).await;
+        let _ = server.await.expect("mid-scan-truncation server task");
+
+        let error = outcome.expect_err(
+            "a picture whose scan never finished arriving must not be delivered as a success",
+        );
+        // `CorruptImage` is a FALLBACK reason, not a dead end: it retires the snapshot and sends the
+        // capture down the RTSP path. This session has no RTSP, so the capture fails there -- which is
+        // the correct outcome. What matters is that no half-picture reached the caller.
+        assert_eq!(
+            error.code(),
+            ErrorCode::UnsupportedCapability,
+            "the snapshot is retired as corrupt and the capture falls through to RTSP, which this              camera does not have; what must NOT happen is a half-picture delivered as a success"
+        );
     }
 }

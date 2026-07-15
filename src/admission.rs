@@ -110,6 +110,25 @@ impl<T> QueueInner<T> {
     }
 
     fn pop_best(&self, now: Instant) -> Option<QueuedCapture<T>> {
+        self.pop_best_admissible(now, |_| true)
+    }
+
+    /// Pops the best-scoring entry whose camera the consumer can actually serve right now.
+    ///
+    /// A fleet-wide consumer cannot simply take the globally best capture: that capture may belong
+    /// to a camera that is offline, or whose actor has no free slot, and popping it would strand it
+    /// -- off the queue, unbounded, owned by nobody. The predicate keeps the ORDERING global while
+    /// making the CHOICE only among cameras that can take work, which is the whole point of a
+    /// central queue: a Direct capture on a connected camera must not wait behind a Scheduled one on
+    /// a camera that is down.
+    ///
+    /// Expired and cancelled entries are still swept regardless of admissibility -- a dead capture
+    /// on an unreachable camera must not linger and hold its slot.
+    fn pop_best_admissible(
+        &self,
+        now: Instant,
+        admissible: impl Fn(&str) -> bool,
+    ) -> Option<QueuedCapture<T>> {
         let mut discarded = Vec::new();
         let mut state = self
             .state
@@ -133,6 +152,7 @@ impl<T> QueueInner<T> {
             .entries
             .iter()
             .enumerate()
+            .filter(|(_, entry)| admissible(&entry.camera_id))
             .max_by(|(_, left), (_, right)| {
                 effective_score(left, now, self.aging_interval)
                     .cmp(&effective_score(right, now, self.aging_interval))
@@ -303,10 +323,59 @@ impl<T: Send + 'static> CaptureAdmissionQueue<T> {
         Ok(ticket)
     }
 
+    /// Waits for the best descriptor whose camera can be served right now.
+    ///
+    /// The fleet scheduler's consumer. It differs from [`Self::next`] in one way that matters: the
+    /// globally best capture may target a camera that is offline or whose actor is full, and popping
+    /// that would strand it. So the ORDER stays global while the CHOICE is confined to cameras that
+    /// can take work -- and when nothing is admissible, it waits to be told the world changed rather
+    /// than spinning.
+    ///
+    /// `changed` is raised by whoever alters admissibility: a camera coming online, an actor freeing
+    /// a slot. Without it this would have to poll, which is the 25,600-wakeups-per-second habit the
+    /// central queue exists to end.
+    pub async fn next_admissible(
+        &self,
+        cancellation: &CancellationToken,
+        changed: &Notify,
+        admissible: impl Fn(&str) -> bool,
+    ) -> Option<QueuedCapture<T>> {
+        loop {
+            // Register for BOTH wakeups before looking -- and `enable()` is what actually registers.
+            //
+            // `notified()` only BUILDS the future; the waiter is not registered until it is first
+            // polled, and `notify_waiters()` wakes only waiters that are already registered. So
+            // merely constructing the futures early is not enough: a notification that lands between
+            // the look below and the `select!` that first polls them is dropped on the floor, and
+            // this task then sleeps forever on work it is already holding. That is a capture stuck
+            // QUEUED with nothing to drive it -- the exact shape of B5, reintroduced by its fix.
+            //
+            // `enable()` registers the waiter now, before the look, so that window does not exist.
+            let arrived = self.inner.notify.notified();
+            let capacity = changed.notified();
+            tokio::pin!(arrived, capacity);
+            arrived.as_mut().enable();
+            capacity.as_mut().enable();
+            if let Some(entry) = self.inner.pop_best_admissible(Instant::now(), &admissible) {
+                return Some(entry);
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return None,
+                () = arrived.as_mut() => {},
+                () = capacity.as_mut() => {},
+            }
+        }
+    }
+
     /// Waits for the best descriptor, or returns `None` when the consumer is cancelled.
     pub async fn next(&self, cancellation: &CancellationToken) -> Option<QueuedCapture<T>> {
         loop {
+            // Enabled before the look, for the same reason as `next_admissible` above: an unenabled
+            // `Notified` is not a registered waiter, and a push that lands in between is lost.
             let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if let Some(entry) = self.inner.pop_best(Instant::now()) {
                 return Some(entry);
             }
@@ -410,6 +479,13 @@ struct ControlState<T> {
 pub struct ControlLanes<T> {
     state: Mutex<ControlState<T>>,
     ordinary_capacity: usize,
+    /// Raised the moment a safety stop enters the lane.
+    ///
+    /// The actor polls this lane between pieces of work, which is enough for everything except the
+    /// one thing the lane exists for: a capture holds the camera session for as long as it runs, and
+    /// an emergency stop cannot wait that long. This signal is what lets the actor find out about a
+    /// stop while it is still busy, rather than after.
+    safety: Notify,
 }
 
 impl<T> ControlLanes<T> {
@@ -427,6 +503,7 @@ impl<T> ControlLanes<T> {
             ));
         }
         Ok(Self {
+            safety: Notify::new(),
             state: Mutex::new(ControlState {
                 safety_stop: None,
                 ordinary: VecDeque::with_capacity(ordinary_capacity),
@@ -464,7 +541,27 @@ impl<T> ControlLanes<T> {
             Some(existing) => existing.merge(stop),
             None => state.safety_stop = Some(stop),
         }
+        drop(state);
+        self.safety.notify_waiters();
         Ok(())
+    }
+
+    /// Resolves as soon as a safety stop is waiting in the lane.
+    ///
+    /// The actor races this against the capture it is running, because a stop that is only noticed
+    /// when the capture ends is a stop that arrives up to `jobTerminalMs` late -- at a camera that
+    /// is physically moving. Enabled before the check, because `notify_waiters` only reaches waiters
+    /// that have already registered, and a stop that lands in that gap would be waited on forever.
+    pub async fn safety_stop_arrived(&self) {
+        loop {
+            let notified = self.safety.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.has_safety_stop() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Pops safety work first, then ordinary work. Actors call this before polling capture work.
@@ -631,7 +728,7 @@ impl ByteBudget {
     }
 }
 
-struct ByteReservation {
+pub(crate) struct ByteReservation {
     budget: Arc<ByteBudgetInner>,
     reserved: u64,
 }
@@ -989,6 +1086,26 @@ impl AdmissionController {
         self.disk.outstanding()
     }
 
+    /// Reserve memory from the SAME budget every capture is admitted against.
+    ///
+    /// `maxInFlightBytes` is meant to be the component's memory ceiling, and a capture reserves its
+    /// whole declared `maximumFrameBytes` up front so that it is. The thumbnail renderer was the one
+    /// allocation that escaped it: a JPEG frame's DECODED size is not its file size, so decoding one
+    /// asks the allocator for memory the budget never saw and never counted. Bounded, because the
+    /// decode-bomb guard refuses a JPEG whose header declares more than `maximumFrameBytes` -- but
+    /// bounded is not the same as reserved, and a ceiling that is quietly exceeded is not a ceiling.
+    ///
+    /// A caller that cannot get this reservation must go without its preview. It must NOT fail the
+    /// capture: the image is already in hand, and a thumbnail never outranks the result.
+    pub(crate) async fn reserve_memory(
+        &self,
+        amount: u64,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<ByteReservation> {
+        self.memory.reserve(amount, deadline, cancellation).await
+    }
+
     /// Returns a compact, allocation-light snapshot of live admission capacity.
     #[must_use]
     pub fn snapshot(&self) -> AdmissionSnapshot {
@@ -1030,6 +1147,9 @@ impl AcquisitionLease {
         } = self;
         drop(resource_group);
         drop(global);
+        // Dropped here rather than carried into the processing lease: the ACQUISITION permit is what
+        // the scheduler meters against, and it has just been returned. Encoding and persistence have
+        // their own bounds and are not the scarce thing.
         Ok(ProcessingLease { disk, memory })
     }
 
@@ -1243,6 +1363,43 @@ mod tests {
             Ok(_) => panic!("operation unexpectedly succeeded"),
             Err(error) => error,
         }
+    }
+
+    #[tokio::test]
+    async fn a_capacity_change_racing_the_look_still_wakes_the_consumer() {
+        let queue = CaptureAdmissionQueue::new(10, 10, Duration::from_secs(10)).unwrap();
+        let cancellation = CancellationToken::new();
+        queue
+            .try_enqueue(
+                "cam",
+                CapturePriority::Scheduled,
+                deadline(),
+                CancellationToken::new(),
+                "stranded",
+            )
+            .unwrap();
+
+        let changed = Arc::new(Notify::new());
+        let signal = Arc::clone(&changed);
+        let looked = std::sync::atomic::AtomicBool::new(false);
+        let admissible = move |_camera: &str| {
+            if looked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            // The camera becomes able to take work the moment after we were asked whether it could.
+            signal.notify_waiters();
+            false
+        };
+
+        let entry = tokio::time::timeout(
+            Duration::from_secs(5),
+            queue.next_admissible(&cancellation, &changed, admissible),
+        )
+        .await
+        .expect("a capacity change racing the look must not strand the queue")
+        .expect("the queue holds one capture and must hand it over");
+        assert_eq!(entry.camera_id, "cam");
+        assert_eq!(entry.payload, "stranded");
     }
 
     #[tokio::test(start_paused = true)]

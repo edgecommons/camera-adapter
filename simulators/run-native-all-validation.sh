@@ -92,11 +92,32 @@ target_mount="$target_volume:/coverage-target"
 registry_mount="$registry_volume:/usr/local/cargo/registry"
 git_mount="$git_volume:/usr/local/cargo/git"
 
+# THE LOCKFILE. `Cargo.lock` is untracked and gitignored, so a clean checkout has none -- and every
+# cargo run below passes `--locked`, which REFUSES to create one ("cannot create the lock file ...
+# because --locked was passed"). Dropping `--locked` does not rescue it either: the source is mounted
+# `:ro` on purpose and cargo writes the lock next to the workspace Cargo.toml (CARGO_TARGET_DIR does
+# not move it), so cargo would then die on "Read-only file system (os error 30)". Two walls, one
+# behind the other -- and that second error is verbatim the one 3c0d83d's own message quotes.
+#
+# So the lock is bind-mounted as a single FILE from OUTSIDE the source tree, generated once by the
+# networked prep run. The source tree is never written to -- the immutability this script depends on
+# holds exactly -- and `--locked` goes back to asserting something true. Generating it inside the
+# container also keeps the lockfile version within what the pinned toolchain can read, which a
+# host-side `cargo generate-lockfile` would not guarantee.
+lock_root="${TMPDIR:-/tmp}/camera-adapter-native-all-lock"
+mkdir -p -- "$lock_root"
+lock_file="$lock_root/Cargo.lock"
+# Docker creates a DIRECTORY at a bind source that does not exist; the file must exist first.
+[[ -f $lock_file ]] || : > "$lock_file"
+lock_mount_ro="$lock_file:/edgecommons/camera-adapter/Cargo.lock:ro"
+lock_mount_rw="$lock_file:/edgecommons/camera-adapter/Cargo.lock"
+
 network_none_run=(
     docker run --rm --network none --read-only --tmpfs /tmp:size=2g,mode=1777
     --cap-drop ALL --security-opt no-new-privileges:true
     --user "$host_uid:$host_gid"
     -v "$source_mount"
+    -v "$lock_mount_ro"
     -v "$target_mount"
     -v "$registry_mount"
     -v "$git_mount"
@@ -105,14 +126,15 @@ network_none_run=(
     -e TMPDIR=/tmp
 )
 
-# Populate only named Cargo cache volumes before the network-none library test.
-# The committed lockfile is still authoritative; network access never reaches
-# the deterministic test container itself.
+# Resolve the lock and populate the named Cargo cache volumes before the network-none library test.
+# This is the ONLY step with a network and the only one that may write the lock; every step after it
+# is hardened, offline, and `--locked`.
 prefetch_run=(
     docker run --rm --network bridge --read-only --tmpfs /tmp:size=64m,mode=1777
     --cap-drop ALL --security-opt no-new-privileges:true
     --user "$host_uid:$host_gid"
     -v "$source_mount"
+    -v "$lock_mount_rw"
     -v "$target_mount"
     -v "$registry_mount"
     -v "$git_mount"
@@ -120,6 +142,8 @@ prefetch_run=(
     -e CARGO_TARGET_DIR=/coverage-target
     -e TMPDIR=/tmp
 )
+"${prefetch_run[@]}" "$image" +1.87.0 generate-lockfile
+[[ -s $lock_file ]] || { echo "the prep run did not produce a Cargo.lock at $lock_file" >&2; exit 1; }
 "${prefetch_run[@]}" "$image" +1.87.0 fetch --locked
 
 if [[ -z $coverage_output ]]; then
@@ -177,6 +201,7 @@ run_rtsp_fixture() {
         --cap-drop ALL --security-opt no-new-privileges:true \
         --user "$host_uid:$host_gid" \
         -v "$source_mount" \
+        -v "$lock_mount_ro" \
         -v "$target_mount" \
         -v "$registry_mount" \
         -v "$git_mount" \
@@ -201,6 +226,7 @@ run_genicam_fixture() {
         --cap-drop ALL --security-opt no-new-privileges:true \
         --user "$host_uid:$host_gid" \
         -v "$source_mount" \
+        -v "$lock_mount_ro" \
         -v "$target_mount" \
         -v "$registry_mount" \
         -v "$git_mount" \

@@ -771,6 +771,14 @@ struct EncodedAccessUnit {
     rtp_timestamp: u32,
     compressed_bytes: u64,
     dimensions: Option<(u32, u32)>,
+    /// This access unit is a random-access point: a decoder handed this unit first, with no history,
+    /// can start producing pictures from it.
+    ///
+    /// H.264 signals one with an IDR (NAL 5). H.265 signals one with any IRAP (NAL 16..=23), and
+    /// **that set is mostly not IDRs** -- x265, and every encoder that defaults to an open GOP, marks
+    /// its random-access points with a CRA (NAL 21) and emits no IDR at all, ever. Code that waits
+    /// for an IDR on an H.265 stream waits forever.
+    random_access: bool,
 }
 
 #[derive(Debug)]
@@ -790,6 +798,7 @@ struct AccessUnitAssembler {
     fragment: Option<FragmentState>,
     bytes: Vec<u8>,
     has_vcl: bool,
+    has_random_access: bool,
     bootstrap_nals: Vec<Vec<u8>>,
     bootstrap_pending: bool,
     bootstrap_injected_for_unit: bool,
@@ -814,6 +823,7 @@ impl AccessUnitAssembler {
             fragment: None,
             bytes: Vec::new(),
             has_vcl: false,
+            has_random_access: false,
             bootstrap_nals: track.bootstrap_nals.clone(),
             bootstrap_pending: !track.bootstrap_nals.is_empty(),
             bootstrap_injected_for_unit: false,
@@ -840,9 +850,29 @@ impl AccessUnitAssembler {
         }
         self.timestamp.get_or_insert(packet.timestamp);
         self.expected_sequence = Some(packet.sequence.wrapping_add(1));
-        match self.codec {
-            RtspCodec::H264 => self.push_h264(packet)?,
-            RtspCodec::H265 => self.push_h265(packet)?,
+        let assembled = match self.codec {
+            RtspCodec::H264 => self.push_h264(packet),
+            RtspCodec::H265 => self.push_h265(packet),
+        };
+        if let Err(error) = assembled {
+            // An access unit larger than `maximumFrameBytes` is unusable -- exactly as unusable as one
+            // that lost a packet, which this assembler already survives by discarding it, counting it,
+            // and resynchronising on the next unit. Only the oversized case killed the worker, and
+            // that asymmetry is plainly unintended: it means a camera whose keyframes exceed the bound
+            // fails on EVERY keyframe, and each failure tears the session down and reconnects. The
+            // frame is lost either way; the session need not be.
+            //
+            // The bound itself still holds -- the bytes are dropped, not kept -- which is the whole
+            // point of it.
+            if error.code() == ErrorCode::ResourceLimit {
+                tracing::debug!(
+                    maximum_bytes = self.maximum_bytes,
+                    "an RTSP access unit exceeded the configured frame bound and was discarded"
+                );
+                self.discard_incomplete();
+                return Ok(None);
+            }
+            return Err(error);
         }
         if !packet.marker {
             return Ok(None);
@@ -857,9 +887,9 @@ impl AccessUnitAssembler {
             .ok_or_else(|| security_error("complete RTP access unit has no timestamp"))?;
         self.expected_sequence = None;
         self.has_vcl = false;
+        let random_access = std::mem::take(&mut self.has_random_access);
         if self.bootstrap_injected_for_unit {
             self.bootstrap_pending = false;
-            self.bootstrap_nals.clear();
             self.bootstrap_injected_for_unit = false;
         }
         let bytes = std::mem::take(&mut self.bytes);
@@ -869,6 +899,7 @@ impl AccessUnitAssembler {
             rtp_timestamp: timestamp,
             compressed_bytes,
             dimensions: self.dimensions,
+            random_access,
         }))
     }
 
@@ -910,7 +941,7 @@ impl AccessUnitAssembler {
                         return Err(security_error("H.264 FU-A fragments overlap"));
                     }
                     let vcl = (1..=5).contains(&(reconstructed & 0x1f));
-                    self.inject_bootstrap_before_vcl(vcl)?;
+                    self.begin_vcl(vcl, reconstructed & 0x1f == 5)?;
                     self.append_start_code()?;
                     let nal_offset = self.bytes.len();
                     self.append_bytes(&[reconstructed])?;
@@ -992,7 +1023,10 @@ impl AccessUnitAssembler {
                         return Err(security_error("H.265 FU fragments overlap"));
                     }
                     let vcl = reconstructed_type <= 31;
-                    self.inject_bootstrap_before_vcl(vcl)?;
+                    // A CRA (21) is an IRAP and is the ONLY random-access point an open-GOP H.265
+                    // encoder ever emits. It is also large enough that it always arrives here, in
+                    // fragments -- never through `append_nal`.
+                    self.begin_vcl(vcl, (16..=23).contains(&reconstructed_type))?;
                     self.append_start_code()?;
                     let nal_offset = self.bytes.len();
                     self.append_bytes(&reconstructed)?;
@@ -1032,8 +1066,43 @@ impl AccessUnitAssembler {
         }
     }
 
+    /// Is this VCL NAL a random-access point -- one a decoder with no history can start from?
+    ///
+    /// H.264: an IDR (NAL 5). H.265: any IRAP (NAL 16..=23), which is *not* mostly IDRs -- an
+    /// open-GOP encoder such as x265 marks every random-access point with a CRA (NAL 21) and never
+    /// emits an IDR in its life.
+    fn nal_is_random_access(&self, nal: &[u8]) -> bool {
+        match self.codec {
+            RtspCodec::H264 => nal.first().is_some_and(|byte| byte & 0x1f == 5),
+            RtspCodec::H265 => nal.len() >= 2 && (16..=23).contains(&((nal[0] >> 1) & 0x3f)),
+        }
+    }
+
+    /// Everything that must happen in front of a VCL NAL, whether it arrived whole or in fragments.
+    ///
+    /// There are THREE ways a VCL NAL enters this assembler -- single, aggregated (STAP-A/AP), and
+    /// fragmented (FU-A/FU) -- and only the first went through `append_nal`. The other two called
+    /// `inject_bootstrap_before_vcl` by hand. That split is why the first cut of this fix did
+    /// nothing: a keyframe is the biggest picture in the stream and is therefore *always*
+    /// fragmented, so a random-access flag set only in `append_nal` never once saw a keyframe.
+    fn begin_vcl(&mut self, vcl: bool, random_access: bool) -> Result<()> {
+        if vcl && random_access {
+            self.has_random_access = true;
+            // Re-arm the bootstrap so it rides in front of THIS unit too, not only the first one.
+            //
+            // A decoder that restarts here needs the parameter sets, and a camera that advertises
+            // them only in the SDP (`sprop-vps`/`sprop-sps`/`sprop-pps`) will never send them again
+            // for as long as the session lives. Injecting them ahead of every random-access point is
+            // what `h264parse config-interval=-1` does, for the same reason, and it costs a few
+            // dozen bytes per keyframe.
+            self.bootstrap_pending = !self.bootstrap_nals.is_empty();
+        }
+        self.inject_bootstrap_before_vcl(vcl)
+    }
+
     fn append_nal(&mut self, nal: &[u8], vcl: bool) -> Result<()> {
-        self.inject_bootstrap_before_vcl(vcl)?;
+        let random_access = self.nal_is_random_access(nal);
+        self.begin_vcl(vcl, random_access)?;
         self.observe_nal(nal)?;
         self.append_start_code()?;
         self.append_bytes(nal)?;
@@ -1095,6 +1164,7 @@ impl AccessUnitAssembler {
     }
 
     fn discard_incomplete(&mut self) {
+        self.has_random_access = false;
         if !self.bytes.is_empty() || self.fragment.is_some() {
             self.incomplete_units = self.incomplete_units.saturating_add(1);
         }
@@ -1457,6 +1527,7 @@ struct GstreamerDecoder {
     source: AppSrc,
     sink: AppSink,
     codec: RtspCodec,
+    maximum_bytes: u64,
     next_pts: u64,
     pending: BTreeMap<u64, PendingDecoderUnit>,
     recently_terminal_pts: VecDeque<u64>,
@@ -1526,10 +1597,33 @@ impl GstreamerDecoder {
             source,
             sink,
             codec,
+            maximum_bytes,
             next_pts: 1,
             pending: BTreeMap::new(),
             recently_terminal_pts: VecDeque::new(),
         })
+    }
+
+    /// Throw this decoder away and stand a fresh one up in its place.
+    ///
+    /// A warm session stops feeding the decoder between captures (that is the whole point of warm:
+    /// it refuses to decode pictures nobody asked for). When a capture arrives, the decoder is
+    /// therefore holding a reference chain with a hole punched through it, and no amount of feeding
+    /// it more pictures will heal that -- it has to begin again.
+    ///
+    /// The comment that used to sit on the warm path said the decoder "emits nothing until the
+    /// stream's next IDR". That is true of H.264. It is false of H.265, where an open-GOP encoder
+    /// emits CRAs and never an IDR, so the wait was unbounded and every warm H.265 capture died on
+    /// its deadline. A decoder restarted here, and then handed a CRA as its FIRST picture, treats it
+    /// as a clean start (`NoRaslOutputFlag`), discards the RASL pictures that hang off it, and
+    /// produces a frame -- which is exactly what a mid-stream CRA cannot do to a decoder that still
+    /// remembers the pictures before the hole.
+    fn restart(&mut self) -> Result<()> {
+        let fresh = Self::new(self.codec, self.maximum_bytes)?;
+        // Dropping the old one sets it to `Null`, which joins its streaming threads. This runs on a
+        // blocking thread (see `restart_decoder_bounded`), which is where that is allowed to happen.
+        drop(std::mem::replace(self, fresh));
+        Ok(())
     }
 
     fn push_and_pull(
@@ -1816,6 +1910,40 @@ async fn create_decoder_bounded(
         _ = cancellation.cancelled() => Err(cancelled_error("decoder creation")),
         _ = tokio::time::sleep_until(deadline) => Err(timeout_error("decoder creation")),
         result = &mut creation => result.map_err(|_| backend_error("GStreamer creation task failed"))?,
+    }
+}
+
+/// Restart a decoder that has been starved of pictures, under the same gate and deadline as any
+/// other blocking GStreamer call.
+#[cfg(feature = "rtsp")]
+async fn restart_decoder_bounded(
+    decoder: &Arc<Mutex<GstreamerDecoder>>,
+    deadline: Instant,
+    decode_gate: &Arc<Semaphore>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let permit = Arc::clone(decode_gate).acquire_owned();
+    tokio::pin!(permit);
+    let permit = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(cancelled_error("decoder admission")),
+        _ = tokio::time::sleep_until(deadline) => return Err(timeout_error("decoder admission")),
+        result = &mut permit => result.map_err(|_| security_error("GStreamer limiter was closed"))?,
+    };
+    let decoder = Arc::clone(decoder);
+    let restart = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decoder
+            .lock()
+            .map_err(|_| backend_error("GStreamer decoder lock was poisoned"))?
+            .restart()
+    });
+    tokio::pin!(restart);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(cancelled_error("decoder restart")),
+        _ = tokio::time::sleep_until(deadline) => Err(timeout_error("decoder restart")),
+        result = &mut restart => result.map_err(|_| backend_error("GStreamer restart task failed"))?,
     }
 }
 
@@ -2748,28 +2876,66 @@ impl RtspWorkerHandle {
         self.interest.send_replace(now);
     }
 
+    /// Stops the worker, giving it long enough to say goodbye to the camera.
+    ///
+    /// The worker ends with a TEARDOWN: cancel it, and on its way out it tells the camera the session
+    /// is over. `abort()` kills the task before it reaches that line, and this used to abort outright
+    /// whenever the deadline had already passed -- which is PRECISELY the OnDemand success path, where
+    /// the capture has consumed its budget by definition. So the common case was the one that skipped
+    /// the goodbye.
+    ///
+    /// Cameras cap concurrent RTSP sessions at two to ten. A session leaked per capture does not look
+    /// like a bug for a day or so; it looks like a camera that has "stopped answering" and needs a
+    /// power cycle. The teardown is therefore given its own small budget rather than the caller's --
+    /// the caller's is spent, and that is not the camera's fault.
     async fn stop(&mut self, deadline: Instant) {
         self.cancellation.cancel();
         let Some(mut join) = self.join.take() else {
             return;
         };
-        if deadline <= Instant::now() {
-            join.abort();
-            return;
-        }
+        let farewell = deadline.max(Instant::now() + TEARDOWN_GRACE);
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => join.abort(),
+            _ = tokio::time::sleep_until(farewell) => join.abort(),
             _ = &mut join => {},
         }
     }
 }
 
+/// How long a cancelled RTSP worker is given to tell the camera the session is over.
+///
+/// The worker's own TEARDOWN carries a one-second deadline; this is the outer bound on waiting for it.
+#[cfg(feature = "rtsp")]
+const TEARDOWN_GRACE: Duration = Duration::from_millis(1_500);
+
 #[cfg(feature = "rtsp")]
 impl Drop for RtspWorkerHandle {
+    /// Cancels the worker and lets it finish saying goodbye.
+    ///
+    /// Dropping used to cancel and then immediately `abort()`, so the TEARDOWN the worker performs on
+    /// its way out never ran -- on every path that drops a session without awaiting it: a config
+    /// reload, a reconnect, an actor tearing down. The graceful path tore down correctly; only the
+    /// abort paths did not, which is the shape of a bug that never shows up in a test and shows up on
+    /// day three in the field as a camera that refuses new sessions.
+    ///
+    /// A `Drop` cannot await, so the goodbye is handed to a task that can -- bounded, so a worker that
+    /// hangs on a camera that has gone dark cannot outlive its usefulness. Outside a Tokio runtime
+    /// (a plain test, or teardown after the runtime is gone) there is nothing to hand it to, and
+    /// aborting is all that is left.
     fn drop(&mut self) {
         self.cancellation.cancel();
-        if let Some(join) = self.join.take() {
-            join.abort();
+        let Some(mut join) = self.join.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    tokio::select! {
+                        _ = tokio::time::sleep(TEARDOWN_GRACE) => join.abort(),
+                        _ = &mut join => {},
+                    }
+                });
+            }
+            Err(_) => join.abort(),
         }
     }
 }
@@ -3154,6 +3320,13 @@ async fn run_rtsp_worker(
     // `ready_at` is exactly the interest instant, so this is all that is needed to answer "is
     // anybody still waiting for a frame?" -- see `capture` above.
     let mut delivered_at: Option<Instant> = None;
+    // The decoder has been starved: this worker assembled access units and threw them away because
+    // nobody was waiting for a picture, so the decoder's reference chain now has a hole in it.
+    let mut decoder_starved = false;
+    // The decoder has just been restarted and holds no history at all, so the only unit it can start
+    // from is a random-access point. Feeding it anything else burns a decode permit to produce
+    // nothing.
+    let mut awaiting_random_access = false;
     let run_result = async {
         loop {
             let operation_deadline = match session_policy {
@@ -3207,13 +3380,42 @@ async fn run_rtsp_worker(
             // out of the gate; a dozen warm cameras could starve the capture path outright.
             //
             // Skipping the decode leaves the GStreamer decoder without the intervening reference
-            // frames, so on the next capture it emits nothing until the stream's next IDR --
-            // `push_and_pull` already reports that as `Ok(None)` and the loop simply waits. A warm
-            // capture therefore costs up to one GOP rather than one frame. That is the deliberate
-            // trade: warm sessions keep the expensive things (the RTSP session, the negotiated
-            // track, the built pipeline) and stop paying to decode pictures nobody asked for.
+            // frames. It cannot be healed by feeding it more pictures -- it has to begin again from a
+            // random-access point, which is what the two steps below do. A warm capture therefore
+            // costs a decoder restart plus up to one GOP, rather than one frame. That is the
+            // deliberate trade: warm sessions keep the expensive things (the RTSP session, the
+            // negotiated track) and stop paying to decode pictures nobody asked for.
+            //
+            // THIS USED TO SAY the decoder "emits nothing until the stream's next IDR", and simply
+            // waited. That is true of H.264 and FALSE OF H.265: an open-GOP encoder -- x265, and the
+            // default of most cameras -- marks its random-access points with a CRA (NAL 21) and emits
+            // no IDR in its life. So the wait was unbounded, and EVERY warm H.265 capture after the
+            // first one died on its deadline. The live fixture that proves it runs only in the
+            // simulator harness, which was itself broken; nothing in CI compiles this file's decode
+            // path against a real stream.
             if !capture_is_waiting(*interest.borrow(), delivered_at) {
+                decoder_starved = true;
                 continue;
+            }
+            if decoder_starved {
+                restart_decoder_bounded(
+                    &decoder,
+                    operation_deadline,
+                    &decode_gate,
+                    &cancellation,
+                )
+                .await?;
+                decoder_starved = false;
+                awaiting_random_access = true;
+            }
+            if awaiting_random_access {
+                // A decoder with no history can only start at a random-access point. Anything else
+                // references pictures it has never seen, so it would spend a decode permit and
+                // produce nothing.
+                if !unit.random_access {
+                    continue;
+                }
+                awaiting_random_access = false;
             }
             let ingested_at = Instant::now();
             let Some(frame) = decode_bounded(
@@ -3728,6 +3930,108 @@ mod tests {
         }
     }
 
+    /// An open-GOP H.265 encoder emits NO IDR. Ever. Its random-access point is a CRA (NAL 21), and
+    /// a keyframe is the largest picture in the stream, so it always arrives FRAGMENTED.
+    ///
+    /// Both halves of that sentence are load-bearing, and both were wrong in the shipped code. The
+    /// warm path waited for "the stream's next IDR", which on x265 never comes; and the first fix
+    /// marked random-access points only in `append_nal`, which a fragmented NAL never reaches. Either
+    /// mistake alone makes every warm H.265 capture after the first one die on its deadline.
+    #[test]
+    fn an_h265_keyframe_is_a_fragmented_cra_and_it_is_still_a_place_to_start() {
+        let h265 = track(RtspCodec::H265);
+        let mut assembler = AccessUnitAssembler::new(&h265, 4096).unwrap();
+        // A CRA (21) split across two FU packets (type 49): S, then E.
+        let start = rtp(1, 10, false, 96, &[49 << 1, 1, 0x80 | 21, 0xaa]);
+        let end = rtp(2, 10, true, 96, &[49 << 1, 1, 0x40 | 21, 0xbb]);
+        assert!(
+            assembler
+                .push(parse_rtp_packet(&start).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let complete = assembler
+            .push(parse_rtp_packet(&end).unwrap())
+            .unwrap()
+            .expect("complete fragmented H.265 CRA");
+        assert!(
+            complete.random_access,
+            "a fragmented CRA is a random-access point -- it is the only one an open-GOP H.265 \
+             stream ever offers, and a decoder that will not start at it never starts at all"
+        );
+    }
+
+    /// The other side of the same contract: a picture that references pictures a restarted decoder
+    /// has never seen is NOT a place to start, and offering it as one would hand the decoder a frame
+    /// it cannot decode and call the capture served.
+    #[test]
+    fn a_picture_that_needs_history_is_not_a_place_to_start() {
+        let h265 = track(RtspCodec::H265);
+        let mut assembler = AccessUnitAssembler::new(&h265, 4096).unwrap();
+        let trail = rtp(1, 10, true, 96, &[1 << 1, 1, 0x02]);
+        let complete = assembler
+            .push(parse_rtp_packet(&trail).unwrap())
+            .unwrap()
+            .expect("complete H.265 TRAIL_R");
+        assert!(!complete.random_access, "TRAIL_R depends on earlier pictures");
+
+        let h264 = track(RtspCodec::H264);
+        let mut assembler = AccessUnitAssembler::new(&h264, 4096).unwrap();
+        let inter = rtp(1, 10, true, 96, &[0x41, 0x02]);
+        let complete = assembler
+            .push(parse_rtp_packet(&inter).unwrap())
+            .unwrap()
+            .expect("complete H.264 non-IDR");
+        assert!(!complete.random_access, "a P picture depends on earlier pictures");
+
+        // ...and H.264's random-access point, the IDR, still is one -- including fragmented.
+        let mut assembler = AccessUnitAssembler::new(&h264, 4096).unwrap();
+        let start = rtp(1, 11, false, 96, &[0x7c, 0x85, 0x03]);
+        let end = rtp(2, 11, true, 96, &[0x7c, 0x45, 0x04]);
+        assembler.push(parse_rtp_packet(&start).unwrap()).unwrap();
+        let complete = assembler
+            .push(parse_rtp_packet(&end).unwrap())
+            .unwrap()
+            .expect("complete fragmented H.264 IDR");
+        assert!(complete.random_access, "a fragmented IDR is a random-access point");
+    }
+
+    /// The parameter sets must ride in front of EVERY random-access point, not only the first one.
+    ///
+    /// A decoder restarted at the second keyframe of a session needs the VPS/SPS/PPS as much as one
+    /// starting at the first, and a camera that advertises them only in the SDP
+    /// (`sprop-vps`/`sprop-sps`/`sprop-pps`) will never send them again for as long as the session
+    /// lives. The assembler used to inject them once and then `clear()` them, which left every later
+    /// restart facing a keyframe it had no parameters to decode.
+    #[test]
+    fn the_parameter_sets_ride_in_front_of_every_random_access_point_not_only_the_first() {
+        let vps = vec![32 << 1, 1, 0xaa];
+        let track = track_with_bootstrap(RtspCodec::H265, vec![vps.clone()]);
+        let mut assembler = AccessUnitAssembler::new(&track, 4096).unwrap();
+
+        let first = rtp(1, 10, true, 96, &[21 << 1, 1, 0x02]);
+        let complete = assembler
+            .push(parse_rtp_packet(&first).unwrap())
+            .unwrap()
+            .expect("first H.265 CRA");
+        assert!(complete.random_access);
+        assert!(
+            complete.bytes.windows(vps.len()).any(|window| window == vps.as_slice()),
+            "the first keyframe carries the SDP parameter sets"
+        );
+
+        let second = rtp(2, 20, true, 96, &[21 << 1, 1, 0x03]);
+        let complete = assembler
+            .push(parse_rtp_packet(&second).unwrap())
+            .unwrap()
+            .expect("second H.265 CRA");
+        assert!(complete.random_access);
+        assert!(
+            complete.bytes.windows(vps.len()).any(|window| window == vps.as_slice()),
+            "and so does EVERY later keyframe -- a decoder restarted here has no parameters otherwise"
+        );
+    }
+
     #[test]
     fn h264_bootstrap_waits_for_vcl_and_covers_fragmented_first_vcl() {
         let track = track_with_bootstrap(RtspCodec::H264, vec![vec![0x68, 0xaa]]);
@@ -3802,6 +4106,46 @@ mod tests {
         );
     }
 
+    /// A frame too big for the bound costs a frame, not the camera.
+    ///
+    /// The assembler already survives a lost packet: it discards the half-built unit, counts it, and
+    /// resynchronises on the next one. An access unit that exceeded `maximumFrameBytes` did NOT get
+    /// that treatment -- it returned an error, which killed the worker, which tore the session down and
+    /// reconnected. So a camera whose keyframes are larger than the configured bound failed on EVERY
+    /// keyframe and reconnected on every one of them, forever. The frame is lost either way; the
+    /// session need not be.
+    ///
+    /// The bound still holds: the bytes are dropped, not kept.
+    #[test]
+    fn an_oversized_access_unit_costs_a_frame_and_not_the_session() {
+        // Room for a small unit, and nowhere near enough for the one below.
+        let mut assembler = AccessUnitAssembler::new(&track(RtspCodec::H264), 64).unwrap();
+
+        let huge = vec![0x41_u8; 200];
+        let mut payload = vec![0x41];
+        payload.extend_from_slice(&huge);
+        let oversized = rtp(1, 10, true, 96, &payload);
+        assert!(
+            assembler
+                .push(parse_rtp_packet(&oversized).unwrap())
+                .expect("an oversized unit is a lost frame, not a broken session")
+                .is_none(),
+            "it must not be delivered either -- the bound is a bound"
+        );
+        assert_eq!(
+            assembler.incomplete_units, 1,
+            "and it is counted, exactly as a unit that lost a packet is counted"
+        );
+
+        // The session survives, and the very next frame decodes.
+        let good = rtp(2, 20, true, 96, &[0x65, 1, 2, 3]);
+        let unit = assembler
+            .push(parse_rtp_packet(&good).unwrap())
+            .expect("the assembler resynchronises")
+            .expect("the next access unit is delivered");
+        assert_eq!(unit.rtp_timestamp, 20);
+    }
+
     #[test]
     fn h264_fu_a_requires_complete_contiguous_frame() {
         let mut assembler = AccessUnitAssembler::new(&track(RtspCodec::H264), 4096).unwrap();
@@ -3839,8 +4183,19 @@ mod tests {
         assert_eq!(unit.bytes.as_ref(), &[0, 0, 0, 1, 19 << 1, 1, 9, 8]);
         assert_eq!(unit.compressed_bytes, 8);
 
+        // The bound holds: a unit that does not fit is dropped and counted, and is never delivered.
+        // It used to be FATAL, which killed the worker and tore the session down -- so a camera whose
+        // keyframes exceeded the bound reconnected on every keyframe. Enforcing a bound and surviving
+        // it are not in tension.
         let mut bounded = AccessUnitAssembler::new(&track(RtspCodec::H265), 6).unwrap();
-        assert!(bounded.push(parse_rtp_packet(&start).unwrap()).is_err());
+        assert!(
+            bounded
+                .push(parse_rtp_packet(&start).unwrap())
+                .expect("an oversized unit costs a frame, not the session")
+                .is_none(),
+            "and it is certainly not delivered"
+        );
+        assert_eq!(bounded.incomplete_units, 1);
     }
 
     #[test]
@@ -4514,6 +4869,722 @@ mod tests {
                 .expect_err("unknown PTS is never accepted after retirement")
                 .code(),
             ErrorCode::BackendError
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Frame fidelity: the picture that is delivered is the picture the camera sent.
+    //
+    // An H.264/H.265 decode is not byte-reversible, so the claim decomposes into two links, and both
+    // are pinned below.
+    //
+    //   LINK 1  RTP wire -> access unit, BYTE FOR BYTE. Everything the camera packetised -- single-NAL
+    //           packets, FU-A/FU fragments spread over dozens of RTP packets, STAP-A/AP aggregation --
+    //           must reappear in the assembled access unit as exactly the original NAL bytes, framed
+    //           with the Annex-B start codes the decoder is entitled to. This is an EXACT claim, and
+    //           it is asserted against the whole byte vector, never against a length or a NAL count:
+    //           a dropped fragment, a reordered packet, or a single flipped byte changes the bytes and
+    //           must therefore fail.
+    //
+    //   LINK 2  access unit -> decoded frame. The decoder must be handed exactly what the assembler
+    //           built, and the raster that comes out must be the raster that went in. It is pinned
+    //           with a KNOWN picture carried through the real GStreamer decode path.
+    //
+    // Together they close the gap the digest chain never could: storage hashes the file it has just
+    // written, so a frame that was corrupted before it reached the disk still yields a perfectly
+    // self-consistent digest -- of the wrong image.
+    // ---------------------------------------------------------------------------------------------
+
+    /// Bit writer for the synthetic-but-conformant H.264 bitstreams below.
+    ///
+    /// `TestBits` above cannot serve: it has no byte-alignment primitive, and I_PCM macroblock data is
+    /// byte-aligned raw samples.
+    #[derive(Default)]
+    struct NalWriter {
+        bytes: Vec<u8>,
+        bit: usize,
+    }
+
+    impl NalWriter {
+        fn bit(&mut self, value: bool) {
+            if self.bit % 8 == 0 {
+                self.bytes.push(0);
+            }
+            if value {
+                let index = self.bytes.len() - 1;
+                self.bytes[index] |= 1 << (7 - (self.bit % 8));
+            }
+            self.bit += 1;
+        }
+
+        fn bits(&mut self, value: u32, count: usize) {
+            for shift in (0..count).rev() {
+                self.bit(value & (1 << shift) != 0);
+            }
+        }
+
+        fn byte(&mut self, value: u8) {
+            self.bits(u32::from(value), 8);
+        }
+
+        /// Unsigned Exp-Golomb, the syntax element H.264 headers are made of.
+        fn ue(&mut self, value: u32) {
+            let code = value + 1;
+            let width = 32 - code.leading_zeros();
+            for _ in 1..width {
+                self.bit(false);
+            }
+            for shift in (0..width).rev() {
+                self.bit(code & (1 << shift) != 0);
+            }
+        }
+
+        fn se(&mut self, value: i32) {
+            let mapped = if value <= 0 {
+                value.unsigned_abs() * 2
+            } else {
+                value.unsigned_abs() * 2 - 1
+            };
+            self.ue(mapped);
+        }
+
+        /// `pcm_alignment_zero_bit`: I_PCM samples begin on a byte boundary.
+        fn align(&mut self) {
+            while self.bit % 8 != 0 {
+                self.bit(false);
+            }
+        }
+
+        /// `rbsp_trailing_bits`, and the finished RBSP.
+        fn finish(mut self) -> Vec<u8> {
+            self.bit(true);
+            self.align();
+            self.bytes
+        }
+    }
+
+    /// Wraps an RBSP as a NAL unit: the header byte, then the emulation-prevented payload.
+    ///
+    /// The escape is the inverse of `RbspBitReader::from_escaped`, so the SPS this produces is the SPS
+    /// the assembler parses, and the bytes a real decoder is handed.
+    fn nal_unit(header: u8, rbsp: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![header];
+        let mut zeros = 0_u8;
+        for byte in rbsp {
+            if zeros >= 2 && *byte <= 3 {
+                bytes.push(3);
+                zeros = 0;
+            }
+            bytes.push(*byte);
+            zeros = if *byte == 0 { zeros + 1 } else { 0 };
+        }
+        bytes
+    }
+
+    /// The Annex-B byte stream an assembled access unit is REQUIRED to reproduce.
+    ///
+    /// Four-byte start code, then the NAL, for every NAL of the unit, in the order the camera sent
+    /// them. This is the reference the assembler is measured against -- not a length, not a hash the
+    /// assembler itself computed.
+    fn annex_b(nals: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for nal in nals {
+            bytes.extend_from_slice(&[0, 0, 0, 1]);
+            bytes.extend_from_slice(nal);
+        }
+        bytes
+    }
+
+    /// A conformant baseline H.264 SPS for `width` x `height` (both multiples of 16).
+    fn h264_sps(width: u32, height: u32) -> Vec<u8> {
+        let mut writer = NalWriter::default();
+        writer.byte(66); // profile_idc: Baseline
+        writer.byte(0); // constraint flags
+        writer.byte(30); // level_idc 3.0
+        writer.ue(0); // seq_parameter_set_id
+        writer.ue(0); // log2_max_frame_num_minus4 -> frame_num is 4 bits
+        writer.ue(0); // pic_order_cnt_type
+        writer.ue(0); // log2_max_pic_order_cnt_lsb_minus4 -> poc_lsb is 4 bits
+        writer.ue(1); // max_num_ref_frames
+        writer.bit(false); // gaps_in_frame_num_value_allowed_flag
+        writer.ue(width / 16 - 1); // pic_width_in_mbs_minus1
+        writer.ue(height / 16 - 1); // pic_height_in_map_units_minus1
+        writer.bit(true); // frame_mbs_only_flag
+        writer.bit(true); // direct_8x8_inference_flag
+        writer.bit(false); // frame_cropping_flag
+        writer.bit(false); // vui_parameters_present_flag
+        nal_unit(0x67, &writer.finish())
+    }
+
+    /// A conformant H.264 PPS: CAVLC, one slice group, deblocking controllable from the slice header.
+    fn h264_pps() -> Vec<u8> {
+        let mut writer = NalWriter::default();
+        writer.ue(0); // pic_parameter_set_id
+        writer.ue(0); // seq_parameter_set_id
+        writer.bit(false); // entropy_coding_mode_flag: CAVLC
+        writer.bit(false); // bottom_field_pic_order_in_frame_present_flag
+        writer.ue(0); // num_slice_groups_minus1
+        writer.ue(0); // num_ref_idx_l0_default_active_minus1
+        writer.ue(0); // num_ref_idx_l1_default_active_minus1
+        writer.bit(false); // weighted_pred_flag
+        writer.bits(0, 2); // weighted_bipred_idc
+        writer.se(0); // pic_init_qp_minus26
+        writer.se(0); // pic_init_qs_minus26
+        writer.se(0); // chroma_qp_index_offset
+        writer.bit(true); // deblocking_filter_control_present_flag
+        writer.bit(false); // constrained_intra_pred_flag
+        writer.bit(false); // redundant_pic_cnt_present_flag
+        nal_unit(0x68, &writer.finish())
+    }
+
+    #[cfg(feature = "rtsp")]
+    /// The three planes of a 4:2:0 picture.
+    struct YuvPlanes {
+        width: u32,
+        height: u32,
+        luma: Vec<u8>,
+        cb: Vec<u8>,
+        cr: Vec<u8>,
+    }
+
+    #[cfg(feature = "rtsp")]
+    /// A deterministic, deliberately ASYMMETRIC RGB test raster.
+    ///
+    /// Red rises left-to-right, green top-to-bottom, blue along the diagonal, so a decoded frame that
+    /// is mirrored, transposed, channel-swapped, stale, or simply a different picture cannot pass a
+    /// per-pixel comparison against it -- which a flat or symmetric pattern would happily allow.
+    ///
+    /// Smooth gradients alone are not enough: they are so nearly self-similar that a picture shifted
+    /// by a pixel would still pass. So the raster also carries four hard-edged landmarks -- an
+    /// off-centre block near each of two opposite corners, a two-pixel vertical bar, and a horizontal
+    /// bar -- applied as an EQUAL delta on all three channels. That is not cosmetic: an equal RGB delta
+    /// moves luma only and leaves BT.601 chroma exactly unchanged (the Cb and Cr coefficients each sum
+    /// to zero), so the landmarks survive 4:2:0 subsampling untouched while giving the comparison a
+    /// 50-level cliff to fall off if the geometry moves by even one pixel.
+    fn gradient_raster(width: u32, height: u32) -> Vec<u8> {
+        let landmark = |x: u32, y: u32| -> i32 {
+            let block = |x0: u32, y0: u32| (x0..x0 + 16).contains(&x) && (y0..y0 + 16).contains(&y);
+            if block(24, 8) || (100..102).contains(&x) {
+                50
+            } else if block(width - 40, height - 32) || (150..152).contains(&y) {
+                -50
+            } else {
+                0
+            }
+        };
+        let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let across = i32::try_from(x * 120 / (width - 1)).expect("bounded gradient");
+                let down = i32::try_from(y * 120 / (height - 1)).expect("bounded gradient");
+                let delta = landmark(x, y);
+                // 60..=180 before the landmark, 10..=230 after it: never clamped, so the landmark
+                // stays an exactly equal delta on all three channels, and therefore chroma-neutral.
+                for channel in [60 + across, 60 + down, 60 + (across + down) / 2] {
+                    pixels.push(u8::try_from(channel + delta).expect("bounded channel"));
+                }
+            }
+        }
+        pixels
+    }
+
+    #[cfg(feature = "rtsp")]
+    /// The worst and the mean per-channel deviation between a decoded frame and the raster it should be.
+    fn deviation(decoded: &[u8], expected: &[u8]) -> (u32, usize, f64) {
+        let mut worst = 0_u32;
+        let mut worst_at = 0_usize;
+        let mut total = 0_u64;
+        for (index, (decoded, expected)) in decoded.iter().zip(expected.iter()).enumerate() {
+            let delta = u32::from(decoded.abs_diff(*expected));
+            total += u64::from(delta);
+            if delta > worst {
+                worst = delta;
+                worst_at = index;
+            }
+        }
+        (worst, worst_at, total as f64 / expected.len() as f64)
+    }
+
+    #[cfg(feature = "rtsp")]
+    /// BT.601 studio-swing RGB -> 4:2:0 YUV, the colour space a 320x240 H.264 stream is decoded in.
+    ///
+    /// This conversion -- not the coding -- is the only lossy step in the round trip below, because
+    /// the macroblocks the samples are carried in are I_PCM (raw, uncoded) samples.
+    fn rgb_to_yuv420(raster: &[u8], width: u32, height: u32) -> YuvPlanes {
+        let sample = |x: u32, y: u32| -> (f64, f64, f64) {
+            let base = ((y * width + x) * 3) as usize;
+            (
+                f64::from(raster[base]),
+                f64::from(raster[base + 1]),
+                f64::from(raster[base + 2]),
+            )
+        };
+        let clamp = |value: f64| value.round().clamp(0.0, 255.0) as u8;
+        let mut luma = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let (red, green, blue) = sample(x, y);
+                luma.push(clamp(
+                    16.0 + (65.738 * red + 129.057 * green + 25.064 * blue) / 256.0,
+                ));
+            }
+        }
+        let mut cb = Vec::with_capacity(((width / 2) * (height / 2)) as usize);
+        let mut cr = Vec::with_capacity(((width / 2) * (height / 2)) as usize);
+        for y in (0..height).step_by(2) {
+            for x in (0..width).step_by(2) {
+                let mut red = 0.0;
+                let mut green = 0.0;
+                let mut blue = 0.0;
+                for (offset_x, offset_y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (r, g, b) = sample(x + offset_x, y + offset_y);
+                    red += r / 4.0;
+                    green += g / 4.0;
+                    blue += b / 4.0;
+                }
+                cb.push(clamp(
+                    128.0 + (-37.945 * red - 74.494 * green + 112.439 * blue) / 256.0,
+                ));
+                cr.push(clamp(
+                    128.0 + (112.439 * red - 94.154 * green - 18.285 * blue) / 256.0,
+                ));
+            }
+        }
+        YuvPlanes {
+            width,
+            height,
+            luma,
+            cb,
+            cr,
+        }
+    }
+
+    #[cfg(feature = "rtsp")]
+    /// An IDR slice whose every macroblock is I_PCM: the samples travel RAW inside the bitstream.
+    ///
+    /// I_PCM is the one H.264 coding mode that is exactly invertible, and the slice header disables the
+    /// deblocking filter, so a conformant decoder must reproduce these samples bit for bit. That is
+    /// what makes "the picture that comes out is the picture that went in" an assertion about the
+    /// PIXELS rather than about a checksum of them.
+    fn h264_ipcm_idr(planes: &YuvPlanes) -> Vec<u8> {
+        let mut writer = NalWriter::default();
+        writer.ue(0); // first_mb_in_slice
+        writer.ue(7); // slice_type: I (all slices)
+        writer.ue(0); // pic_parameter_set_id
+        writer.bits(0, 4); // frame_num
+        writer.ue(0); // idr_pic_id
+        writer.bits(0, 4); // pic_order_cnt_lsb
+        writer.bit(false); // no_output_of_prior_pics_flag
+        writer.bit(false); // long_term_reference_flag
+        writer.se(0); // slice_qp_delta
+        writer.ue(1); // disable_deblocking_filter_idc: off, so the decode is exactly invertible
+        let chroma_width = planes.width / 2;
+        for mb_y in 0..planes.height / 16 {
+            for mb_x in 0..planes.width / 16 {
+                writer.ue(25); // mb_type: I_PCM
+                writer.align(); // pcm_alignment_zero_bit
+                for row in 0..16 {
+                    for column in 0..16 {
+                        let x = mb_x * 16 + column;
+                        let y = mb_y * 16 + row;
+                        writer.byte(planes.luma[(y * planes.width + x) as usize]);
+                    }
+                }
+                for plane in [&planes.cb, &planes.cr] {
+                    for row in 0..8 {
+                        for column in 0..8 {
+                            let x = mb_x * 8 + column;
+                            let y = mb_y * 8 + row;
+                            writer.byte(plane[(y * chroma_width + x) as usize]);
+                        }
+                    }
+                }
+            }
+        }
+        nal_unit(0x65, &writer.finish())
+    }
+
+    /// A single-NAL RTP packet: the NAL travels as the payload, unchanged.
+    fn single_nal_packet(sequence: u16, timestamp: u32, marker: bool, nal: &[u8]) -> Vec<u8> {
+        rtp(sequence, timestamp, marker, 96, nal)
+    }
+
+    /// H.264 STAP-A: several small NALs (the parameter sets) aggregated into one RTP packet.
+    fn stap_a_payload(nals: &[&[u8]]) -> Vec<u8> {
+        let mut payload = vec![0x78]; // F=0, NRI=3, type=24
+        for nal in nals {
+            payload.extend_from_slice(&u16::try_from(nal.len()).expect("bounded NAL").to_be_bytes());
+            payload.extend_from_slice(nal);
+        }
+        payload
+    }
+
+    /// H.264 FU-A: one NAL cut into `mtu`-sized fragments, exactly as a camera fragments a keyframe.
+    fn fu_a_payloads(nal: &[u8], mtu: usize) -> Vec<Vec<u8>> {
+        let indicator = (nal[0] & 0xe0) | 28;
+        let nal_type = nal[0] & 0x1f;
+        let body = &nal[1..];
+        let chunk = mtu - 2;
+        let fragments = body.len().div_ceil(chunk);
+        body.chunks(chunk)
+            .enumerate()
+            .map(|(index, piece)| {
+                let mut header = nal_type;
+                if index == 0 {
+                    header |= 0x80; // S
+                }
+                if index + 1 == fragments {
+                    header |= 0x40; // E
+                }
+                let mut payload = vec![indicator, header];
+                payload.extend_from_slice(piece);
+                payload
+            })
+            .collect()
+    }
+
+    /// H.265 AP: the aggregation packet, carrying VPS/SPS/PPS together.
+    fn h265_ap_payload(nals: &[&[u8]]) -> Vec<u8> {
+        let mut payload = vec![48 << 1, 1];
+        for nal in nals {
+            payload.extend_from_slice(&u16::try_from(nal.len()).expect("bounded NAL").to_be_bytes());
+            payload.extend_from_slice(nal);
+        }
+        payload
+    }
+
+    /// H.265 FU: the fragmentation unit, which reconstructs its own two-byte NAL header.
+    fn h265_fu_payloads(nal: &[u8], mtu: usize) -> Vec<Vec<u8>> {
+        let nal_type = (nal[0] >> 1) & 0x3f;
+        let indicator = [(nal[0] & 0x81) | (49 << 1), nal[1]];
+        let body = &nal[2..];
+        let chunk = mtu - 3;
+        let fragments = body.len().div_ceil(chunk);
+        body.chunks(chunk)
+            .enumerate()
+            .map(|(index, piece)| {
+                let mut header = nal_type;
+                if index == 0 {
+                    header |= 0x80; // S
+                }
+                if index + 1 == fragments {
+                    header |= 0x40; // E
+                }
+                let mut payload = vec![indicator[0], indicator[1], header];
+                payload.extend_from_slice(piece);
+                payload
+            })
+            .collect()
+    }
+
+    /// Pushes RTP packets, requiring that exactly the last one completes the access unit.
+    ///
+    /// An access unit delivered EARLY is a corrupted access unit -- it is missing everything that had
+    /// not arrived yet -- so "nothing before the marker, something on the marker" is part of the
+    /// fidelity claim, not a convenience of the harness.
+    fn assemble(assembler: &mut AccessUnitAssembler, packets: &[Vec<u8>]) -> EncodedAccessUnit {
+        let mut assembled = None;
+        for (index, packet) in packets.iter().enumerate() {
+            let unit = assembler
+                .push(parse_rtp_packet(packet).expect("the harness emits well-formed RTP"))
+                .expect("no packet of a well-formed access unit may be rejected");
+            let last = index + 1 == packets.len();
+            assert_eq!(
+                unit.is_some(),
+                last,
+                "packet {index} of {} completed the access unit at the wrong moment",
+                packets.len()
+            );
+            if let Some(unit) = unit {
+                assembled = Some(unit);
+            }
+        }
+        assembled.expect("the marker packet completes the access unit")
+    }
+
+    /// LINK 1 (H.264): the access unit IS the NAL units the camera packetised -- every byte of them.
+    ///
+    /// The camera's parameter sets arrive aggregated in a STAP-A, and its 6 KB keyframe arrives cut
+    /// into six FU-A fragments. The assembler's job is to give the decoder back precisely what was
+    /// sent, framed with Annex-B start codes -- and this is asserted against the entire byte vector.
+    /// A dropped fragment, a swapped pair of packets, or a single flipped byte anywhere in the
+    /// keyframe changes those bytes, and therefore fails here rather than being decoded into a
+    /// plausible-looking picture that is not the one the camera took. The length-only check that would
+    /// pass in its place is exactly the hole this test exists to close.
+    #[test]
+    fn an_h264_access_unit_is_reassembled_byte_for_byte_from_stap_a_and_fu_a() {
+        let sps = h264_sps(320, 240);
+        let pps = h264_pps();
+        // A keyframe with no repeating structure: any misplacement of a fragment is visible.
+        let mut keyframe = vec![0x65_u8];
+        keyframe.extend((0..6_000_u32).map(|index| 1 + (index % 250) as u8));
+        let expected = annex_b(&[sps.clone(), pps.clone(), keyframe.clone()]);
+
+        let mut packets = vec![rtp(1, 900, false, 96, &stap_a_payload(&[&sps, &pps]))];
+        let fragments = fu_a_payloads(&keyframe, 1_024);
+        assert!(
+            fragments.len() >= 6,
+            "the keyframe must genuinely span several RTP packets, not one"
+        );
+        let last = fragments.len() - 1;
+        for (index, fragment) in fragments.iter().enumerate() {
+            let sequence = u16::try_from(index + 2).expect("bounded sequence");
+            packets.push(rtp(sequence, 900, index == last, 96, fragment));
+        }
+
+        let mut assembler = AccessUnitAssembler::new(&track(RtspCodec::H264), 1 << 20).unwrap();
+        let unit = assemble(&mut assembler, &packets);
+        assert_eq!(
+            unit.bytes.as_ref(),
+            expected.as_slice(),
+            "the assembled access unit is not the bytes the camera sent"
+        );
+        assert_eq!(
+            unit.compressed_bytes,
+            expected.len() as u64,
+            "the byte count the pipeline reports must be the byte count it assembled"
+        );
+        assert_eq!(
+            unit.dimensions,
+            Some((320, 240)),
+            "the geometry must come from the camera's own SPS"
+        );
+        assert_eq!(unit.rtp_timestamp, 900);
+
+        // The same three NALs, sent one per RTP packet: same access unit, byte for byte.
+        let single = [
+            single_nal_packet(20, 901, false, &sps),
+            single_nal_packet(21, 901, false, &pps),
+            single_nal_packet(22, 901, true, &keyframe),
+        ];
+        let mut singles = AccessUnitAssembler::new(&track(RtspCodec::H264), 1 << 20).unwrap();
+        assert_eq!(
+            assemble(&mut singles, &single).bytes.as_ref(),
+            expected.as_slice(),
+            "single-NAL packetisation must deliver the identical access unit"
+        );
+
+        // Teeth. One flipped byte, deep inside the third fragment, must change the delivered bytes.
+        let mut corrupted = packets.clone();
+        let victim = corrupted[3].len() / 2;
+        corrupted[3][victim] ^= 0x01;
+        let mut flipped = AccessUnitAssembler::new(&track(RtspCodec::H264), 1 << 20).unwrap();
+        assert_ne!(
+            assemble(&mut flipped, &corrupted).bytes.as_ref(),
+            expected.as_slice(),
+            "a single flipped payload byte must be visible in the assembled unit: an assertion that \
+             cannot see it is not pinning the picture"
+        );
+
+        // A lost fragment must never be papered over into a shorter, decodable-looking access unit.
+        let mut dropped = packets.clone();
+        dropped.remove(3);
+        let mut gapped = AccessUnitAssembler::new(&track(RtspCodec::H264), 1 << 20).unwrap();
+        let outcome: Result<Vec<_>> = dropped
+            .iter()
+            .map(|packet| gapped.push(parse_rtp_packet(packet).unwrap()))
+            .collect();
+        assert!(
+            outcome.is_err(),
+            "a keyframe that lost a fragment must not be assembled and handed on as a frame"
+        );
+    }
+
+    /// LINK 1 (H.265): the same exactness claim, over the AP and FU packetisations.
+    ///
+    /// H.265 fragmentation carries a two-byte NAL header that the FU packets do not transmit intact --
+    /// the assembler RECONSTRUCTS it from the payload header. A reconstruction that is off by a bit
+    /// yields a NAL the decoder will interpret as a different type entirely, so it is asserted here as
+    /// exact bytes, not as a plausible header.
+    #[test]
+    fn an_h265_access_unit_is_reassembled_byte_for_byte_from_ap_and_fu() {
+        let vps = vec![32 << 1, 1, 0x0c, 0x01];
+        let sps = h265_sps(320, 240, (0, 0, 0, 0));
+        let pps = vec![34 << 1, 1, 0xc1, 0x72];
+        let mut keyframe = vec![19 << 1, 1_u8];
+        keyframe.extend((0..4_000_u32).map(|index| 1 + (index % 250) as u8));
+        let expected = annex_b(&[vps.clone(), sps.clone(), pps.clone(), keyframe.clone()]);
+
+        let mut packets = vec![rtp(
+            1,
+            700,
+            false,
+            96,
+            &h265_ap_payload(&[&vps, &sps, &pps]),
+        )];
+        let fragments = h265_fu_payloads(&keyframe, 700);
+        assert!(
+            fragments.len() >= 5,
+            "the keyframe must genuinely span several RTP packets"
+        );
+        let last = fragments.len() - 1;
+        for (index, fragment) in fragments.iter().enumerate() {
+            let sequence = u16::try_from(index + 2).expect("bounded sequence");
+            packets.push(rtp(sequence, 700, index == last, 96, fragment));
+        }
+
+        let mut assembler = AccessUnitAssembler::new(&track(RtspCodec::H265), 1 << 20).unwrap();
+        let unit = assemble(&mut assembler, &packets);
+        assert_eq!(
+            unit.bytes.as_ref(),
+            expected.as_slice(),
+            "the assembled H.265 access unit is not the bytes the camera sent"
+        );
+        assert_eq!(unit.compressed_bytes, expected.len() as u64);
+        assert_eq!(
+            unit.dimensions,
+            Some((320, 240)),
+            "the geometry must come from the camera's own H.265 SPS"
+        );
+        assert_eq!(unit.rtp_timestamp, 700);
+
+        let single = [
+            single_nal_packet(40, 701, false, &vps),
+            single_nal_packet(41, 701, false, &sps),
+            single_nal_packet(42, 701, false, &pps),
+            single_nal_packet(43, 701, true, &keyframe),
+        ];
+        let mut singles = AccessUnitAssembler::new(&track(RtspCodec::H265), 1 << 20).unwrap();
+        assert_eq!(
+            assemble(&mut singles, &single).bytes.as_ref(),
+            expected.as_slice(),
+            "single-NAL packetisation must deliver the identical H.265 access unit"
+        );
+
+        // Teeth: a flipped byte inside a fragment is a different picture, and must be visible.
+        let mut corrupted = packets.clone();
+        let victim = corrupted[2].len() / 2;
+        corrupted[2][victim] ^= 0x80;
+        let mut flipped = AccessUnitAssembler::new(&track(RtspCodec::H265), 1 << 20).unwrap();
+        assert_ne!(
+            assemble(&mut flipped, &corrupted).bytes.as_ref(),
+            expected.as_slice(),
+            "a flipped H.265 payload byte must change the assembled access unit"
+        );
+    }
+
+    /// Every RTP packet of the I_PCM keyframe, packetised the way a camera packetises a keyframe.
+    ///
+    /// Parameter sets aggregated in a STAP-A; the (very large) I_PCM slice fragmented across FU-A
+    /// packets at a realistic MTU. The marker rides the final fragment.
+    #[cfg(feature = "rtsp")]
+    fn packetise_keyframe(nals: &[Vec<u8>], sequence: &mut u16, timestamp: u32) -> Vec<Vec<u8>> {
+        let (slice, parameter_sets) = nals.split_last().expect("a keyframe has a slice");
+        let sets: Vec<&[u8]> = parameter_sets.iter().map(Vec::as_slice).collect();
+        let mut packets = vec![rtp(*sequence, timestamp, false, 96, &stap_a_payload(&sets))];
+        *sequence = sequence.wrapping_add(1);
+        let fragments = fu_a_payloads(slice, 1_400);
+        let last = fragments.len() - 1;
+        for (index, fragment) in fragments.iter().enumerate() {
+            packets.push(rtp(*sequence, timestamp, index == last, 96, fragment));
+            *sequence = sequence.wrapping_add(1);
+        }
+        packets
+    }
+
+    /// LINK 2: the picture the decoder returns IS the picture that was encoded into the access unit.
+    ///
+    /// This is the claim the adapter exists to keep, and nothing else in the suite made it: storage
+    /// digests the file it has just written, so a frame mangled anywhere between the camera and the
+    /// disk still produces a perfectly consistent digest of the WRONG image.
+    ///
+    /// A known raster (asymmetric RGB gradients) is carried into a real H.264 access unit whose every
+    /// macroblock is I_PCM -- the one exactly-invertible coding mode -- with the deblocking filter
+    /// switched off. That access unit is packetised into ~85 RTP packets (STAP-A + FU-A), reassembled
+    /// by the production `AccessUnitAssembler`, asserted to be byte-for-byte the encoded unit (LINK 1
+    /// on real codec bytes), and only then handed to the production `GstreamerDecoder` -- h264parse,
+    /// avdec_h264, videoconvert, RGB -- exactly as a live camera's frame is.
+    ///
+    /// The decoded RGB is then compared to the original raster PIXEL BY PIXEL. The comparison is a
+    /// tolerance, not byte equality, and deliberately so: H.264 coding of I_PCM samples is lossless,
+    /// but the RGB -> BT.601 4:2:0 -> RGB colour round trip is NOT (chroma is subsampled and every
+    /// step rounds). The tolerance is tight enough that a shifted, mirrored, stale, channel-swapped or
+    /// simply different picture cannot pass it.
+    #[cfg(feature = "rtsp")]
+    #[test]
+    fn the_image_that_is_decoded_is_the_image_the_camera_encoded() {
+        const WIDTH: u32 = 320;
+        const HEIGHT: u32 = 240;
+        const FRAME_BYTES: u64 = 4 << 20;
+
+        let raster = gradient_raster(WIDTH, HEIGHT);
+        let planes = rgb_to_yuv420(&raster, WIDTH, HEIGHT);
+        let nals = vec![
+            h264_sps(WIDTH, HEIGHT),
+            h264_pps(),
+            h264_ipcm_idr(&planes),
+        ];
+        let expected_unit = annex_b(&nals);
+
+        let mut assembler = AccessUnitAssembler::new(&track(RtspCodec::H264), FRAME_BYTES).unwrap();
+        let mut decoder = GstreamerDecoder::new(RtspCodec::H264, FRAME_BYTES)
+            .expect("the production decode pipeline must build");
+        let mut sequence = 1_u16;
+        let mut decoded = None;
+        // A decoder may hold the first access unit back; the camera simply sends the next frame. Every
+        // one of them is the same known picture, and every one must survive the wire intact.
+        for frame in 0..4_u32 {
+            let packets = packetise_keyframe(&nals, &mut sequence, 3_000 + frame * 3_000);
+            assert!(
+                packets.len() > 80,
+                "the I_PCM keyframe must really be fragmented across the wire, got {} packets",
+                packets.len()
+            );
+            let unit = assemble(&mut assembler, &packets);
+            assert_eq!(
+                unit.bytes.as_ref(),
+                expected_unit.as_slice(),
+                "the decoder must be handed EXACTLY the access unit that was encoded, and it was not"
+            );
+            if let Some(frame) = decoder
+                .push_and_pull(unit, FRAME_BYTES, 32, Instant::now())
+                .expect("the decoder must accept a conformant H.264 access unit")
+            {
+                decoded = Some(frame);
+                break;
+            }
+        }
+        let frame = decoded.expect("the real decode path must return the frame it was fed");
+
+        assert_eq!(
+            (frame.width, frame.height),
+            (WIDTH, HEIGHT),
+            "the decoded frame must have the geometry the camera's SPS declared"
+        );
+        assert_eq!(
+            frame.bytes.len(),
+            (WIDTH * HEIGHT * 3) as usize,
+            "an RGB frame is exactly three bytes per pixel, with no padding"
+        );
+
+        // The picture itself. The lossy colour conversion is allowed for; a different picture is not.
+        let (worst, worst_at, mean) = deviation(&frame.bytes, &raster);
+        assert!(
+            worst <= 8,
+            "decoded pixel {worst_at} differs from the captured raster by {worst} -- the frame that \
+             came out of the decoder is not the frame that went in (only the lossy RGB/BT.601 4:2:0 \
+             colour round trip is permitted, not a different picture)"
+        );
+        assert!(
+            mean <= 3.0,
+            "the decoded frame deviates from the captured raster by {mean:.2} per channel on \
+             average, which is more than the colour round trip can account for"
+        );
+
+        // And the tolerance has teeth: the SAME picture, moved by a single pixel, blows through it.
+        // Without this, "within tolerance" would be a claim about the size of the tolerance rather
+        // than about the identity of the picture.
+        let shifted: Vec<u8> = raster[3..]
+            .iter()
+            .copied()
+            .chain(raster[..3].iter().copied())
+            .collect();
+        let (shifted_worst, _, shifted_mean) = deviation(&frame.bytes, &shifted);
+        assert!(
+            shifted_worst > 8,
+            "a one-pixel shift of the captured raster stayed inside the tolerance (worst \
+             {shifted_worst}, mean {shifted_mean:.2}) -- the comparison is too loose to be pinning \
+             anything"
         );
     }
 }

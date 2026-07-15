@@ -1,7 +1,13 @@
 # syntax=docker/dockerfile:1
 #
-# Build from the EdgeCommons umbrella so the unpublished sibling core library is available:
-#   docker build -f camera-adapter/Dockerfile -t camera-adapter:dev .
+# Build from this repository:
+#   docker build -t camera-adapter:dev .
+#
+# The context is the adapter alone. `edgecommons` is a GIT dependency pinned by REV (Cargo.toml), so
+# cargo fetches exactly one library source and the image needs no sibling checkout. The `[patch]` that
+# redirects it to a local core tree lives in a gitignored `.cargo/config.toml` and is a DEVELOPER
+# convenience -- it is never part of an image, and an image must never be built from an unpinned
+# working tree.
 #
 # This file intentionally provides ONVIF and RTSP targets only. GenICam requires a reviewed,
 # architecture-matched Aravis >= 0.8.36 package and is deployed through the native Linux path,
@@ -28,13 +34,16 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
 
 WORKDIR /build
 
-# Copy only source inputs. The build context is the umbrella root, not camera-adapter itself.
-COPY core/libs/rust /build/core/libs/rust
-COPY core/libs/rust-streamlog /build/core/libs/rust-streamlog
-COPY core/proto /build/core/proto
-COPY camera-adapter/Cargo.toml camera-adapter/Cargo.lock /build/camera-adapter/
-COPY camera-adapter/src /build/camera-adapter/src
-COPY camera-adapter/native /build/camera-adapter/native
+# Copy only source inputs.
+#
+# `Cargo.lock` is deliberately absent: it is untracked and gitignored, because a local build goes
+# through the `[patch]` override above, and a patched build rewrites the lock to a PATH source. A
+# committed lock would therefore either lie to a fresh clone or break the read-only validation mounts.
+# Copying it -- or building `--locked` against a lock that is not there -- fails outright in a clean
+# clone, which is exactly what this file used to do.
+COPY Cargo.toml /build/camera-adapter/
+COPY src /build/camera-adapter/src
+COPY native /build/camera-adapter/native
 
 WORKDIR /build/camera-adapter
 
@@ -43,7 +52,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     CARGO_TARGET_DIR=/build/target \
-    cargo build --locked --release --no-default-features --features standalone,onvif \
+    cargo build --release --no-default-features --features standalone,onvif \
     && install -D -m 0755 /build/target/release/camera-adapter /build/artifacts/camera-adapter
 
 FROM build AS build-rtsp
@@ -51,7 +60,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     CARGO_TARGET_DIR=/build/target \
-    cargo build --locked --release --no-default-features --features standalone,onvif,rtsp \
+    cargo build --release --no-default-features --features standalone,onvif,rtsp \
     && install -D -m 0755 /build/target/release/camera-adapter /build/artifacts/camera-adapter
 
 FROM docker.io/library/debian@sha256:1def178129dfb5f24db43afbf2fcac04530012e3264ba4ff81c71184e17a9ee4 AS runtime-base

@@ -594,14 +594,20 @@ def make_handler(state: SimulatorState) -> type[SimulatorHandler]:
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
-    """Thread-per-request server with a hard in-flight connection ceiling."""
+    """Thread-per-request server with a hard in-flight connection ceiling.
+
+    The ceiling defaults to 64 -- enough for the functional fixtures -- and is raised via
+    ``SIM_MAX_CONNECTIONS`` for fleet/load runs where many cameras establish sessions at once
+    (each warm RTSP session first does an ONVIF handshake, so N cameras need N concurrent slots).
+    """
 
     daemon_threads = True
     block_on_close = False
-    request_queue_size = 64
+    _MAX_CONNECTIONS = max(8, int(os.environ.get("SIM_MAX_CONNECTIONS", "64")))
+    request_queue_size = _MAX_CONNECTIONS
 
     def __init__(self, address: tuple[str, int], handler: type[BaseHTTPRequestHandler]) -> None:
-        self._request_slots = threading.BoundedSemaphore(64)
+        self._request_slots = threading.BoundedSemaphore(self._MAX_CONNECTIONS)
         super().__init__(address, handler)
 
     def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:

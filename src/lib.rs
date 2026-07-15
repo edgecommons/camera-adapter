@@ -14,6 +14,7 @@ pub mod commands;
 pub mod config;
 #[cfg(feature = "onvif")]
 pub mod credential_provider;
+pub mod dispatch;
 pub mod encoding;
 pub mod error;
 pub mod idempotency;
@@ -21,7 +22,6 @@ pub mod jobs;
 pub mod messages;
 pub mod model;
 pub mod observability;
-pub mod outbox;
 pub mod registry;
 pub mod runtime;
 pub mod scheduler;
@@ -29,6 +29,7 @@ pub mod state_path;
 pub mod storage;
 pub mod storage_pressure;
 pub mod supervisor;
+pub mod thumbnail;
 #[cfg(windows)]
 mod windows_security;
 

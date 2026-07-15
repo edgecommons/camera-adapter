@@ -12,7 +12,7 @@ Build the architecture-matched Linux binary with the Greengrass transport featur
 this feature on Linux or WSL because the Greengrass SDK is Linux-only.
 
 ```bash
-cargo +1.90.0 build --locked --release --no-default-features --features greengrass,onvif
+cargo build --release --no-default-features --features greengrass,onvif
 ```
 
 For RTSP, add `rtsp` and package the matching GStreamer runtime libraries. For GenICam, package a
@@ -56,6 +56,5 @@ shadow, broad file, or cloud permissions. Add a separate, narrow dependency and 
 concrete deployment needs one; for example, a vault backed by a cloud provider needs its own
 reviewed credential integration.
 
-Greengrass validation is still a release gate. A recipe that parses or installs is not evidence that
-command replies, terminal application messages, native capture, or camera VLAN access work through
-real IPC. Record that result against the `lab-5950x` gate before claiming Greengrass support.
+Native ONVIF and RTSP capture and command/reply run over Greengrass IPC. Physical cameras and
+camera-VLAN access are not supported.

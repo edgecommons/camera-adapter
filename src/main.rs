@@ -100,11 +100,14 @@ async fn main() -> anyhow::Result<()> {
         RuntimeServices {
             apps,
             events,
-            outbox_events: gg.events(),
+            component_events: gg.events(),
             readiness: readiness.clone(),
             backend_context,
-            messaging: gg.messaging()?,
             metrics: gg.metrics(),
+            // The RESOLVED transport, not a guess. It decides what a terminal announcement may
+            // carry: the Greengrass IPC client encodes a whole message into a 10,000-byte static
+            // buffer, and an MQTT broker takes a megabyte.
+            transport: gg.args().transport,
         },
     )
     .await?;

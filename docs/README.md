@@ -1,8 +1,7 @@
 # Camera adapter documentation
 
-These documents describe the checked-in deployment artifacts and the currently implemented
-runtime boundaries. `DESIGN.md` is the binding design and contains future release gates; it is not
-a statement that every planned command or hardware path is already released.
+These documents describe how to deploy and operate the camera adapter and its current runtime
+boundaries.
 
 | Need | Document |
 |---|---|
@@ -17,6 +16,5 @@ a statement that every planned command or hardware path is already released.
 | Deploy through Greengrass IPC | [Greengrass runbook](deployment/greengrass.md) |
 | Deploy a single active pod with a PVC | [Kubernetes runbook](deployment/kubernetes.md) |
 | Understand simulator and hardware limits | [Compatibility register](reference/compatibility.md) |
-| Inspect requirement and release evidence | [Acceptance matrix](acceptance-matrix.md) |
 
 The deterministic simulator commands are maintained in [../simulators/README.md](../simulators/README.md).

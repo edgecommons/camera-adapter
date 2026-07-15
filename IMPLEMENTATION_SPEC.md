@@ -45,7 +45,7 @@ design. See `DESIGN.md` §§23.8–26, lines 2273–2347.
 
 | ID | Binding resolution | Design trace |
 |---|---|---|
-| `R-01` | Use `ecv1/{device}/camera-adapter/main/cmd/sb/{verb}` and select the camera with body `instance`. Do not implement per-instance command inboxes for this delivery. Update the core southbound design and shipped reference documentation when the behavior ships. | D-CAM-18 and §§12.1, 13, 26, 27: lines 130–132, 932–958, 1071–1106, 2321–2324, 2345–2348 |
+| `R-01` | Use `ecv1/{device}/camera-adapter/main/cmd/sb/{verb}` and select the camera with body `instance` for this delivery. Command addressing is resolved by core decision D-U28 (optional-instance UNS addressing); the pending migration target is instance-scope `.../{instance}/cmd/sb/{verb}` + component/fleet `.../cmd/sb/{verb}`, applied when the D-U28 rollout reaches this adapter (which updates the core southbound design and reference docs). | D-CAM-18 and §§12.1, 13, 26, 27 |
 | `R-02` | `backend.type = "sim"` is a supported, configurable production backend in addition to `genicam-aravis` and `onvif-rtsp`. | §§6.2, 10.9: lines 227–263, 754–765 |
 | `R-03` | ONVIF v1 binds with exactly one of `deviceServiceUrl` or `selector.endpointReference`. Endpoint-reference binding is resolved through bounded WS-Discovery. | §10.12: lines 800–819 |
 | `R-04` | Initial startup reports and skips invalid instances if at least one enabled valid instance remains. A reload candidate is all-or-nothing: any invalid instance rejects the candidate and leaves the complete prior configuration running. | §§10.5, 20.1: lines 690–698, 1934–1945 |
@@ -64,7 +64,7 @@ design. See `DESIGN.md` §§23.8–26, lines 2273–2347.
 | `R-17` | With a sidecar, install and flush the sidecar before installing the final image. Consumers can never see a final image before its required sidecar. | §9.6 and §22.6: lines 495–502, 2077–2096 |
 | `R-18` | Scheduler DST, coalescing, overlap, and jitter behavior is fixed by §7.4 of this addendum. | §§10.4, 23.1: lines 669–688, 2115–2131 |
 | `R-19` | Add ONVIF limits `maxHeaderBytes = 65536`, `maxDecompressionRatio = 100`, and `allowBasicOverPlaintext = false`; apply DNS/IP pinning rules in §10.1 of this addendum. | §§10.12, 18.1, 18.4: lines 800–819, 1843–1852, 1876–1884 |
-| `R-20` | Undelivered outbox records are never pruned. Outbox pressure raises stateful alarms and makes readiness false when state storage can no longer safely commit. | §§9.5, 14.3, 17.2, 19.4: lines 483–493, 1557–1567, 1813–1818, 1924–1930 |
+| `R-20` | Terminal announcements are published once, best effort, after the durable commit, and are never retried or stored for retry. A publish failure raises a stateful alarm and never fails a capture, rejects a capture, or changes readiness. | §§9.5, 14.3, 17.2, 19.4: lines 483–493, 1557–1567, 1813–1818, 1924–1930 |
 | `R-21` | Queued jobs survive a compatible same-backend reload. Removal or backend-type change interrupts queued jobs transactionally with terminal failure messages. | §§17.1, 20.1: lines 1788–1811, 1934–1945 |
 | `R-22` | Rust panics and reported callback errors are isolated at the supervisor boundary. Native segmentation faults and process aborts are not catchable in-process; sharding or process isolation is the mitigation. | §§17.3, 21.6: lines 1820–1828, 2034–2038 |
 | `R-23` | SQLite uses transactional migrations, WAL, `synchronous=FULL`, a bounded busy timeout, startup integrity checking, and an exclusive state-directory process lock. | §17.1: lines 1788–1811 |
@@ -108,7 +108,7 @@ selected for the release is integrated with the real P1 APIs.
 |---|---|---|---|
 | P0 | Rust skeleton; dependency/license inventory; pinned Aravis, GLib, GStreamer and SQLite approach; Windows feasibility; SimBackend memory/thread baseline | One frame through each native stack available on the development platform; 256 idle simulations; approved OS/feature matrix; versioned resource baseline | §24 P0, line 2292 |
 | P1 | Deferred command outcomes, correlation-aware `app`, confirmed publish, pre-commit config veto, initial readiness control, and observable CommandInbox startup in Java, Python, Rust, and TypeScript; update skeletons/templates and core docs | Per-language unit/coverage gates; reload-veto and startup-readiness races; 4×4 local MQTT requester/responder interop; PUBACK tests; four-language deployed Greengrass IPC interop; scaffold-to-build regression | §§10.5, 12.2, 19.4, 20.1, 23.3, 24 P1, lines 690–698, 960–1014, 1924–1945, 2186–2194, 2293 |
-| P2 | Config, SQLite catalog/ledger/outbox, job engine, scheduler, admission, safe storage, commands/messages, metrics/health, SimBackend | Full SimBackend and EMQX contract; crash checkpoints; property/fuzz tests; at least 90% line coverage | §24 P2, line 2294 |
+| P2 | Config, SQLite catalog/ledger, job engine, scheduler, admission, safe storage, commands/messages, metrics/health, SimBackend | Full SimBackend and EMQX contract; crash checkpoints; property/fuzz tests; at least 90% line coverage | §24 P2, line 2294 |
 | P3 | WS-Discovery, ONVIF services/media/auth/TLS/snapshot, PTZ/presets, deterministic in-repo simulators | Simulator security/fault suite; physical ONVIF/PTZ compatibility is waived with no hardware claim | §24 P3 |
 | P4 | Aravis GigE/USB3 backend, features, bounded buffers, timestamp quality, formats | Fake camera and packet faults; physical vendor compatibility is waived with no hardware claim | §24 P4 |
 | P5 | GStreamer RTSP extraction, bounded warm session, fallback | RTSP codec/fault suite; physical fallback-camera compatibility is waived with no hardware claim | §24 P5 |
@@ -134,13 +134,12 @@ when the same boundaries remain reviewable.
 | `backend::rtsp` | GStreamer negotiation, readiness selection, decode, one-session warm pool | ONVIF SOAP | §§11.3, 23.4: lines 879–899, 2206–2212 |
 | `jobs` | State machine, deadlines, immutable effective profiles, terminal CAS, group aggregation | Protocol I/O | §§8, 13.5–13.9: lines 308–409, 1168–1351 |
 | `catalog` | SQLite schema/migrations, jobs, groups, command ledger, schedule dedup, retention, queries | Camera I/O | §§8.2, 17.1: lines 343–384, 1788–1811 |
-| `outbox` | Exact-envelope storage, confirmed publication, retry/backoff, pressure alarms, delivered retention | New captures on retry | §§12.2, 14.3, 17.2: lines 960–1014, 1557–1567, 1813–1818 |
 | `admission` | Priority aging, camera/global/resource/byte/disk/encoder/writer permits | Backend-specific feature selection | §§8.3, 10.7, 16: lines 386–400, 710–742, 1741–1784 |
 | `scheduler` | Six-field cron, timezone/DST, stable jitter, misfire/overlap, durable occurrence keys | Wall-clock-only tests | §§8.2, 10.4, 23.1: lines 358–359, 669–688, 2115–2131 |
 | `encoding` | Bounded worker pool and streaming jpeg/png/tiff/raw/passthrough output | Unbounded in-memory output | §§6.3, 9.4: lines 265–272, 467–481 |
 | `storage` | Linux capability-scoped paths and no-clobber install; Windows portable persistence; disk reservation, partial files, stream/checksum/fsync, reconciliation | Retention deletion | §§9, 18.3: lines 411–502, 1867–1875 |
 | `commands` | Closed schemas, validation, CommandInbox registration, deferred/immediate settlement | Direct publish to `reply_to` | §§12.2, 13: lines 960–1014, 1071–1446 |
-| `messages` | Terminal body construction, correlation, exact topic/name, outbox serialization | Image bytes | §§12–15: lines 930–1739 |
+| `messages` | Terminal body construction, correlation, exact topic/name, announcement serialization | Image bytes | §§12–15: lines 930–1739 |
 | `observability` | Standard southbound health, bounded camera metrics, redacted/rate-limited logs/events | High-cardinality dimensions | §19: lines 1886–1930 |
 | `runtime` | Reload/shutdown orchestration, initial-not-ready construction, observable command-inbox startup, readiness gates, and startup state | Platform-specific business branches | §§19.4–21.1: lines 1924–1970 |
 
@@ -223,16 +222,14 @@ Every language adds a bounded confirmed-publish operation with these semantics:
   unbounded waiter state; and
 - the existing immediate `publish` behavior remains source- and behavior-compatible.
 
-The camera outbox stores the complete serialized envelope before publication. A retry sends the exact
-bytes with the same envelope UUID. A successful confirmed result is the only transition that may set the
-outbox delivery timestamp. Application consumers therefore see at-least-once delivery and deduplicate by
-`eventId` or `(cameraId, captureId, header.name)`.
+A terminal announcement is published once, best effort. Application consumers therefore see
+at-most-once delivery: an announcement may be lost, and none is ever duplicated by this component. The
+durable capture result, not the announcement, is authoritative.
 
-Each language therefore exposes a prepared application publication that contains the validated topic,
-the logical message, and the exact encoded envelope bytes. Confirmed publication of that prepared value
-must send those stored bytes directly; it must not rebuild or reserialize the envelope. A lower-level
-exact-encoded confirmed operation may exist for durable outboxes, but it remains guarded by the same UNS
-topic policy and accepts only an envelope that was parsed/validated or produced by a library builder.
+Each language exposes a prepared application publication that contains the validated topic, the logical
+message, and the encoded envelope. A confirmed, exact-byte publication also exists in core and is the
+foundation on which a durable-delivery augmentation would be built for components that need one; this
+component does not use it.
 
 ### 5.4 Configuration and startup lifecycle plumbing
 
@@ -359,7 +356,7 @@ Capture acceptance uses two durable commits:
 For a deferred direct capture, provisional token creation occurs before commit 1 and activation occurs
 after commit 1. If commit 1 fails, discard the token and return immediate error. A crash after commit 1 but
 before commit 2 leaves a durable `ACCEPTED` job, which startup marks `INTERRUPTED` and pairs with a terminal
-outbox record as specified by `DESIGN.md` §17.1.
+terminal record as specified by `DESIGN.md` §17.1.
 
 Submitted acceptance replies only after the `QUEUED` transition is durable. Group acceptance inserts the
 group ledger, group record, and every `ACCEPTED` member in one transaction, then transitions all members to
@@ -439,7 +436,7 @@ compare-and-set:
 - after installation starts, only persistence/reconciliation may choose `SUCCEEDED` or `FAILED`.
 
 A backend cancellation request is an optimization and does not determine the durable winner. The terminal
-catalog CAS is the source of truth. Exactly one terminal outbox record is committed with that winner.
+catalog CAS is the source of truth. Exactly one terminal announcement is published for that winner.
 
 ## 7. Configuration addendum
 
@@ -566,7 +563,7 @@ previous complete valid configuration continues.
 Queued jobs survive a reload only when the camera remains present, enabled, and on the same backend type,
 and the snapshotted profile remains executable by that backend contract. They retain their snapshot even
 if the configured profile is edited or removed. Removing/disabling the camera or changing backend type
-transactionally marks its queued jobs `INTERRUPTED` with `PROCESS_INTERRUPTED` terminal outbox messages.
+transactionally marks its queued jobs `INTERRUPTED` with `PROCESS_INTERRUPTED`, and announces each.
 The active job follows the configured drain timeout.
 
 ### 7.6 Durable state directory resolution
@@ -796,7 +793,7 @@ The writer performs:
 7. acquire the catalog `install_started` CAS;
 8. install the final image (Linux: no-clobber; Windows: standard-library no-overwrite link/install with collision/error failure);
 9. flush the parent directory where supported; and
-10. transactionally commit terminal success and exact outbox envelope.
+10. transactionally commit terminal success, then announce it best effort.
 
 If cancellation wins before step 7, remove partials and, if present, the not-yet-consumable installed
 sidecar. Once step 7 wins, cancellation cannot win. A crash after sidecar installation but before image
@@ -884,25 +881,108 @@ session consumes observable decoder/native resources, is closed on reload, disco
 shutdown, and is never shared between cameras. When the RTSP build feature is absent, config that requires
 `rtsp-frame` or enables fallback is rejected for that instance with a stable unsupported-build error.
 
-## 11. Outbox pressure and readiness
+## 11a. Capture thumbnail
 
-Undelivered terminal messages are not subject to time- or count-based pruning. The outbox publisher
-continues while the broker is unavailable and reuses exact envelope bytes.
+A capture profile may opt in to a thumbnail (`thumbnail.size` = `small` | `medium` | `large`). Absent, no
+thumbnail is produced and no `thumbnail` key appears on the wire.
 
-Raise or update the stateful `message-delivery-delayed` condition when either:
+The bound is the **longest edge** — 160, 320, 640 px — with the aspect ratio preserved and no upscaling of a
+smaller frame. The encoding is always JPEG. It is rendered from the camera's `CaptureFrame`, on the blocking
+pool, inside the same permits as encoding and persistence, so no image work reaches the reactor.
 
-- the oldest pending record is at least 60 seconds old; or
-- pending records reach `max(100, ceil(0.01 * state.maxResultRecords))`.
+The thumbnail is carried in the **announcement only**. It is not written to the metadata sidecar, not stored
+in the catalog's `terminal_result`, and not included in a deferred or group reply — those are all made from
+the committed body, and a lossy, derived, disposable preview must not be durably stored once per capture
+(the reason the outbox was removed). An announcement rebuilt from the durable body after a restart therefore
+carries no thumbnail.
 
-Escalate its context when pending records reach 80% of `maxResultRecords`. Context contains pending count,
-oldest age, retry count, and last sanitized delivery error, never payloads or paths.
+The thumbnail carries **no digest**. It is a lossy re-encode; a `sha256` beside the artifact's own would
+invite a consumer to believe it is verifiable against the artifact, which it is not and cannot be.
 
-Outbox count alone does not make readiness false because capture results can remain durable while delivery
-recovers. Readiness becomes false, and new captures are rejected with `STORAGE_PRESSURE`, when the state
-filesystem crosses either configured free-space floor, SQLite cannot commit, integrity is lost, or the
-adapter cannot reserve enough state capacity for the next bounded terminal record. Liveness remains true
-while the runtime can publish status/alarms and retry. The adapter never deletes an undelivered terminal
-message to recover readiness.
+`data` is a binary value and MUST reach the wire as native protobuf bytes, never as base64 inside JSON.
+
+### The transport decides the ceiling
+
+The component resolves its transport at startup (`--platform`/`--transport`, or auto) and derives the
+thumbnail policy from it. It never guesses from the config file, and it never learns the limit by failing.
+
+| transport | largest size carried | preview budget |
+|---|---|---|
+| `IPC` (GREENGRASS) | `small` (160 px) | 6 KiB |
+| `MQTT` (HOST, KUBERNETES) | `large` (640 px) | 60 KiB |
+
+The IPC number is not a Greengrass protocol limit and not the Java nucleus's limit. The Greengrass IPC
+*client* this component links (`aws-greengrass-component-sdk`) encodes the whole eventstream packet into a
+**static 10,000-byte buffer** — `GG_IPC_MAX_MSG_LEN` in `include/gg/ipc/limits.h`, backing
+`static uint8_t ipc_send_mem[…]` in `csrc/ipc/client.c` — and `eventstream_encode` answers `NOMEM` above
+it, *before a byte reaches the nucleus*. The packet must also carry the envelope, the eventstream headers
+and the topic, so the preview gets 6 KiB of it. The define is overridable at SDK build time
+(`-D GG_IPC_MAX_MSG_LEN=<N>`); raising it is a core decision, not this component's.
+
+A configured size larger than the transport carries is **clamped down, never rejected** — the same
+configuration is deployed to Greengrass and to Kubernetes, and refusing to start on one of them would be
+hostile. The clamp is reported once per camera at startup (and again after a reload, which may introduce a
+new one), never per capture.
+
+**A preview never outranks the result.** If an announcement carrying a thumbnail cannot be published, the
+result is announced again without it. A result nobody was told about is a real loss; a missing preview is
+an inconvenience. This is the belt to the transport policy's braces: it covers any transport whose limit
+the component has mis-modelled.
+
+### Byte ceiling — a known constraint, not a design
+
+The messaging library caps a binary value at `MAX_BINARY_BODY_BYTES` = 64 KiB and errors above it. If a
+thumbnail exceeded that, the announcement itself would fail to build and the capture's message would be
+lost — a preview must never be able to do that. The component therefore encodes at JPEG quality 80, then 65,
+then 50, accepting the first result at or under **the transport's preview budget** (the table above: 6 KiB
+on IPC, 60 KiB on MQTT); if none fits, the thumbnail is dropped and the announcement is published without
+it. The MQTT budget sits under the 64 KiB library cap by construction, and a compile-time assertion pins it
+there.
+
+That 64 KiB is **not** a transport limit. `core/docs/platform/DESIGN-binary-messaging.md` §3.6 sizes it for
+the JSON BinaryValue path, where base64 inflates the payload and it flows through JSON parsers. On the
+protobuf wire the value is emitted as native `EcValue.bytes_value` — no base64, no JSON parser — so the cap
+guards a cost this path does not pay, and it over-constrains it. AWS IoT Core's 128 KiB ceiling does not
+apply either: announcements are local-destination only and never go northbound. Raising the limit is the
+`BinaryFrame` work in core (1 MiB default, configurable, all four languages). Until then this component
+lives under 64 KiB because that is what the library enforces, not because the number is principled.
+
+### Failure semantics
+
+A thumbnail that cannot be rendered (`thumbnailFailed`) or will not fit (`thumbnailDropped`) is counted on
+`camera_captures`, logged at WARN, and omitted. It never fails a capture, never rejects one, and never
+changes readiness.
+
+### Decompression bound
+
+The thumbnail is the only code in the component that decodes a camera's JPEG. A JPEG's decoded size is not
+its file size — a few hundred bytes can declare a 65500x65500 image and decode to gigabytes. A JPEG frame
+whose header-declared decoded size exceeds the capture's own admitted `maximumFrameBytes` is refused before
+any pixel buffer is allocated, and counted as a render failure. An out-of-memory death is not a degraded
+preview.
+
+## 11. Announcement failure and readiness
+
+A terminal announcement is published once, best effort, after its terminal state is durably committed.
+It is not stored for retry and it is not retried. If the broker or IPC transport is unavailable, or the
+component stops between the commit and the publish, that announcement is lost. The catalog and the
+installed image remain authoritative, and `sb/capture-status` answers for the capture afterwards.
+
+A failed announcement raises the stateful `message-publish-degraded` condition and increments the
+`announcementFailed` measure on `camera_captures`. The condition clears on the next successful
+announcement. Its context contains the instance, the capture id, and a sanitized error code — never
+payloads or paths.
+
+A messaging outage never makes readiness false and never rejects a capture. The component continues to
+capture, encode, and persist while the transport reconnects; only the announcements are lost. Readiness
+becomes false, and new captures are rejected with `STORAGE_PRESSURE`, when the state filesystem crosses
+either configured free-space floor, SQLite cannot commit, integrity is lost, or the adapter cannot
+reserve enough state capacity for the next bounded terminal record. Liveness remains true while the
+runtime can publish status and alarms.
+
+Durable, acknowledged delivery is a generic messaging concern. It belongs in the EdgeCommons messaging
+service as an opt-in augmentation available to any component in all four languages, not reimplemented
+inside this one.
 
 ## 12. Simulator and validation topology
 
@@ -944,12 +1024,12 @@ Each row links source files, tests, evidence artifacts, and status (`not started
 | `TR-CONFIG` | DESIGN §10, lines 504–837; addendum §7 | config | Defaults/ranges/unknown fields/redaction/startup/reload matrix |
 | `TR-BACKEND` | DESIGN §11; addendum §§7.2–7.3, 10 | backend modules | Simulator/protocol evidence; physical compatibility waiver with excluded claims |
 | `TR-CORE-P1` | DESIGN §§10.5, 12.2, 19.4, 20.1, lines 690–698, 960–1014, 1924–1945; addendum §5 | four core language libraries and templates | Unit coverage, reload-veto/readiness/startup races, 4×4 MQTT, lab-5950x IPC |
-| `TR-MSG` | DESIGN §§12, 14–15, lines 930–1070 and 1448–1739 | commands, messages, outbox | Exact rooted/rootless topic/envelope vectors, correlation, late reply, broker outage |
+| `TR-MSG` | DESIGN §§12, 14–15, lines 930–1070 and 1448–1739 | commands, messages | Exact rooted/rootless topic/envelope vectors, correlation, late reply, broker outage |
 | `TR-CMD` | DESIGN §13, lines 1071–1446; addendum §8 | commands, jobs, catalog | Every success/error schema with independent client |
 | `TR-CAPACITY` | DESIGN §16, lines 1741–1784; addendum §§6.4–6.5 | admission, actor, encoding, storage | 256/32/1,024 tests, priority aging, p95 control latency, RSS/thread graphs |
-| `TR-RECOVERY` | DESIGN §17, lines 1786–1839; addendum §§6.1–6.3, 11 | catalog, jobs, outbox | Kill-point matrix and exact outbox UUID/dedup evidence |
+| `TR-RECOVERY` | DESIGN §17, lines 1786–1839; addendum §§6.1–6.3, 11 | catalog, jobs | Kill-point matrix; a capture that survives a kill is durable and answerable via sb/capture-status |
 | `TR-SEC` | DESIGN §18, lines 1841–1884; addendum §§7.1, 9, 10 | config, onvif, storage, logging, packaging | Threat review, SSRF/DNS/XXE/decompression/path/credential tests |
-| `TR-OBS` | DESIGN §19, lines 1886–1930; addendum §11 | observability, runtime, outbox | Metric schema/cardinality, alarm raise/clear, health transition tests |
+| `TR-OBS` | DESIGN §19, lines 1886–1930; addendum §11 | observability, runtime | Metric schema/cardinality, alarm raise/clear, health transition tests |
 | `TR-RUNTIME` | DESIGN §§19.4–20, lines 1924–1955; addendum §§5.4, 7.5–7.6, 9.3 | runtime, config, supervisor, jobs | Initial-not-ready and command-start races, reload compatibility matrix, durable-path resolution, and timed shutdown/forced-stop tests |
 | `TR-DEPLOY` | DESIGN §21, lines 1957–2038 | packaging/deployment artifacts | HOST, Greengrass, kind, hardware runner evidence or explicit gaps |
 | `TR-INTEGRATION` | DESIGN §22, lines 2040–2108 | system tests, file-replicator docs/config | End-to-end metadata/file/checksum/group/replication evidence |
@@ -989,7 +1069,7 @@ The final local handoff contains:
 - sample successful and failing requests, replies, terminal app envelopes, and operator alarm envelopes;
 - image and sidecar paths, modes, sizes, SHA-256 values, and crash-recovery evidence;
 - 256-camera/32-capture short-capacity artifacts, their write-once run manifest, SHA-256 attestations, and complete 15-minute human-readable report with report attestation, plus the deferred 24-hour soak plan; attach soak results only after that later execution;
-- broker-outage outbox evidence with stable envelope UUIDs;
+- broker-outage evidence: captures continue and persist while announcements are dropped;
 - four-language local MQTT and deployed Greengrass IPC interop evidence for P1;
 - HOST, Greengrass, kind, and applicable hardware-cluster evidence;
 - the physical-camera compatibility register with explicit `WAIVED — NO HARDWARE AVAILABLE` and excluded

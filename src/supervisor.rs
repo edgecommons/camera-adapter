@@ -334,9 +334,20 @@ mod tests {
         assert!((Duration::from_secs(15)..=Duration::from_secs(18)).contains(&permanent));
     }
 
+    /// NOTE: this test deliberately does NOT install the sanitized panic hook.
+    ///
+    /// The hook is process-wide and `Once`-guarded, so a single test that installs it redacts the
+    /// panic payload of every OTHER test in the binary -- and a Rust assertion failure IS a panic
+    /// payload. The whole suite lost its failure messages to this one call, which meant a red build in
+    /// CI reported a line number and nothing else, and a failure that would not reproduce locally
+    /// could not be diagnosed at all. It cost real time before anyone noticed the cause.
+    ///
+    /// None of the assertions below need the hook: they are about the sanitized `CameraError` that
+    /// `isolate_backend_panic` returns, not about what the hook logs. The hook's own behaviour is
+    /// proved in `tests/panic_hook.rs`, which is a separate binary -- the only place a process-wide
+    /// hook can be installed without blinding anybody.
     #[tokio::test]
     async fn panic_is_sanitized_while_typed_backend_errors_are_preserved() {
-        install_sanitized_panic_hook();
         assert_eq!(isolate_backend_panic(async { Ok(7_u8) }).await.unwrap(), 7);
         let typed: Result<()> = isolate_backend_panic(async {
             Err(CameraError::Backend {
