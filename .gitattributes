@@ -1,0 +1,5 @@
+# Shell scripts must stay LF, even when checked out on Windows. The simulator validation and container
+# scripts run under bash (in WSL or a Linux container), and a CRLF line ending turns `set -euo pipefail`
+# into `pipefail\r` -- "invalid option name" -- which is exactly how the capacity harness failed to start
+# on a Windows checkout. Pin the ending so a clone cannot reintroduce it.
+*.sh text eol=lf
