@@ -2062,7 +2062,10 @@ async fn simulator_runtime_exercises_the_full_ptz_and_preset_command_matrix() {
         "instance": "camera-a",
         "requestId": "ptz-continuous-matrix",
         "velocity": { "pan": 0.5, "tilt": 0.0, "zoom": 0.0 },
-        "timeoutMs": 100
+        // Long enough that the move is still active when the status query below observes it,
+        // even under the slower llvm-cov instrumentation. The explicit stop below ends it, not
+        // this timeout, so the value only needs to outlast the observation window.
+        "timeoutMs": 5000
     }))
     .unwrap();
     assert_eq!(
