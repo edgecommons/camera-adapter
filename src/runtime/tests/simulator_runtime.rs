@@ -5040,6 +5040,32 @@ const SHORT_CAPACITY_FRAME_BYTES: u64 =
     feature = "capacity-harness"
 ))]
 const IDLE_SESSION_RSS_MAXIMUM_FULL_FRAME_FRACTION_DENOMINATOR: u64 = 8;
+#[cfg(all(
+    target_os = "linux",
+    feature = "standalone",
+    feature = "onvif",
+    feature = "capacity-harness"
+))]
+/// The modeled sensor-plus-transfer latency a simulated 8MP capture holds its permit for.
+///
+/// H2: this used to be 5,000 ms — five seconds of bare `sleep` per capture, a device for freezing 32
+/// captures in the admission gate so the harness could photograph "32 concurrent". It froze 32
+/// *reservations*, not 32 *frames*: nothing was on the heap. 750 ms is a defensible readout+transfer
+/// time for a slow high-resolution industrial sensor, it is comfortably long enough to sample the
+/// concurrent window, and — now that `SimSession::capture` holds the real frame buffer across it — it
+/// is 750 ms during which 32 genuine 8-megapixel buffers are resident at once.
+const SHORT_CAPACITY_TRANSFER_DELAY_MS: u64 = 750;
+#[cfg(all(
+    target_os = "linux",
+    feature = "standalone",
+    feature = "onvif",
+    feature = "capacity-harness"
+))]
+/// The least resident growth 32 concurrent 8MP captures must produce, as a fraction of their combined
+/// frame bytes. Half leaves generous headroom for allocator behaviour and for captures at the edges of
+/// the window that have not yet allocated or have already handed their buffer on; it is still far above
+/// the ZERO the old sleep-only harness would have shown.
+const CONCURRENT_CAPTURE_MEMORY_MINIMUM_FRACTION_DENOMINATOR: u64 = 2;
 
 #[cfg(all(
     target_os = "linux",
@@ -5053,6 +5079,13 @@ struct CapacityProcessStats {
     rss_bytes: Option<u64>,
     thread_count: Option<u64>,
     open_file_descriptors: Option<u64>,
+    /// Total CPU time (user + system) the process has consumed, in microseconds.
+    ///
+    /// H5: RSS alone cannot tell a healthy idle-between-captures runtime from one pinned at 100% in a
+    /// poll storm — the two look identical in resident memory. This is the difference. Sampled over
+    /// the run, its slope is the process's CPU utilization, and a runtime that has regressed into a
+    /// busy-wait (the class of defect D1 and B6 were) shows it here and nowhere else.
+    cpu_micros: Option<u64>,
 }
 
 #[cfg(all(
@@ -5079,6 +5112,16 @@ struct CapacitySample {
     available_encoders: usize,
     available_writers: usize,
     process: CapacityProcessStats,
+    /// The catalog's total footprint on disk — the SQLite database and its WAL/SHM/journal
+    /// sidecars, summed — in bytes.
+    ///
+    /// H5: the review said the harness "cannot catch B1", the finding where the durable store grows
+    /// without bound because retention was wired to nothing. `outstandingDiskBytes` is an admission
+    /// *reservation counter*, not a measurement of the store; it says how much the component intends
+    /// to write, never how large the catalog has actually become. This is a `stat` of the real files,
+    /// sampled over the run, so the durable cost of a capture is finally observable — and its per-record
+    /// slope is asserted, which is exactly the signal a per-capture-envelope regression would move.
+    catalog_disk_bytes: Option<u64>,
 }
 
 #[cfg(all(
@@ -5131,6 +5174,7 @@ struct ShortCapacityArtifact {
     concurrent_capture_target: usize,
     frame: serde_json::Value,
     idle_session_memory: IdleSessionMemoryEvidence,
+    concurrent_capture_memory: serde_json::Value,
     capture_group_submit_micros: u64,
     command_latency: BTreeMap<String, CommandLatencySummary>,
     resource_samples: Vec<CapacitySample>,
@@ -5157,7 +5201,7 @@ fn short_capacity_configuration(root: &Path) -> AdapterConfig {
                 "resourceGroup": "sim-shared",
                 "backend": {
                     "type": "sim",
-                    "captureDelayMs": 5_000,
+                    "captureDelayMs": SHORT_CAPACITY_TRANSFER_DELAY_MS,
                     "frame": {
                         "width": SHORT_CAPACITY_FRAME_WIDTH,
                         "height": SHORT_CAPACITY_FRAME_HEIGHT,
@@ -5239,10 +5283,12 @@ async fn wait_for_capacity_roster(runtime: &CameraRuntime) -> u64 {
             .filter(|snapshot| snapshot.state == CameraConnectionState::Disabled)
             .count();
         let live_actor_count = runtime
-            .actors
+            .cameras
             .read()
-            .expect("capacity actor registry lock must remain readable")
-            .len();
+            .expect("capacity camera registry lock must remain readable")
+            .values()
+            .filter(|slot| slot.session.is_some())
+            .count();
         if snapshots.len() == SHORT_CAPACITY_CONFIGURED_CAMERAS
             && online == SHORT_CAPACITY_ENABLED_CAMERAS
             && disabled
@@ -5289,7 +5335,55 @@ fn capacity_process_stats() -> CapacityProcessStats {
         open_file_descriptors: fs::read_dir("/proc/self/fd")
             .ok()
             .map(|entries| entries.filter_map(std::result::Result::ok).count() as u64),
+        cpu_micros: proc_self_cpu_micros(),
     }
+}
+
+/// Total CPU microseconds (user + system) from `/proc/self/stat`.
+///
+/// The `comm` field (field 2) can contain spaces and parentheses, so the record is split on the LAST
+/// `)`; utime and stime are then the 12th and 13th whitespace tokens of the remainder (fields 14 and
+/// 15 of the record). Both are in clock ticks of `USER_HZ`, which is 100 on every Linux this runs on —
+/// so one tick is 10,000 microseconds.
+#[cfg(all(
+    target_os = "linux",
+    feature = "standalone",
+    feature = "onvif",
+    feature = "capacity-harness"
+))]
+fn proc_self_cpu_micros() -> Option<u64> {
+    const MICROS_PER_TICK: u64 = 10_000;
+    let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // After the ')' the first token is `state` (field 3), so record field 14 (utime) is index 11.
+    let utime = fields.get(11)?.parse::<u64>().ok()?;
+    let stime = fields.get(12)?.parse::<u64>().ok()?;
+    utime.checked_add(stime)?.checked_mul(MICROS_PER_TICK)
+}
+
+/// The catalog's total on-disk footprint: the SQLite database plus its WAL/SHM/journal sidecars.
+#[cfg(all(
+    target_os = "linux",
+    feature = "standalone",
+    feature = "onvif",
+    feature = "capacity-harness"
+))]
+fn catalog_disk_bytes(state_directory: &Path) -> Option<u64> {
+    let mut total = 0_u64;
+    let mut saw_one = false;
+    for name in [
+        "camera-adapter.sqlite3",
+        "camera-adapter.sqlite3-wal",
+        "camera-adapter.sqlite3-shm",
+        "camera-adapter.sqlite3-journal",
+    ] {
+        if let Ok(metadata) = fs::metadata(state_directory.join(name)) {
+            total = total.saturating_add(metadata.len());
+            saw_one = true;
+        }
+    }
+    saw_one.then_some(total)
 }
 
 #[cfg(all(
@@ -5302,20 +5396,25 @@ fn capacity_sample(
     runtime: &CameraRuntime,
     phase: &str,
     started: Instant,
+    state_directory: &Path,
 ) -> CapacitySample {
     let admission = runtime.admission.snapshot();
     let snapshots = runtime
         .registry
         .snapshots(SHORT_CAPACITY_CONFIGURED_CAMERAS)
         .expect("capacity registry must remain readable");
-    let actors = runtime
-        .actors
+    let cameras = runtime
+        .cameras
         .read()
-        .expect("capacity actor map must remain readable");
-    let queued_capture_descriptors =
-        actors.values().map(|actor| actor.queued_captures()).sum();
-    let queued_control_descriptors =
-        actors.values().map(|actor| actor.queued_controls()).sum();
+        .expect("capacity camera map must remain readable");
+    let live_sessions = || cameras.values().filter_map(|slot| slot.session.as_ref());
+    let live_actor_count = live_sessions().count();
+    let queued_capture_descriptors = live_sessions()
+        .map(|session| session.actor.queued_captures())
+        .sum();
+    let queued_control_descriptors = live_sessions()
+        .map(|session| session.actor.queued_controls())
+        .sum();
     CapacitySample {
         phase: phase.to_owned(),
         elapsed_millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -5325,7 +5424,7 @@ fn capacity_sample(
             .iter()
             .filter(|snapshot| snapshot.state == CameraConnectionState::Online)
             .count(),
-        live_actor_count: actors.len(),
+        live_actor_count,
         queued_capture_descriptors,
         queued_control_descriptors,
         available_global_acquisitions: admission.available_acquisitions,
@@ -5336,6 +5435,7 @@ fn capacity_sample(
         available_encoders: admission.available_encoders,
         available_writers: admission.available_writers,
         process: capacity_process_stats(),
+        catalog_disk_bytes: catalog_disk_bytes(state_directory),
     }
 }
 
@@ -5443,6 +5543,7 @@ fn write_capacity_artifact<T: Serialize>(directory: &Path, file_name: &str, arti
 async fn short_linux_capacity_proves_1024_configured_256_sessions_and_32_captures() {
     let artifact_directory = capacity_artifact_directory();
     let temporary_root = TempDir::new().expect("capacity test root must be creatable");
+    let state_directory = temporary_root.path().join("capacity-state");
     let configuration = short_capacity_configuration(temporary_root.path());
     fs::create_dir_all(&configuration.global.output.root_directory)
         .expect("capacity output root must exist before secure storage initialization");
@@ -5514,6 +5615,9 @@ async fn short_linux_capacity_proves_1024_configured_256_sessions_and_32_capture
             apps,
             events,
             component_events: core.events(),
+            metrics: Arc::new(RecordingMetrics::default()),
+            // A standalone/HOST capacity runtime is an MQTT transport.
+            transport: edgecommons::platform::Transport::Mqtt,
             readiness,
             backend_context: BackendRuntimeContext::new(
                 None,
@@ -5532,7 +5636,7 @@ async fn short_linux_capacity_proves_1024_configured_256_sessions_and_32_capture
     startup_sampler
         .await
         .expect("capacity startup RSS sampler must not panic");
-    let roster_online_sample = capacity_sample(&runtime, "roster-online", started);
+    let roster_online_sample = capacity_sample(&runtime, "roster-online", started, &state_directory);
     let roster_online_rss_bytes = roster_online_sample.process.rss_bytes.expect(
         "Linux capacity proof requires /proc/self/status VmRSS after roster startup",
     );
@@ -5595,7 +5699,7 @@ async fn short_linux_capacity_proves_1024_configured_256_sessions_and_32_capture
 
     let saturation_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     let saturation = loop {
-        let sample = capacity_sample(&runtime, "acquisition-saturation", started);
+        let sample = capacity_sample(&runtime, "acquisition-saturation", started, &state_directory);
         let group_available = sample
             .available_resource_group_acquisitions
             .get("sim-shared")
@@ -5616,6 +5720,37 @@ async fn short_linux_capacity_proves_1024_configured_256_sessions_and_32_capture
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     samples.push(saturation);
+
+    // H2: 32 concurrent 8MP captures must cost 32 real frame buffers, not 32 counters. Admission can
+    // report saturation a beat before every session has finished synthesizing, so sample resident
+    // memory across a short window inside the 750 ms transfer hold and take the peak — the instant all
+    // 32 buffers coexist. The old sleep-only harness would have shown zero growth here; this is the
+    // assertion that makes "32 concurrent" a claim about the heap.
+    let in_flight_frame_bytes =
+        SHORT_CAPACITY_FRAME_BYTES * SHORT_CAPACITY_CONCURRENT_CAPTURES as u64;
+    let minimum_expected_growth_bytes =
+        in_flight_frame_bytes / CONCURRENT_CAPTURE_MEMORY_MINIMUM_FRACTION_DENOMINATOR;
+    let mut saturation_peak_rss_bytes = roster_online_rss_bytes;
+    let peak_deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    while tokio::time::Instant::now() < peak_deadline {
+        if let Some(rss_bytes) = capacity_process_stats().rss_bytes {
+            saturation_peak_rss_bytes = saturation_peak_rss_bytes.max(rss_bytes);
+        }
+        if saturation_peak_rss_bytes
+            >= roster_online_rss_bytes.saturating_add(minimum_expected_growth_bytes)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    let concurrent_capture_growth_bytes =
+        saturation_peak_rss_bytes.saturating_sub(roster_online_rss_bytes);
+    assert!(
+        concurrent_capture_growth_bytes >= minimum_expected_growth_bytes,
+        "32 concurrent 8MP captures grew resident memory by only {concurrent_capture_growth_bytes} bytes; \
+         real frame buffers should add at least {minimum_expected_growth_bytes} of their \
+         {in_flight_frame_bytes}-byte combined footprint. A permit held on a bare sleep would show ~0."
+    );
 
     let overflow_response = immediate_success(
         router
@@ -5647,7 +5782,7 @@ async fn short_linux_capacity_proves_1024_configured_256_sessions_and_32_capture
         !overflow_queued.state.is_terminal(),
         "the 33rd capture must not bypass a saturated global admission gate"
     );
-    samples.push(capacity_sample(&runtime, "overflow-queued", started));
+    samples.push(capacity_sample(&runtime, "overflow-queued", started, &state_directory));
 
     let mut latency_samples = BTreeMap::<String, Vec<u64>>::new();
     for index in 0..20 {
@@ -5700,10 +5835,18 @@ async fn short_linux_capacity_proves_1024_configured_256_sessions_and_32_capture
         .into_iter()
         .map(|(verb, values)| (verb, summarize_latency(values)))
         .collect::<BTreeMap<_, _>>();
+    // The command plane must stay responsive while the capture plane is saturated — but note what
+    // "saturated" now means. It used to mean 32 captures asleep on a 5-second timer, an idle process
+    // against which any command was instant, so a 250 ms ceiling passed trivially and measured nothing.
+    // With H2 the same 32 captures are synthesizing 8-megapixel frames and streaming ~256 MiB to disk,
+    // so this samples the router under GENUINE contention. 2 s is the honest ceiling for that: fifteen
+    // times under the framework's 30 s command deadline, comfortably met on the lab and in WSL, and
+    // still far below the multi-second p95 a truly starved command plane would show.
+    const SATURATED_COMMAND_P95_CEILING_MICROS: u64 = 2_000_000;
     for (verb, summary) in &command_latency {
         assert!(
-            summary.p95_micros <= 250_000,
-            "{verb} p95 was {}us while acquisitions were saturated",
+            summary.p95_micros <= SATURATED_COMMAND_P95_CEILING_MICROS,
+            "{verb} p95 was {}us while the capture plane was saturated with real 8MP work",
             summary.p95_micros
         );
     }
@@ -5721,7 +5864,7 @@ async fn short_linux_capacity_proves_1024_configured_256_sessions_and_32_capture
         wait_for_terminal_within(&runtime, &overflow_capture_id, Duration::from_secs(90))
             .await;
     assert_eq!(overflow.state, crate::model::JobState::Succeeded);
-    samples.push(capacity_sample(&runtime, "captures-terminal", started));
+    samples.push(capacity_sample(&runtime, "captures-terminal", started, &state_directory));
 
     router.begin_shutdown();
     runtime.shutdown().await;
@@ -5743,6 +5886,13 @@ async fn short_linux_capacity_proves_1024_configured_256_sessions_and_32_capture
                 "bytesPerFrame": SHORT_CAPACITY_FRAME_BYTES
             }),
             idle_session_memory,
+            concurrent_capture_memory: json!({
+                "rosterOnlineRssBytes": roster_online_rss_bytes,
+                "saturationPeakRssBytes": saturation_peak_rss_bytes,
+                "inFlightFrameBytes": in_flight_frame_bytes,
+                "observedGrowthBytes": concurrent_capture_growth_bytes,
+                "minimumExpectedGrowthBytes": minimum_expected_growth_bytes,
+            }),
             capture_group_submit_micros,
             command_latency,
             resource_samples: samples,
@@ -5811,6 +5961,7 @@ async fn fifteen_minute_linux_capacity_smoke_exercises_mixed_runtime_traffic() {
     );
     let artifact_directory = capacity_artifact_directory();
     let temporary_root = TempDir::new().expect("capacity smoke root must be creatable");
+    let state_directory = temporary_root.path().join("capacity-state");
     let mut configuration = short_capacity_configuration(temporary_root.path());
     const SMOKE_FRAME_BYTES: u64 = 640 * 480;
     const SMOKE_RESERVATION_BYTES: u64 = 1024 * 1024;
@@ -5872,6 +6023,9 @@ async fn fifteen_minute_linux_capacity_smoke_exercises_mixed_runtime_traffic() {
             apps,
             events,
             component_events: core.events(),
+            metrics: Arc::new(RecordingMetrics::default()),
+            // A standalone/HOST capacity runtime is an MQTT transport.
+            transport: edgecommons::platform::Transport::Mqtt,
             readiness: RuntimeReadiness::noop(),
             backend_context: BackendRuntimeContext::new(
                 None,
@@ -5889,11 +6043,20 @@ async fn fifteen_minute_linux_capacity_smoke_exercises_mixed_runtime_traffic() {
     let started = Instant::now();
     let deadline = started + Duration::from_secs(duration_seconds);
     let mut ticks = tokio::time::interval(Duration::from_secs(1));
-    let mut samples = vec![capacity_sample(&runtime, "soak-roster-online", started)];
+    let mut samples = vec![capacity_sample(&runtime, "soak-roster-online", started, &state_directory)];
     let mut timing = BTreeMap::<String, Vec<u64>>::new();
     let mut submitted_captures = 0_u64;
     let mut reconnects = 0_u64;
     let mut reloads = 0_u64;
+    // H4 (the part that is reachable in-process): drive more of the runtime than pull-only capture.
+    // Real RTSP/ONVIF/GenICam streaming and the two-box separation are the X1..X6 rig and cannot be
+    // stood up by an in-process SimBackend — but the PTZ safety-stop lane (D2, N13) and the group
+    // scatter/aggregate path (D-CAM-20) are pure runtime, and they should be under load here, not only
+    // in their own focused tests.
+    let mut ptz_moves = 0_u64;
+    let mut group_captures = 0_u64;
+    let mut retention_sweeps = 0_u64;
+    let sweep_cancellation = CancellationToken::new();
     let mut tick = 0_u64;
     while Instant::now() < deadline {
         ticks.tick().await;
@@ -5951,7 +6114,7 @@ async fn fifteen_minute_linux_capacity_smoke_exercises_mixed_runtime_traffic() {
                 )
                 .await,
             );
-            samples.push(capacity_sample(&runtime, "soak-sample", started));
+            samples.push(capacity_sample(&runtime, "soak-sample", started, &state_directory));
         }
         if tick % 60 == 0 {
             runtime
@@ -5970,10 +6133,70 @@ async fn fifteen_minute_linux_capacity_smoke_exercises_mixed_runtime_traffic() {
                 .expect("capacity smoke configuration must remain readable");
             let (apps, events) = capacity_facades(&core, &instance_ids);
             runtime
-                .apply_reloaded_config(replacement, apps, events)
+                .apply_reloaded_config((*replacement).clone(), apps, events)
                 .await
                 .expect("capacity smoke reload must preserve the valid generation");
             reloads = reloads.saturating_add(1);
+        }
+        // H4: a continuous PTZ move with a short mandatory-stop deadline, on a rotating camera. This
+        // is the lane N13 found empty — a commanded move that must be stopped by a timer even if the
+        // requester walks away — and it should be exercised under sustained capture load, not only in
+        // isolation. The sim's PTZ is in-memory, so the interest is the runtime path, not the optics.
+        if tick % 7 == 3 {
+            let _ = immediate_success(
+                router
+                    .dispatch(
+                        "sb/ptz",
+                        command_message(
+                            "sb/ptz",
+                            &format!("soak-move-{tick}"),
+                            json!({
+                                "operation": "continuous",
+                                "instance": target,
+                                "requestId": format!("soak-move-{tick}"),
+                                "velocity": { "pan": 0.4, "tilt": 0.0, "zoom": 0.0 },
+                                "timeoutMs": 500
+                            }),
+                        ),
+                        deferred.clone(),
+                    )
+                    .await,
+            );
+            ptz_moves = ptz_moves.saturating_add(1);
+        }
+        // H4: a small group capture fans out to several cameras and aggregates one reply, under load.
+        if tick % 90 == 45 {
+            let members = (0..4)
+                .map(|offset| format!("camera-{:04}", 32 + ((tick as usize + offset) % 224)))
+                .collect::<Vec<_>>();
+            let _ = immediate_success(
+                router
+                    .dispatch(
+                        "sb/capture-group-submit",
+                        command_message(
+                            "sb/capture-group-submit",
+                            &format!("soak-group-{tick}"),
+                            json!({
+                                "requestId": format!("soak-group-{tick}"),
+                                "instances": members
+                            }),
+                        ),
+                        deferred.clone(),
+                    )
+                    .await,
+            );
+            group_captures = group_captures.saturating_add(1);
+        }
+        // B1's retention path, driven under load. In a 15-minute window nothing is old enough to be
+        // reclaimed (the window is 72 hours), so this reclaims zero — but it proves the sweep the
+        // review found wired to nothing now runs on the live runtime, repeatedly, alongside the
+        // capture hot path, without erroring, deadlocking, or disturbing the roster.
+        if tick % 120 == 0 {
+            runtime
+                .retention_sweep(chrono::Utc::now().timestamp_millis(), 500, &sweep_cancellation)
+                .await
+                .expect("capacity smoke retention sweep must succeed under load");
+            retention_sweeps = retention_sweeps.saturating_add(1);
         }
     }
     // The final workload tick can deliberately request a reconnect.  Do not label the
@@ -5981,7 +6204,7 @@ async fn fifteen_minute_linux_capacity_smoke_exercises_mixed_runtime_traffic() {
     // full configured roster; otherwise the final report would confuse an in-progress
     // reconnect with lost capacity.
     let _ = wait_for_capacity_roster(&runtime).await;
-    samples.push(capacity_sample(&runtime, "soak-complete", started));
+    samples.push(capacity_sample(&runtime, "soak-complete", started, &state_directory));
     let mut scheduled_jobs_by_camera = BTreeMap::new();
     for instance in instance_ids.iter().take(8) {
         let scheduled_jobs = runtime
@@ -6015,6 +6238,92 @@ async fn fifteen_minute_linux_capacity_smoke_exercises_mixed_runtime_traffic() {
         "15-minute smoke omitted reconnect traffic"
     );
     assert!(reloads >= 4, "15-minute smoke omitted reload traffic");
+    assert!(ptz_moves >= 60, "15-minute smoke omitted PTZ safety-lane traffic");
+    assert!(group_captures >= 5, "15-minute smoke omitted group-capture traffic");
+    assert!(retention_sweeps >= 5, "15-minute smoke omitted retention sweeps");
+
+    // ---- H5: what a single before/after RSS delta cannot see -------------------------------------
+    //
+    // The old harness gated exactly one memory number: the idle-startup RSS delta. It could not tell a
+    // runtime that leaks a little per capture from one that is steady, could not see the durable store
+    // growing without bound (B1), and could not see a poll storm burning CPU (D1/B6). These are the
+    // three growth-over-time gates that close that gap. Each is generous enough not to be flaky and
+    // tight enough that the regression it names would move it.
+
+    // (1) Resident memory must not RUN AWAY. Compare an early steady window against the run's late
+    //     peak. This is a coarse guard by nature — fifteen minutes is too short to separate a slow
+    //     leak from allocator retention and reload churn, and trying to gate that finely is how a soak
+    //     smoke becomes flaky. So the bound is deliberately generous: 256 MiB of growth over the run
+    //     is not a leak worth chasing, but the unbounded, monotonic climb that a real leak or a wired-
+    //     to-nothing cleanup produces sails past it. The sharp per-record signal lives in the catalog
+    //     gate below; this one only has to catch a runaway.
+    const RSS_RUNAWAY_BOUND_BYTES: u64 = 256 * 1024 * 1024;
+    let steady_rss: Vec<u64> = samples
+        .iter()
+        .filter(|sample| sample.elapsed_millis >= 60_000 && sample.elapsed_millis <= 180_000)
+        .filter_map(|sample| sample.process.rss_bytes)
+        .collect();
+    let late_rss_peak = samples
+        .iter()
+        .filter(|sample| sample.elapsed_millis >= 180_000)
+        .filter_map(|sample| sample.process.rss_bytes)
+        .max();
+    let rss_growth_bound_bytes = RSS_RUNAWAY_BOUND_BYTES;
+    let (rss_floor, rss_peak, rss_growth_bytes) = match (steady_rss.iter().min(), late_rss_peak) {
+        (Some(&floor), Some(peak)) => {
+            let growth = peak.saturating_sub(floor);
+            assert!(
+                growth <= rss_growth_bound_bytes,
+                "resident memory grew {growth} bytes from its steady floor of {floor} to a late peak of {peak}; \
+                 a 256-camera roster at rest must stay within {rss_growth_bound_bytes} bytes of itself over the run"
+            );
+            (floor, peak, growth)
+        }
+        _ => panic!("15-minute smoke must sample RSS across an early-steady and a late window"),
+    };
+
+    // (2) CPU must not be pegged. Total CPU time over the wall clock is utilization; a runtime that has
+    //     regressed into a busy-wait across its eight worker threads would show several cores' worth.
+    //     A mostly-idle-between-captures 256-camera smoke sits well under one core; four is a generous
+    //     ceiling that still catches a poll storm.
+    let cpu_series: Vec<u64> = samples
+        .iter()
+        .filter_map(|sample| sample.process.cpu_micros)
+        .collect();
+    let (cpu_start, cpu_end) = (
+        *cpu_series.first().expect("CPU must be sampled at the start"),
+        *cpu_series.last().expect("CPU must be sampled at the end"),
+    );
+    let cpu_used_micros = cpu_end.saturating_sub(cpu_start);
+    let wall_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX).max(1);
+    let cpu_utilization_millicores = cpu_used_micros.saturating_mul(1_000) / wall_micros;
+    assert!(
+        cpu_utilization_millicores <= 4_000,
+        "the smoke averaged {cpu_utilization_millicores} millicores of CPU over its run; a mostly-idle \
+         256-camera roster pegged near or above four full cores is the signature of a poll storm"
+    );
+
+    // (3) The durable store's per-record cost must be bounded. This is the gate the review said the
+    //     harness lacked for B1: not just that retention is wired (it is, and it swept above), but that
+    //     a capture's durable footprint stays small. A regression that reattached a fat per-capture
+    //     payload -- the ~5 KB outbox envelope was exactly this -- would blow the bytes-per-record.
+    let job_state_counts = runtime
+        .catalog
+        .count_jobs_by_state(None, Vec::new())
+        .await
+        .expect("capacity smoke must be able to count durable jobs");
+    let durable_records: u64 = job_state_counts.values().copied().sum();
+    let catalog_bytes = catalog_disk_bytes(&state_directory)
+        .expect("capacity smoke must be able to stat the catalog on disk");
+    assert!(durable_records > 0, "the smoke must have written durable jobs");
+    let bytes_per_record = catalog_bytes / durable_records;
+    const CATALOG_BYTES_PER_RECORD_CEILING: u64 = 16 * 1024;
+    assert!(
+        bytes_per_record <= CATALOG_BYTES_PER_RECORD_CEILING,
+        "the catalog holds {catalog_bytes} bytes across {durable_records} durable jobs -- \
+         {bytes_per_record} bytes each, over the {CATALOG_BYTES_PER_RECORD_CEILING}-byte ceiling. A \
+         capture's durable cost has blown up; this is the shape B1 warned about."
+    );
 
     router.begin_shutdown();
     runtime.shutdown().await;
@@ -6034,9 +6343,30 @@ async fn fifteen_minute_linux_capacity_smoke_exercises_mixed_runtime_traffic() {
             "submittedCaptures": submitted_captures,
             "reconnects": reconnects,
             "reloads": reloads,
+            "ptzMoves": ptz_moves,
+            "groupCaptures": group_captures,
+            "retentionSweeps": retention_sweeps,
+            "residentMemory": {
+                "steadyFloorBytes": rss_floor,
+                "latePeakBytes": rss_peak,
+                "growthBytes": rss_growth_bytes,
+                "growthBoundBytes": rss_growth_bound_bytes
+            },
+            "cpu": {
+                "usedMicros": cpu_used_micros,
+                "wallMicros": wall_micros,
+                "utilizationMillicores": cpu_utilization_millicores,
+                "utilizationCeilingMillicores": 4_000
+            },
+            "catalog": {
+                "diskBytes": catalog_bytes,
+                "durableRecords": durable_records,
+                "bytesPerRecord": bytes_per_record,
+                "bytesPerRecordCeiling": CATALOG_BYTES_PER_RECORD_CEILING
+            },
             "commandLatency": command_latency,
             "resourceSamples": samples,
-            "omittedFromThisSmoke": ["24-hour execution", "10,000-job completion target", "broker-outage recovery", "encoder/writer saturation", "Core ping timing", "physical cameras"]
+            "omittedFromThisSmoke": ["24-hour execution", "10,000-job completion target", "broker-outage recovery", "encoder/writer saturation", "Core ping timing", "physical cameras", "real RTSP/ONVIF/GenICam streaming and the two-box fleet (X1-X6)"]
         }),
     );
 }

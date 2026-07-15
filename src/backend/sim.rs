@@ -145,55 +145,75 @@ impl SimSession {
         period.is_some_and(|period| ordinal % period == 0)
     }
 
-    fn frame_bytes(&self, ordinal: u64, limit: u64) -> Result<Vec<u8>> {
-        let frame = &self.config.frame;
-        let raw_format = if frame.pixel_format == PixelFormat::Jpeg {
-            PixelFormat::Rgb8
-        } else {
-            frame.pixel_format
-        };
-        let expected = raw_format
-            .uncompressed_len(frame.width, frame.height)
-            .ok_or_else(|| {
-                CameraError::rejected(
-                    ErrorCode::UnsupportedPixelFormat,
-                    "unsupported simulator source format",
-                )
-            })?;
-        if expected > limit || usize::try_from(expected).is_err() {
-            return Err(CameraError::rejected(
-                ErrorCode::ResourceLimit,
-                "simulated frame exceeds the accepted maximum",
-            ));
+    /// The owned inputs a synthesis needs, so it can run on a blocking thread with no borrow of `self`.
+    fn frame_recipe(&self) -> FrameRecipe {
+        FrameRecipe {
+            frame: self.config.frame.clone(),
+            seed: self.config.seed.unwrap_or_else(|| stable_seed(&self.id)),
         }
-        let mut bytes = vec![0_u8; expected as usize];
-        fill_pattern(
-            &mut bytes,
-            frame.width,
-            frame.height,
-            raw_format,
-            frame.pattern,
-            self.config.seed.unwrap_or_else(|| stable_seed(&self.id)),
-            ordinal,
-        );
-        if frame.pixel_format != PixelFormat::Jpeg {
-            return Ok(bytes);
-        }
-        let mut jpeg = Vec::new();
-        JpegEncoder::new_with_quality(Cursor::new(&mut jpeg), 90)
-            .encode(&bytes, frame.width, frame.height, ExtendedColorType::Rgb8)
-            .map_err(|error| CameraError::Backend {
-                backend: "sim",
-                message: format!("JPEG generation failed: {error}"),
-            })?;
-        if jpeg.len() as u64 > limit {
-            return Err(CameraError::rejected(
-                ErrorCode::ResourceLimit,
-                "simulated JPEG exceeds the accepted maximum",
-            ));
-        }
-        Ok(jpeg)
     }
+}
+
+/// Everything a frame synthesis needs, owned — so it crosses a `spawn_blocking` boundary.
+#[derive(Clone)]
+struct FrameRecipe {
+    frame: crate::config::SimFrameConfig,
+    seed: u64,
+}
+
+/// Synthesize one frame's bytes. CPU-bound, and deliberately a free function taking OWNED inputs:
+/// a real camera does not fill megapixels on the async reactor, and neither should the simulator that
+/// stands in for a fleet of them. `capture()` runs this on a blocking thread so the runtime being
+/// measured is never the thread doing the pixel work — that pollution was review finding H3, where the
+/// harness synthesized every frame on the very reactor whose scheduling latency it was measuring.
+fn synthesize_frame(recipe: &FrameRecipe, ordinal: u64, limit: u64) -> Result<Vec<u8>> {
+    let frame = &recipe.frame;
+    let raw_format = if frame.pixel_format == PixelFormat::Jpeg {
+        PixelFormat::Rgb8
+    } else {
+        frame.pixel_format
+    };
+    let expected = raw_format
+        .uncompressed_len(frame.width, frame.height)
+        .ok_or_else(|| {
+            CameraError::rejected(
+                ErrorCode::UnsupportedPixelFormat,
+                "unsupported simulator source format",
+            )
+        })?;
+    if expected > limit || usize::try_from(expected).is_err() {
+        return Err(CameraError::rejected(
+            ErrorCode::ResourceLimit,
+            "simulated frame exceeds the accepted maximum",
+        ));
+    }
+    let mut bytes = vec![0_u8; expected as usize];
+    fill_pattern(
+        &mut bytes,
+        frame.width,
+        frame.height,
+        raw_format,
+        frame.pattern,
+        recipe.seed,
+        ordinal,
+    );
+    if frame.pixel_format != PixelFormat::Jpeg {
+        return Ok(bytes);
+    }
+    let mut jpeg = Vec::new();
+    JpegEncoder::new_with_quality(Cursor::new(&mut jpeg), 90)
+        .encode(&bytes, frame.width, frame.height, ExtendedColorType::Rgb8)
+        .map_err(|error| CameraError::Backend {
+            backend: "sim",
+            message: format!("JPEG generation failed: {error}"),
+        })?;
+    if jpeg.len() as u64 > limit {
+        return Err(CameraError::rejected(
+            ErrorCode::ResourceLimit,
+            "simulated JPEG exceeds the accepted maximum",
+        ));
+    }
+    Ok(jpeg)
 }
 
 #[async_trait]
@@ -221,6 +241,15 @@ impl CameraSession for SimSession {
         self.ensure_open()?;
         self.capture_ordinal = self.capture_ordinal.saturating_add(1);
         let ordinal = self.capture_ordinal;
+        // A capture cancelled before it begins allocates nothing. This mirrors a real backend that
+        // never opens the socket, and it keeps the "prevents frame allocation" contract even now that
+        // synthesis happens up front rather than after the latency wait.
+        if request.cancellation.is_cancelled() {
+            return Err(CameraError::rejected(
+                ErrorCode::CaptureCancelled,
+                "sim capture cancelled",
+            ));
+        }
         if self
             .config
             .faults
@@ -233,26 +262,44 @@ impl CameraSession for SimSession {
                 "simulated disconnect threshold reached",
             ));
         }
-        let delay = Duration::from_millis(self.config.capture_delay_ms);
-        tokio::select! {
-            () = request.cancellation.cancelled() => {
-                return Err(CameraError::rejected(ErrorCode::CaptureCancelled, "sim capture cancelled"));
-            }
-            () = tokio::time::sleep(delay) => {}
-        }
         if Self::should_fire(self.config.faults.fail_every_nth_capture, ordinal) {
             return Err(CameraError::Backend {
                 backend: "sim",
                 message: "configured deterministic capture failure".to_string(),
             });
         }
-        let mut bytes = self.frame_bytes(ordinal, request.maximum_frame_bytes)?;
+        // H3: synthesize OFF the reactor. `spawn_blocking` runs the pixel fill (and any JPEG encode)
+        // on the blocking pool, so a fleet of 256 simulated cameras filling megapixels never blocks
+        // the async worker threads whose scheduling and dispatch latency the capacity harness exists
+        // to measure.
+        let recipe = self.frame_recipe();
+        let limit = request.maximum_frame_bytes;
+        let mut bytes = tokio::task::spawn_blocking(move || synthesize_frame(&recipe, ordinal, limit))
+            .await
+            .map_err(|error| CameraError::Backend {
+                backend: "sim",
+                message: format!("simulated frame synthesis task failed: {error}"),
+            })??;
         if Self::should_fire(self.config.faults.incomplete_every_nth_capture, ordinal) {
             bytes.truncate(bytes.len().saturating_sub(1));
             return Err(CameraError::Backend {
                 backend: "sim",
                 message: "configured deterministic incomplete frame".to_string(),
             });
+        }
+        // H2: model the sensor/transfer latency while HOLDING the real frame buffer. The old harness
+        // held its capture permit on a bare `sleep` that touched no memory, so "32 concurrent 8MP
+        // captures" was 32 accounting reservations over an idle process — the peak that 32 real frame
+        // buffers actually cost was never on the heap at once. Now the bytes are live for the whole
+        // latency window, so concurrency is measured in resident pages, not just in a counter.
+        let delay = Duration::from_millis(self.config.capture_delay_ms);
+        if !delay.is_zero() {
+            tokio::select! {
+                () = request.cancellation.cancelled() => {
+                    return Err(CameraError::rejected(ErrorCode::CaptureCancelled, "sim capture cancelled"));
+                }
+                () = tokio::time::sleep(delay) => {}
+            }
         }
         let now = Utc::now();
         Ok(CaptureFrame {

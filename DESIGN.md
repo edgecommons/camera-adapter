@@ -2329,9 +2329,21 @@ ONVIF/RTSP:
 
 The current capacity-validation slice is a short, repeatable Linux simulator proof of 1,024 configured
 entries, 256 connected idle sessions, and 32 concurrent 8-megapixel captures with resource and process
-samples. A separately recorded, 15-minute partial simulator smoke follows that proof with schedules,
-commands, PTZ/status, reconnects, and valid reloads using small frames. Neither is a long-duration
-performance result or a replacement for the deferred soak below.
+samples. The 32 concurrent captures now hold 32 real frame buffers at once: the SimBackend synthesizes
+each frame off the async reactor (`spawn_blocking`) and holds the bytes across a realistic transfer
+latency, so "32 concurrent" is asserted in resident pages — the peak must add at least half of the
+combined 8-megapixel footprint — rather than being read off an admission counter while the process sits
+idle on a sleep.
+
+A separately recorded, 15-minute partial simulator smoke follows that proof with schedules, commands,
+PTZ/status, reconnects, and valid reloads using small frames. Beyond that pull-only traffic it drives
+the PTZ safety-stop lane and the group scatter/aggregate path under sustained load and runs retention
+sweeps on the live runtime, and it enforces three growth-over-time gates a single before/after RSS delta
+cannot see: resident memory does not run away over the run, CPU is not pegged (no poll storm), and the
+catalog's per-record on-disk footprint stays bounded (the shape a durable-cost regression such as B1
+would move). Neither is a long-duration performance result or a replacement for the deferred soak below,
+and neither exercises real RTSP/ONVIF/GenICam streaming or a two-machine fleet — that separation is the
+`X1`–`X6` two-box rig, which a single in-process SimBackend cannot stand up.
 
 The following full-soak scenario remains part of the design, but its 24-hour execution is explicitly
 deferred to a later validation phase and is not a current gate:
