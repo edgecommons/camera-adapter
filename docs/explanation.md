@@ -49,5 +49,5 @@ catalog remain the authority on what was captured.
 
 `sim` is deterministic and supports logic testing. `onvif-rtsp` uses strict ONVIF service/profile selection
 and can use GStreamer RTSP extraction when compiled. `genicam-aravis` is an optional Linux-native backend.
-Simulator evidence establishes the implemented protocol paths; it does not certify physical models, NICs,
-USB topologies, cameras, or deployment environments.
+These protocol paths are implemented in software; physical camera models, NICs, USB topologies, and
+deployment environments are not certified.

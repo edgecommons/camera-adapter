@@ -21,7 +21,7 @@ interop are not covered by it. Kubernetes deployment, file-replicator and bottli
 deployment threat review, and combined native-feature coverage gates remain.
 Physical-camera validation is waived for this project because no hardware is available; the component must
 not be represented as hardware-certified based on simulator results. The live status is the
-[acceptance matrix](docs/acceptance-matrix.md).
+[acceptance matrix](ACCEPTANCE-MATRIX.md).
 
 Configured output and state roots are monitored against the output free-space floors. A low or
 unreadable root raises the stateful critical `storage-low` alarm and rejects new captures with

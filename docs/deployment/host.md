@@ -139,8 +139,7 @@ icacls $root /grant:r `
 ```
 
 Keep the ownership/ACL record with the deployment. Windows GenICam and native GStreamer packaging
-are not claimed as release support. Physical-camera validation is waived for this project because no
-hardware is available; that waiver does not establish Windows service or hardware compatibility.
+are not supported. Physical cameras are not supported on Windows.
 
 ## Docker
 

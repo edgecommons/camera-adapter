@@ -6,7 +6,7 @@ another, and the adapter discovers and captures it over **real GVCP/GVSP multica
 
 Two rigs live here: `run-genicam-l2.sh` (GigE Vision, below) and `run-rtsp-onvif-l2.sh` (ONVIF/RTSP -- reaches B3/D3/R1/B6 with N warm streams; see the note in that script on why WS-Discovery/T1 needs a fleet host on the physical LAN, not a bridged VM).
 
-The GigE rig exists to close the gap `docs/acceptance-matrix.md` names outright — *"not L2, cross-container/cross-host
+The GigE rig exists to close the gap `ACCEPTANCE-MATRIX.md` names outright — *"not L2, cross-container/cross-host
 GigE, physical-camera evidence"* — for the GenICam backend, which no in-process or same-container test can
 reach: cross-host discovery, the bounded native connect (review finding **D4**), and buffer acquisition
 against a camera that is genuinely a different host at the far end of a wire.

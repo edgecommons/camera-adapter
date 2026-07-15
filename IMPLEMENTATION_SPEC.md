@@ -45,7 +45,7 @@ design. See `DESIGN.md` §§23.8–26, lines 2273–2347.
 
 | ID | Binding resolution | Design trace |
 |---|---|---|
-| `R-01` | Use `ecv1/{device}/camera-adapter/main/cmd/sb/{verb}` and select the camera with body `instance`. Do not implement per-instance command inboxes for this delivery. Update the core southbound design and shipped reference documentation when the behavior ships. | D-CAM-18 and §§12.1, 13, 26, 27: lines 130–132, 932–958, 1071–1106, 2321–2324, 2345–2348 |
+| `R-01` | Use `ecv1/{device}/camera-adapter/main/cmd/sb/{verb}` and select the camera with body `instance` for this delivery. Command addressing is resolved by core decision D-U28 (optional-instance UNS addressing); the pending migration target is instance-scope `.../{instance}/cmd/sb/{verb}` + component/fleet `.../cmd/sb/{verb}`, applied when the D-U28 rollout reaches this adapter (which updates the core southbound design and reference docs). | D-CAM-18 and §§12.1, 13, 26, 27 |
 | `R-02` | `backend.type = "sim"` is a supported, configurable production backend in addition to `genicam-aravis` and `onvif-rtsp`. | §§6.2, 10.9: lines 227–263, 754–765 |
 | `R-03` | ONVIF v1 binds with exactly one of `deviceServiceUrl` or `selector.endpointReference`. Endpoint-reference binding is resolved through bounded WS-Discovery. | §10.12: lines 800–819 |
 | `R-04` | Initial startup reports and skips invalid instances if at least one enabled valid instance remains. A reload candidate is all-or-nothing: any invalid instance rejects the candidate and leaves the complete prior configuration running. | §§10.5, 20.1: lines 690–698, 1934–1945 |

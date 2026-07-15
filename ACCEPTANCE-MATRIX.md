@@ -49,7 +49,7 @@ cargo +1.90.0 build --release --no-default-features --features greengrass,onvif
 ```
 
 No physical camera is represented as passing. Physical-camera validation is waived because hardware is not
-available; the [compatibility register](reference/compatibility.md) records the resulting exclusion from
+available; the [compatibility register](docs/reference/compatibility.md) records the resulting exclusion from
 hardware-compatibility claims.
 
 ## Repeatable capacity command

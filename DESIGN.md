@@ -132,7 +132,7 @@ The words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are no
 | D-CAM-15 | PTZ | Common normalized command contract mapped through backend capabilities | ONVIF provides the initial PTZ implementation; unsupported backends return a capability error. |
 | D-CAM-16 | Fleet safety | Layered bounded queues and byte-based admission | Camera count alone is not a safe memory or bandwidth bound. |
 | D-CAM-17 | Delivery | Integrate with `file-replicator` through disk and metadata, not code coupling | Keeps acquisition and delivery independently deployable. |
-| D-CAM-18 | Command addressing | Use the shipped component `main` inbox and select camera `instance` in the body | Matches the shipped CommandInbox contract and both shipped adapters. This deliberately proposes to supersede the approved-but-unshipped Phase 5 per-instance `cmd/sb/*` addressing in `core/docs/SOUTHBOUND.md` §2.2; accepting or rejecting that renegotiation is an explicit review decision (§27). |
+| D-CAM-18 | Command addressing | Use the shipped component `main` inbox and select camera `instance` in the body | Matches the shipped CommandInbox contract and both shipped adapters. **Resolved by core decision D-U28** (optional-instance UNS addressing: instance present ⇒ instance-scoped, absent ⇒ component/global-scoped, retiring the `main` sentinel), which supersedes the Phase 5 per-instance `cmd/sb/*` addressing in `core/docs/SOUTHBOUND.md` §2.2. The adapter currently ships the `main`-inbox + body-`instance` behavior; migration to optional-instance topic addressing (instance-scope `.../{instance}/cmd/sb/{verb}`, component/fleet `.../cmd/sb/{verb}`) is tracked under the D-U28 rollout, which also updates `core/docs/SOUTHBOUND.md`. |
 | D-CAM-19 | Outbox acknowledgement | Withdrawn | There is no outbox and no acknowledgement to wait for. Terminal announcements publish once, best effort. Durable, acknowledged delivery is a generic messaging concern and belongs in the EdgeCommons messaging service as an opt-in augmentation across all four languages, available to any component, rather than being reimplemented inside one. |
 | D-CAM-20 | Group capture | `sb/capture-group` fans one request out as independent per-camera capture jobs sharing an adapter-generated `captureGroupId`; the single deferred reply aggregates every member's terminal result | One operator action often needs an evidence set from several cameras. Aggregation fits the shipped single-reply command model plus the D-CAM-10 deferred reply; a core scatter-gather exchange (one request, multiple replies) is not required for v1 and is raised as a core question (§27). |
 | D-CAM-21 | Capture thumbnail | Opt-in per capture profile (`thumbnail.size` = `small` 160px / `medium` 320px / `large` 640px, longest edge, aspect preserved, never upscaled); JPEG; carried in the ANNOUNCEMENT only, as native protobuf bytes; never in the durable record | A consumer on the bus can see the picture without fetching the file. It is bounded by the longest edge because cameras are 4:3 and 16:9 and a fixed W×H would distort or letterbox. It is announcement-only because the terminal body IS the committed document — the catalog's `terminal_result`, the metadata sidecar verbatim, and the body group replies embed — and a lossy, derived, disposable preview must not be durably stored per capture (D-CAM-13). It carries NO digest: a thumbnail is a lossy re-encode and a `sha256` beside the artifact's would invite a consumer to believe it is verifiable against it. A thumbnail that cannot be rendered, or will not fit the byte ceiling, is dropped and counted — it never fails a capture. The ceiling is the TRANSPORT's, resolved at startup: the Greengrass IPC client encodes a whole message into a static 10,000-byte buffer, so IPC carries `small` only (6 KiB budget) and a larger configured size is clamped down rather than rejected — the same config ships to Greengrass and to Kubernetes; MQTT carries all three (60 KiB budget, bounded by the library's 64 KiB binary-value cap, not by the broker). And a preview NEVER outranks the result: if an announcement carrying one cannot be published, the result is announced again without it. |
@@ -968,14 +968,15 @@ ecv1/{device}/{component}/{instance}/{class}[/{channel...}]
 Commands use at most two channel tokens (`sb/{verb}`), so they remain valid when `topic.includeRoot`
 reduces the channel budget.
 
-The `main` inbox plus body `instance` rule is deliberate. It follows the shipped command-inbox behavior
-and both shipped adapters' messaging contracts. `core/docs/SOUTHBOUND.md` §2.2 documents a different
-target: per-instance `cmd/sb/*` addressing, explicitly bannered there as approved Phase 5 design that is
-not yet built. This design proposes to keep the shipped `main`-inbox pattern and supersede that
-per-instance addressing rather than implement it. That is a renegotiation of an accepted core design —
-raised as an explicit review decision in §27, not a documentation defect. If the review instead upholds
-Phase 5 per-instance addressing, this section and §13 must be reworked before implementation, and
-whichever way the decision goes, `core/docs/SOUTHBOUND.md` is updated to record it.
+The `main` inbox plus body `instance` rule follows the shipped command-inbox behavior and both shipped
+adapters' messaging contracts. This is resolved at the org level by core decision **D-U28**, which adopts
+an optional-instance UNS grammar: the instance token is present for instance-scoped traffic and absent
+for component/global-scoped traffic, retiring the `main` sentinel. Under D-U28 the adapter's commands
+become instance-scope `ecv1/{device}/camera-adapter/{instance}/cmd/sb/{verb}` and component/fleet
+`ecv1/{device}/camera-adapter/cmd/sb/{verb}`, superseding both the `cmd/sb/*` per-instance target formerly
+in `core/docs/SOUTHBOUND.md` §2.2 and this adapter's body-`instance` selection. The adapter currently
+ships the `main`-inbox + body-`instance` behavior; this section and §13 are reworked when the D-U28
+rollout reaches the camera adapter, which also updates `core/docs/SOUTHBOUND.md`.
 
 ### 12.2 Core prerequisites
 
@@ -2461,8 +2462,9 @@ Reviewers should explicitly decide:
 - [ ] Deferred `sb/capture` and immediate `sb/capture-submit` are both required.
 - [ ] Software-level group capture (`sb/capture-group`) scope, aggregated-reply semantics, and its
   explicit no-synchronization claim are correct.
-- [ ] Keeping the shipped `main`-inbox command addressing — and thereby superseding the approved
-  Phase 5 per-instance `cmd/sb/*` target in `core/docs/SOUTHBOUND.md` — is accepted (see §27).
+- [x] Command addressing is resolved by core decision D-U28 (optional-instance UNS addressing). The
+  adapter ships the `main`-inbox + body-`instance` behavior today and migrates to optional-instance
+  topic addressing under the D-U28 rollout (see §27).
 - [ ] Four-language deferred-command, correlated-`app()`, and acknowledgement-capable-publish core
   additions are accepted plumbing.
 - [ ] Command names, bodies, error codes, and PTZ normalized coordinates are acceptable.
@@ -2486,10 +2488,12 @@ Reviewers should explicitly decide:
 6. Should PTZ preset mutation stay disabled by default as proposed?
 7. Physical-camera validation is waived for this project because no hardware is available; a future
    hardware-certified release must select models for the compatibility matrix.
-8. Command addressing: should the org retire the approved-but-unshipped Phase 5 per-instance
-   `cmd/sb/*` addressing (`core/docs/SOUTHBOUND.md` §2.2) in favor of the shipped
-   `main`-inbox-plus-body-`instance` pattern this design uses, or must this adapter adopt per-instance
-   addressing when Phase 5 ships? Either decision updates `core/docs/SOUTHBOUND.md`.
+8. Command addressing — **resolved.** Core decision D-U28 adopts an optional-instance UNS grammar
+   (instance present ⇒ instance-scoped, absent ⇒ component/global-scoped, retiring the `main` sentinel),
+   superseding both the Phase 5 per-instance `cmd/sb/*` target in `core/docs/SOUTHBOUND.md` §2.2 and this
+   adapter's body-`instance` selection. The adapter ships the `main`-inbox + body-`instance` behavior
+   today; it migrates to optional-instance topic addressing under the D-U28 rollout, which updates
+   `core/docs/SOUTHBOUND.md`.
 9. Should the core add a scatter-gather message exchange pattern — one request producing multiple
    correlated replies or a streamed reply set? v1 group capture deliberately aggregates member results
    into one reply within the existing single-reply command model. A core pattern would also serve other
@@ -2504,8 +2508,8 @@ Reviewers should explicitly decide:
 This design is grounded in the current EdgeCommons contracts:
 
 - `core/docs/SOUTHBOUND.md` for adapter configuration, command-family, and health conventions; its §2.2
-  per-instance command addressing is approved-but-unshipped Phase 5 design that §12.1 of this document
-  proposes to supersede (§27 question 8);
+  per-instance command addressing is superseded by core decision D-U28 (optional-instance UNS addressing;
+  see §12.1 and §27 question 8);
 - `core/docs/platform/UNS-CANONICAL-DESIGN.md` for topic, identity, request/reply, guard, and timeout rules;
 - `file-replicator/docs/reference/messaging-interface.md` for current command/event usage and durable-file
   integration precedent;

@@ -34,14 +34,14 @@ written.
 
 ## Connect one physical ONVIF camera
 
-Physical models are not yet certified. Before using one, complete the compatibility-register evidence
-for its model, firmware, authentication mode, PTZ behavior, and selected profile. Create durable output
-and state roots as described in the [HOST runbook](deployment/host.md), then replace the simulator
-backend with one explicit `onvif-rtsp` instance. Use a whole credential reference, not a password in
-configuration:
+Physical camera models are not certified — validate your specific model's firmware, authentication
+mode, PTZ behavior, and selected profile before relying on it. Create durable output and state roots
+as described in the [HOST runbook](deployment/host.md), then replace the simulator backend with one
+explicit `onvif-rtsp` instance. Use a whole credential reference, not a password in configuration:
 
 ```json
 {
+  "type": "onvif-rtsp",
   "credentials": { "$secret": "cameras/loading-dock" },
   "deviceServiceUrl": "https://camera.example/onvif/device_service",
   "mediaProfile": "main",
