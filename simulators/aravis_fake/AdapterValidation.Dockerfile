@@ -24,6 +24,7 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
       > /etc/apt/sources.list \
     && apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install -y --no-install-recommends build-essential libglib2.0-dev libusb-1.0-0-dev libxml2-dev pkg-config \
+      git ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && rustup toolchain install "${LLVM_COV_TOOLCHAIN}" --profile minimal --component llvm-tools-preview \
     && rustup toolchain install "${GREENGRASS_TOOLCHAIN}" --profile minimal \
