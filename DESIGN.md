@@ -958,25 +958,22 @@ ecv1/{device}/{component}/{instance}/{class}[/{channel...}]
 ```
 
 - Component token: explicit stable `component.token = "camera-adapter"` (first-party lower-kebab form).
-- Command inbox: `ecv1/{device}/camera-adapter/main/cmd/#`.
+- Command inbox: `ecv1/{device}/camera-adapter/cmd/#`.
 - Camera terminal metadata: `ecv1/{device}/camera-adapter/{cameraId}/app/image/{captured|failed|cancelled}`.
 - Camera operator events and alarms: `ecv1/{device}/camera-adapter/{cameraId}/evt/{severity}/{type}`.
-- Component operator events: `ecv1/{device}/camera-adapter/main/evt/{severity}/{type}`.
+- Component operator events: `ecv1/{device}/camera-adapter/evt/{severity}/{type}`.
 - Heartbeat, configuration, metrics, and log streaming use the library-owned `state`, `cfg`,
   `metric`, and `log` classes.
 
 Commands use at most two channel tokens (`sb/{verb}`), so they remain valid when `topic.includeRoot`
 reduces the channel budget.
 
-The `main` inbox plus body `instance` rule follows the shipped command-inbox behavior and both shipped
-adapters' messaging contracts. This is resolved at the org level by core decision **D-U28**, which adopts
-an optional-instance UNS grammar: the instance token is present for instance-scoped traffic and absent
-for component/global-scoped traffic, retiring the `main` sentinel. Under D-U28 the adapter's commands
-become instance-scope `ecv1/{device}/camera-adapter/{instance}/cmd/sb/{verb}` and component/fleet
-`ecv1/{device}/camera-adapter/cmd/sb/{verb}`, superseding both the `cmd/sb/*` per-instance target formerly
-in `core/docs/SOUTHBOUND.md` §2.2 and this adapter's body-`instance` selection. The adapter currently
-ships the `main`-inbox + body-`instance` behavior; this section and §13 are reworked when the D-U28
-rollout reaches the camera adapter, which also updates `core/docs/SOUTHBOUND.md`.
+The component command inbox plus body `instance` rule is the camera adapter's messaging contract. Org-level
+core decision **D-U28** defines an optional-instance UNS grammar: the instance token is present for
+instance-scoped traffic and absent for component/global-scoped traffic, and there is no `main` sentinel. The
+camera adapter is single-instance at the component level, so its commands are component-scope
+`ecv1/{device}/camera-adapter/cmd/sb/{verb}`; a specific camera is selected by the body `instance` field,
+not by a per-instance command topic.
 
 ### 12.2 Core prerequisites
 

@@ -30,11 +30,11 @@ ComponentConfiguration:
           resources:
             - "ecv1/*/camera-adapter/*"
         "com.mbreissi.edgecommons.CameraAdapter:subscribe:1":
-          policyDescription: "Subscribes only to the camera adapter main command inbox."
+          policyDescription: "Subscribes only to the camera adapter command inbox."
           operations:
             - "aws.greengrass#SubscribeToTopic"
           resources:
-            - "ecv1/*/camera-adapter/main/cmd/*"
+            - "ecv1/*/camera-adapter/cmd/*"
 Manifests:
   - Platform:
       os: linux

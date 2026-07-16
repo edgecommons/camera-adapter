@@ -27,7 +27,7 @@ CAMERA_ADAPTER_DOCKER_E2E_PORT=1884 \
 cargo test --no-default-features --features standalone --test docker_capture_submit
 ```
 
-The test publishes to `ecv1/NOT_GREENGRASS/camera-adapter/main/cmd/sb/capture-submit` and asserts
+The test publishes to `ecv1/NOT_GREENGRASS/camera-adapter/cmd/sb/capture-submit` and asserts
 that the reply has the same correlation ID, `ok: true`, and a durable `captureId`. Completion is
 reported later as a terminal application message; acceptance never means an image has already been
 written.

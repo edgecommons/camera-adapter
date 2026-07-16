@@ -1,9 +1,9 @@
 # Messaging interface
 
-All commands use the shipped main inbox:
+All commands use the component command inbox:
 
 ```text
-ecv1/{device}/camera-adapter/main/cmd/sb/{verb}
+ecv1/{device}/camera-adapter/cmd/sb/{verb}
 ```
 
 Select a camera with the closed JSON body field `instance`; omit it only when the documented single-camera

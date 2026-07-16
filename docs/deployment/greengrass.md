@@ -51,7 +51,7 @@ output tree only. State must remain inaccessible to other component accounts.
 ## IPC least privilege
 
 The recipe grants local IPC publishing under the component's `ecv1/*/camera-adapter/*` namespace
-and command subscription only under `ecv1/*/camera-adapter/main/cmd/*`. It does not grant MQTT proxy,
+and command subscription only under `ecv1/*/camera-adapter/cmd/*`. It does not grant MQTT proxy,
 shadow, broad file, or cloud permissions. Add a separate, narrow dependency and policy only when a
 concrete deployment needs one; for example, a vault backed by a cloud provider needs its own
 reviewed credential integration.
