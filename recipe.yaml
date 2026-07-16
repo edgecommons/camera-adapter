@@ -35,6 +35,7 @@ ComponentConfiguration:
             - "aws.greengrass#SubscribeToTopic"
           resources:
             - "ecv1/*/camera-adapter/cmd/*"
+            - "ecv1/*/camera-adapter/*/cmd/*"
 Manifests:
   - Platform:
       os: linux
