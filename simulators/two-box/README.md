@@ -45,7 +45,7 @@ camera + broker on the fleet, runs the adapter on the SUT, and verifies real fra
   gige-vision`.
 - The capture **announcement** reaches the broker on the fleet host
   (`ecv1/<thing>/camera-adapter/<cam>/app/image/captured`), and the camera reports `ONLINE` on
-  `main/state`.
+  `state`.
 - The native connect stays **bounded** — no thread runaway from the connect path.
 
 ## What it does NOT establish

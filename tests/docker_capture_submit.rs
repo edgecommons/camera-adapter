@@ -45,7 +45,7 @@ async fn compose_capture_submit_returns_a_correlated_acceptance() {
 
     let device = "NOT_GREENGRASS";
     let reply_topic = format!("camera-adapter-e2e/reply/{}", Uuid::now_v7());
-    let command_topic = format!("ecv1/{device}/{COMPONENT_TOKEN}/main/cmd/sb/capture-submit");
+    let command_topic = format!("ecv1/{device}/{COMPONENT_TOKEN}/cmd/sb/capture-submit");
     let request_id = format!("docker-e2e-{}", Uuid::now_v7());
     let received = Arc::new(Mutex::new(Vec::<Message>::new()));
     let observer = Arc::new(
