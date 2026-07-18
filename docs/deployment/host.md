@@ -139,7 +139,8 @@ icacls $root /grant:r `
 ```
 
 Keep the ownership/ACL record with the deployment. Windows GenICam and native GStreamer packaging
-are not supported. Physical cameras are not supported on Windows.
+are not supported. No physical camera has been validated on Windows; validate your own before relying on
+it.
 
 ## Docker
 

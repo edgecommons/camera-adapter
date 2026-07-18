@@ -71,11 +71,12 @@ of `serial`, `mac`, `deviceId`, or `ip`. An ONVIF backend provides exactly one o
 `selector.endpointReference`, a `mediaProfile`, optional credential/TLS references, and an allowlist for
 snapshot or RTSP URI hosts.
 
-Each named capture profile chooses `passthrough`, `jpeg`, `png`, `tiff`, or `raw`; `jpegQuality` defaults
-to 90. It may override capture mode, offline handling, deadline, frame ceiling, GenICam width/height/
-offset/exposure/gain, and motion interlock. The profile's `captureInterlock` is `reject`, `stop-and-settle`,
-or `allow`. Unsupported Bayer/PFNC input is rejected as `UNSUPPORTED_PIXEL_FORMAT`; raw bytes are never
-mislabeled as RGB.
+Each named capture profile carries a required `output` object whose `encoding` is `passthrough`, `jpeg`,
+`png`, `tiff`, or `raw`; `output.jpegQuality` defaults to 90. Beside `output`, a profile may override
+capture mode, offline handling, deadline, frame ceiling, GenICam width/height/offset/exposure/gain, and
+the motion interlock. The profile's `captureInterlock` is `reject`, `stopAndSettle`, or `allow`.
+Unsupported Bayer/PFNC input is rejected as `UNSUPPORTED_PIXEL_FORMAT`; raw bytes are never mislabeled as
+RGB.
 
 A capture profile may also ask for a thumbnail. It is off unless the profile carries a `thumbnail`
 object:
