@@ -88,6 +88,25 @@ true` to let a *truncated* snapshot fall back to extracting a complete frame fro
 built with the `rtsp` feature and the matching GStreamer runtime packaged. In every case, list only the
 explicit safe hosts in `backend.allowedUriHosts`.
 
+## Capture from a bare-RTSP camera (no ONVIF)
+
+For a camera that has no ONVIF service, use the `rtsp` backend and point it straight at the stream:
+
+```json
+"backend": {
+  "type": "rtsp",
+  "url": "rtsp://line-cam.example:554/stream1",
+  "credentials": { "$secret": "cameras/line" },
+  "allowedUriHosts": ["line-cam.example"]
+}
+```
+
+Put no credentials in the `url` (`rtsp://user:pass@…` is rejected) — supply them as a `$secret`. Use an
+`rtsps://` URL with `tls.ca` / `tls.verifyHostname` for an encrypted camera; plaintext `rtsp://` requires
+`allowInsecure: true`. The only valid `captureMode` is `rtsp-frame`, and the backend has no PTZ, snapshot,
+or discovery. It is built with the `rtsp` feature (which no longer requires `onvif`) plus the GStreamer
+runtime. See the [sample configuration](sample-configurations.md#5-bare-rtsp-camera-no-onvif).
+
 ## Hand completed files to file-replicator
 
 The adapter and [file-replicator](https://docs.edgecommons.mbreissi.com/components/file-replicator/) couple

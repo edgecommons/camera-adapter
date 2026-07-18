@@ -47,9 +47,15 @@ Feature choices are explicit:
 # ONVIF plus native GStreamer RTSP capture (Linux native dependencies required)
 cargo build --release --no-default-features --features standalone,onvif,rtsp
 
+# Bare-RTSP-only capture, without the ONVIF backend (native GStreamer required)
+cargo build --release --no-default-features --features standalone,rtsp
+
 # Linux Aravis GenICam support (Aravis 0.8.36 or newer required)
 cargo build --release --no-default-features --features standalone,onvif,genicam
 ```
+
+The `rtsp` feature no longer implies `onvif`: it builds the standalone `rtsp` backend (a camera addressed
+by a raw `rtsp://`/`rtsps://` URL) and can be enabled with or without `onvif`.
 
 The Rust package declares MSRV 1.85. Use the locked dependency graph; do not update native or
 container dependencies opportunistically while building a deployment image.

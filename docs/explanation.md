@@ -171,6 +171,13 @@ has:
 - **`onvif-rtsp`** does strict ONVIF service and media-profile selection and captures via the snapshot URI;
   when the `rtsp` feature is compiled in, it can also extract a complete frame from the RTSP stream, either
   as a fallback from a bad snapshot or as the required capture mode. It provides the PTZ implementation.
+- **`rtsp`** is a bare-RTSP backend for a camera addressed directly by an `rtsp://`/`rtsps://` URL, with no
+  ONVIF device (built only with the `rtsp` feature — it reuses the ONVIF backend's RTSP engine and trust
+  surface). It captures still frames only and has no PTZ, snapshot, or discovery, because a raw stream URL
+  exposes none of those. Because reachability is inferred from a successful connection, its `connect()`
+  drives the full RTSP `DESCRIBE`/`SETUP` handshake, authentication, and codec check, so an unreachable
+  URL, bad credentials, or an unsupported codec is reported as an offline camera rather than surfacing only
+  at the first capture.
 - **`genicam-aravis`** is an optional Linux-native backend (built only with the `genicam` feature) for GigE
   Vision and USB3 Vision cameras, using a software trigger and buffer acquisition through Aravis.
 
