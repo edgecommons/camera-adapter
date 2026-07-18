@@ -66,10 +66,11 @@ Every instance has `id`, `backend`, `defaultCaptureProfile`, and `captureProfile
 true; disabled instances are retained for configuration validation but do not accept actuation. Optional
 `resourceGroup` applies a shared transport acquisition bound. `schedules` is omitted for command-only use.
 
-`backend.type` is one of `sim`, `onvif-rtsp`, or `genicam-aravis`. A GenICam selector provides exactly one
-of `serial`, `mac`, `deviceId`, or `ip`. An ONVIF backend provides exactly one of `deviceServiceUrl` or
-`selector.endpointReference`, a `mediaProfile`, optional credential/TLS references, and an allowlist for
-snapshot or RTSP URI hosts.
+`backend.type` is one of `sim`, `onvif-rtsp`, `rtsp`, or `genicam-aravis`. A GenICam selector provides
+exactly one of `serial`, `mac`, `deviceId`, or `ip`. An ONVIF backend provides exactly one of
+`deviceServiceUrl` or `selector.endpointReference`, a `mediaProfile`, optional credential/TLS references,
+and an allowlist for snapshot or RTSP URI hosts. A bare-`rtsp` backend takes a single stream `url` and no
+ONVIF fields (see [Backend and schedule fields](#backend-and-schedule-fields)).
 
 Each named capture profile carries a required `output` object whose `encoding` is `passthrough`, `jpeg`,
 `png`, `tiff`, or `raw`; `output.jpegQuality` defaults to 90. Beside `output`, a profile may override
@@ -118,6 +119,18 @@ authority; they do not disable per-connection address validation.
 `sim` accepts optional deterministic `simulatedId`, `seed`, a frame (`width`, `height`, `pixelFormat`,
 `pattern`), `connectDelayMs`, `captureDelayMs` (default 10), PTZ capability switches, and deterministic
 fault counters. It is intended for configured test and development cameras.
+
+`rtsp` is a bare-RTSP backend for a camera addressed directly by an `rtsp://` or `rtsps://` `url`, with no
+ONVIF device. It captures still frames only — `captureMode` is `rtsp-frame`, its single valid value — and
+exposes no PTZ, snapshot, or discovery. The `url` must carry no embedded credentials (`rtsp://user:pass@…`
+is rejected); supply `credentials` as a `$secret` reference for RTSP Basic/Digest auth, and `tls.ca` /
+`tls.verifyHostname` for RTSPS. `allowInsecure` (default false) gates plaintext `rtsp://` and, together with
+`security.allowBasicOverPlaintext`, Basic auth over plaintext. `allowedUriHosts` / `allowedUriCidrs` extend
+endpoint authority beyond the URL's own host without disabling per-connection address validation.
+`rtspSessionPolicy` (`on-demand` default, or `warm`) and `maxFrameBytes` (64 MiB default; must not exceed
+`limits.maxInFlightBytes`) behave as on the ONVIF RTSP path. `authenticationMode` is `auto` (default),
+`basic`, or `http-digest`; `wsse-digest` is ONVIF-only and rejected. It is compiled only with the native
+`rtsp` feature.
 
 `genicam-aravis` accepts a single selector, `transport` (`auto`, `gige-vision`, or `usb3-vision`), optional
 host `interface`, `packetSize`, `packetDelayNs`, `bufferCount`, and allowlisted `featureOverrides`. It is

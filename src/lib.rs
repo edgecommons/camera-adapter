@@ -12,7 +12,7 @@ pub mod backend;
 pub mod catalog;
 pub mod commands;
 pub mod config;
-#[cfg(feature = "onvif")]
+#[cfg(any(feature = "onvif", feature = "rtsp"))]
 pub mod credential_provider;
 pub mod dispatch;
 pub mod encoding;

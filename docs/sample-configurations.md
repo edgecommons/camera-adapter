@@ -28,11 +28,12 @@ This page is organized as:
   `sim` backend: command-only, then scheduled.
 - **[§3](#3-onvif-snapshot)**–**[§4](#4-onvif-with-rtsp-fallback)** — ONVIF network cameras: plain snapshot,
   then snapshot with RTSP fallback.
-- **[§5](#5-gige-vision-genicam)**–**[§6](#6-usb3-vision-genicam)** — GenICam machine-vision cameras over
+- **[§5](#5-bare-rtsp-camera-no-onvif)** — a camera addressed by a raw RTSP URL, with no ONVIF.
+- **[§6](#6-gige-vision-genicam)**–**[§7](#7-usb3-vision-genicam)** — GenICam machine-vision cameras over
   GigE Vision and USB3 Vision.
-- **[§7](#7-ptz-policy-on-a-camera)** — enabling PTZ safely on a camera.
-- **[§8](#8-a-group-schedule)** — capturing several cameras together on a cron.
-- **[§9](#9-a-thumbnail-preview-on-the-bus)** — attaching a preview to the published result.
+- **[§8](#8-ptz-policy-on-a-camera)** — enabling PTZ safely on a camera.
+- **[§9](#9-a-group-schedule)** — capturing several cameras together on a cron.
+- **[§10](#10-a-thumbnail-preview-on-the-bus)** — attaching a preview to the published result.
 
 ---
 
@@ -49,13 +50,13 @@ ones:
 | Field | Meaning |
 |-------|---------|
 | `id` (required) | The camera's instance id — stamped on every message it emits and used to select it in a command body (`instance`). |
-| `backend` (required) | The protocol implementation, an object **tagged by `type`**: `{ "type": "sim" \| "onvif-rtsp" \| "genicam-aravis", … }`. The backend's own fields sit flat beside `type` inside this object. |
+| `backend` (required) | The protocol implementation, an object **tagged by `type`**: `{ "type": "sim" \| "onvif-rtsp" \| "rtsp" \| "genicam-aravis", … }`. The backend's own fields sit flat beside `type` inside this object. |
 | `defaultCaptureProfile` (required) | The profile used when a command or schedule names none. |
 | `captureProfiles` (required) | A map of named profiles (below). |
 | `enabled` | Defaults `true`; a disabled camera is validated but does not accept actuation. |
 | `resourceGroup` | Names a shared acquisition cap (a NIC or USB controller) declared under `global.limits.resourceGroups`. |
 | `schedules` | Per-camera cron schedules. Omit it for a **command-only** camera. |
-| `ptz` | Per-camera PTZ policy (see [§7](#7-ptz-policy-on-a-camera)). |
+| `ptz` | Per-camera PTZ policy (see [§8](#8-ptz-policy-on-a-camera)). |
 
 ### A capture profile describes the frame and the file
 
@@ -72,7 +73,7 @@ Each named profile carries a **required `output` object** and optional overrides
 - `pixelFormat` (GenICam) — a **case-sensitive** token: `Mono8`, `RGB8`, `BGR8`, or `JPEG`. `rgb8` in
   lower case is not a valid value.
 - `thumbnail` — `{ "size": "small" \| "medium" \| "large" }` to attach a preview to the result (see
-  [§9](#9-a-thumbnail-preview-on-the-bus)).
+  [§10](#10-a-thumbnail-preview-on-the-bus)).
 - `timeoutMs`, `offlinePolicy`, `queueExpiryMs`, `maximumFrameBytes`, and the GenICam
   `width`/`height`/`offsetX`/`offsetY`/`exposureMicros`/`gain` sensor overrides, when a camera needs them.
 
@@ -202,7 +203,37 @@ extraction needs the adapter built with the `rtsp` feature and the matching GStr
 error. Set `captureMode: "rtsp-frame"` instead of the fallback when you want to *require* RTSP extraction on
 every capture rather than only on a bad snapshot.
 
-## 5. GigE Vision (GenICam)
+## 5. Bare-RTSP camera (no ONVIF)
+
+```json
+{
+  "id": "line-cam",
+  "backend": {
+    "type": "rtsp",
+    "url": "rtsp://line-cam.example:554/stream1",
+    "credentials": { "$secret": "cameras/line" },
+    "allowedUriHosts": ["line-cam.example"]
+  },
+  "defaultCaptureProfile": "inspection",
+  "captureProfiles": {
+    "inspection": { "captureMode": "rtsp-frame", "output": { "encoding": "jpeg", "jpegQuality": 90 } }
+  }
+}
+```
+
+For a camera that speaks RTSP but not ONVIF, the `rtsp` backend connects straight to the stream `url` — no
+device service, no media-profile discovery. On `connect()` the adapter performs the full RTSP
+`DESCRIBE`/`SETUP` handshake, authenticates with the `cameras/line` secret (RTSP Basic/Digest — the URL
+must **not** embed `user:pass@`), and validates the stream's codec, so an unreachable or misconfigured
+camera is reported offline immediately rather than only at the first capture. `captureMode` is `rtsp-frame`
+— its only valid value here — so each capture decodes one complete frame to RGB and the profile encodes it
+(to JPEG in this example). `allowedUriHosts` pins the endpoint on top of the per-connection address
+validation the backend always does. For an encrypted camera, use an `rtsps://` URL with `tls.ca` /
+`tls.verifyHostname`; plaintext `rtsp://` requires `allowInsecure: true`. The `rtsp` backend is compiled
+only with the native `rtsp` feature (it needs the GStreamer runtime) — see the
+[deployment runbooks](deployment/host.md). It has no PTZ, snapshot, or discovery.
+
+## 6. GigE Vision (GenICam)
 
 ```json
 {
@@ -222,7 +253,7 @@ the adapter never sweeps all NICs. The `raw` profile writes the camera's raw pix
 with no re-encoding — the right choice when a downstream pipeline wants the sensor bytes. For a smaller file,
 choose `png`/`tiff` (from a raw pixel format) or `jpeg`.
 
-## 6. USB3 Vision (GenICam)
+## 7. USB3 Vision (GenICam)
 
 ```json
 {
@@ -238,7 +269,7 @@ interface list — the `deviceId` selector binds it directly, and `transport: "u
 path. The `inspection` profile encodes each frame to PNG. USB3 Vision under Kubernetes needs an explicit,
 least-privilege device mapping; see the [Kubernetes runbook](deployment/kubernetes.md).
 
-## 7. PTZ policy on a camera
+## 8. PTZ policy on a camera
 
 ```json
 {
@@ -264,7 +295,7 @@ a capture requested while the camera is moving is refused with `CAMERA_MOVING` r
 motion-blurred frame; `stopAndSettle` would instead stop the camera and wait `ptz.settleMs` before capturing.
 See [how-to: move or stop PTZ safely](how-to-guides.md#move-or-stop-ptz-safely).
 
-## 8. A group schedule
+## 9. A group schedule
 
 ```json
 "captureGroupSchedules": [{
@@ -288,7 +319,7 @@ evaluated against the whole group, so a slow member holds the next occurrence ba
 group tear into halves a cycle apart. This is software fan-out — it does not claim hardware-synchronized
 acquisition.
 
-## 9. A thumbnail preview on the bus
+## 10. A thumbnail preview on the bus
 
 ```json
 {

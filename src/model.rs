@@ -17,6 +17,8 @@ pub enum BackendKind {
     GenicamAravis,
     /// ONVIF control with snapshot/RTSP capture.
     OnvifRtsp,
+    /// Bare RTSP still-image capture from a raw stream URL.
+    Rtsp,
 }
 
 impl BackendKind {
@@ -27,6 +29,7 @@ impl BackendKind {
             Self::Sim => "sim",
             Self::GenicamAravis => "genicam-aravis",
             Self::OnvifRtsp => "onvif-rtsp",
+            Self::Rtsp => "rtsp",
         }
     }
 }
@@ -395,6 +398,7 @@ mod tests {
         assert_eq!(BackendKind::Sim.as_str(), "sim");
         assert_eq!(BackendKind::GenicamAravis.as_str(), "genicam-aravis");
         assert_eq!(BackendKind::OnvifRtsp.as_str(), "onvif-rtsp");
+        assert_eq!(BackendKind::Rtsp.as_str(), "rtsp");
         assert_eq!(PixelFormat::Bgr8.uncompressed_len(2, 3), Some(18));
         assert_eq!(PixelFormat::Mono8.uncompressed_len(0, 9), Some(0));
 

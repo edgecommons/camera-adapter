@@ -217,14 +217,20 @@ impl CameraRuntime {
         // ONVIF sessions so the next connection cannot keep probing on an old interface set or
         // applying stale security limits.  Sim and GenICam sessions have no such global policy
         // dependency and remain live when their backend settings are unchanged.
-        let onvif_runtime_policy_changed = previous.global.discovery.eligible_interfaces
-            != replacement.global.discovery.eligible_interfaces
-            || previous.global.security.max_header_bytes
-                != replacement.global.security.max_header_bytes
+        //
+        // The bare RTSP backend retains the same HTTP/XML security limits (it applies
+        // `max_header_bytes`, `max_decompression_ratio`, and the basic-over-plaintext gate), but
+        // has no discovery-interface dependency, so it is retired only when that security subset
+        // changes.
+        let security_policy_changed = previous.global.security.max_header_bytes
+            != replacement.global.security.max_header_bytes
             || previous.global.security.max_decompression_ratio
                 != replacement.global.security.max_decompression_ratio
             || previous.global.security.allow_basic_over_plaintext
                 != replacement.global.security.allow_basic_over_plaintext;
+        let onvif_runtime_policy_changed = previous.global.discovery.eligible_interfaces
+            != replacement.global.discovery.eligible_interfaces
+            || security_policy_changed;
         let restarting = previous
             .instances
             .iter()
@@ -234,7 +240,9 @@ impl CameraRuntime {
                         && new.enabled
                         && old.backend == new.backend
                         && !(onvif_runtime_policy_changed
-                            && old.backend.kind() == crate::model::BackendKind::OnvifRtsp) =>
+                            && old.backend.kind() == crate::model::BackendKind::OnvifRtsp)
+                        && !(security_policy_changed
+                            && old.backend.kind() == crate::model::BackendKind::Rtsp) =>
                 {
                     None
                 }

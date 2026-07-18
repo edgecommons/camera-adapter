@@ -1,8 +1,9 @@
 # Compatibility
 
 The camera adapter is designed for standards-compliant ONVIF/RTSP network cameras and GenICam (GigE
-Vision and USB3 Vision) machine-vision cameras. It is **validated against deterministic protocol
-simulators**, not against physical hardware: a passing simulator exercises a protocol path, but it does
+Vision and USB3 Vision) machine-vision cameras — including RTSP-only cameras with no ONVIF, through the
+dedicated `rtsp` backend. It is **validated against deterministic protocol simulators**, not against
+physical hardware: a passing simulator exercises a protocol path, but it does
 not establish that a specific physical camera model, NIC, USB topology, cluster CNI, or deployment
 platform will interoperate without adjustment. Real devices vary in how faithfully they implement the
 standards, so you must validate your own cameras — see [Physical cameras](#physical-cameras).

@@ -31,7 +31,8 @@ onvif = [
 ]
 genicam = ["dep:aravis", "dep:aravis-scoped"]
 rtsp = [
-    "onvif",
+    "dep:base64",
+    "dep:md-5",
     "tokio/io-util",
     "tokio/net",
     "dep:gstreamer",

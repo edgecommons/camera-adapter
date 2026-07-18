@@ -11,14 +11,14 @@ use serde::Deserialize;
 use tokio::sync::Semaphore;
 use zeroize::Zeroize;
 
-use crate::backend::onvif::{OnvifCredentialProvider, OnvifCredentials, SecretBytes};
+use crate::backend::net::{CredentialProvider, NetworkCredentials, SecretBytes};
 use crate::config::SecretRef;
 use crate::{CameraError, Result};
 
 const MAX_CONCURRENT_VAULT_READS: usize = 4;
 const MAX_SECRET_BYTES: usize = 1024 * 1024;
 
-/// Production ONVIF credential provider backed by the component-scoped EdgeCommons vault.
+/// Production credential provider backed by the component-scoped EdgeCommons vault.
 #[derive(Clone)]
 pub struct EdgeCommonsCredentialProvider {
     service: Arc<dyn CredentialService>,
@@ -68,12 +68,12 @@ impl std::fmt::Debug for EdgeCommonsCredentialProvider {
 }
 
 #[async_trait]
-impl OnvifCredentialProvider for EdgeCommonsCredentialProvider {
-    async fn resolve_login(&self, reference: &SecretRef) -> Result<Arc<OnvifCredentials>> {
+impl CredentialProvider for EdgeCommonsCredentialProvider {
+    async fn resolve_login(&self, reference: &SecretRef) -> Result<Arc<NetworkCredentials>> {
         let selected = self.selected_bytes(reference).await?;
         let document: LoginDocument = serde_json::from_slice(selected.as_slice())
             .map_err(|_| credential_error("camera login secret is not the required JSON object"))?;
-        let credentials = OnvifCredentials::new(
+        let credentials = NetworkCredentials::new(
             document.username.as_bytes().to_vec(),
             document.password.as_bytes().to_vec(),
         )?;
@@ -232,8 +232,8 @@ mod tests {
             })
             .await
             .expect("field login");
-        assert_eq!(format!("{whole:?}"), "OnvifCredentials(<redacted>)");
-        assert_eq!(format!("{nested:?}"), "OnvifCredentials(<redacted>)");
+        assert_eq!(format!("{whole:?}"), "NetworkCredentials(<redacted>)");
+        assert_eq!(format!("{nested:?}"), "NetworkCredentials(<redacted>)");
     }
 
     #[tokio::test]

@@ -441,6 +441,8 @@ pub enum BackendConfig {
     GenicamAravis(GenicamBackendConfig),
     /// ONVIF control and snapshot/RTSP backend.
     OnvifRtsp(OnvifBackendConfig),
+    /// Bare RTSP still-image backend for a raw stream URL.
+    Rtsp(RtspBackendConfig),
 }
 
 impl BackendConfig {
@@ -451,6 +453,7 @@ impl BackendConfig {
             Self::Sim(_) => BackendKind::Sim,
             Self::GenicamAravis(_) => BackendKind::GenicamAravis,
             Self::OnvifRtsp(_) => BackendKind::OnvifRtsp,
+            Self::Rtsp(_) => BackendKind::Rtsp,
         }
     }
 }
@@ -728,6 +731,44 @@ pub enum AuthenticationMode {
     WsseDigest,
     /// Require Basic authentication, subject to plaintext policy.
     Basic,
+}
+
+/// Bare RTSP backend configuration for a camera addressed by a raw stream URL.
+///
+/// This backend performs no ONVIF control: there is no device service, no media-profile discovery,
+/// and no PTZ or snapshot capability. It reuses the ONVIF field *types* so the network-trust,
+/// credential, and TLS surfaces stay identical, but the only capture mode is RTSP frame extraction.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RtspBackendConfig {
+    /// Raw `rtsp`/`rtsps` stream URL. User information in the URL is forbidden.
+    pub url: String,
+    /// Credential secret containing username/password.
+    pub credentials: Option<SecretRef>,
+    /// TLS trust/hostname policy.
+    #[serde(default)]
+    pub tls: TlsConfig,
+    /// Allow plaintext/TLS-verification development overrides.
+    #[serde(default)]
+    pub allow_insecure: bool,
+    /// Allowed URI hostnames, in addition to the configured stream host.
+    #[serde(default)]
+    pub allowed_uri_hosts: Vec<String>,
+    /// Allowed resolved CIDRs.
+    #[serde(default)]
+    pub allowed_uri_cidrs: Vec<IpNet>,
+    /// RTSP lifecycle policy.
+    #[serde(default)]
+    pub rtsp_session_policy: RtspSessionPolicy,
+    /// Default backend capture mode. RTSP frame extraction is the only supported value.
+    #[serde(default = "default_rtsp_capture_mode")]
+    pub capture_mode: CaptureMode,
+    /// Maximum decoded frame bytes.
+    #[serde(default = "default_max_snapshot_bytes")]
+    pub max_frame_bytes: u64,
+    /// Authentication negotiation mode.
+    #[serde(default)]
+    pub authentication_mode: AuthenticationMode,
 }
 
 /// One immutable-at-acceptance capture profile.
@@ -1415,6 +1456,7 @@ fn validate_camera(camera: &CameraConfig, global: &GlobalConfig, path: &str) -> 
         BackendConfig::OnvifRtsp(onvif) => {
             validate_onvif(onvif, global, &format!("{path}.backend"))?
         }
+        BackendConfig::Rtsp(rtsp) => validate_rtsp(rtsp, global, &format!("{path}.backend"))?,
     }
     Ok(())
 }
@@ -1484,6 +1526,7 @@ fn validate_profile(
             BackendKind::OnvifRtsp => {
                 matches!(mode, CaptureMode::SnapshotUri | CaptureMode::RtspFrame)
             }
+            BackendKind::Rtsp => mode == CaptureMode::RtspFrame,
         };
         if !allowed {
             return config_error(
@@ -1795,6 +1838,106 @@ fn validate_onvif(onvif: &OnvifBackendConfig, global: &GlobalConfig, path: &str)
                 "must be a hostname or IP without path/userinfo",
             );
         }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "rtsp"))]
+fn validate_rtsp(rtsp: &RtspBackendConfig, global: &GlobalConfig, path: &str) -> Result<()> {
+    let _ = (rtsp, global);
+    config_error(path, "the 'rtsp' backend requires the 'rtsp' build feature")
+}
+
+#[cfg(feature = "rtsp")]
+fn validate_rtsp(rtsp: &RtspBackendConfig, global: &GlobalConfig, path: &str) -> Result<()> {
+    validate_rtsp_url(&rtsp.url, rtsp.allow_insecure, &format!("{path}.url"))?;
+    if let Some(credentials) = &rtsp.credentials {
+        validate_secret_ref(credentials, &format!("{path}.credentials"))?;
+    }
+    if let Some(ca) = &rtsp.tls.ca {
+        validate_secret_ref(ca, &format!("{path}.tls.ca"))?;
+    }
+    if rtsp.capture_mode != CaptureMode::RtspFrame {
+        return config_error(format!("{path}.captureMode"), "must be rtsp-frame");
+    }
+    if rtsp.authentication_mode == AuthenticationMode::WsseDigest {
+        return config_error(
+            format!("{path}.authenticationMode"),
+            "wsse-digest is an ONVIF SOAP mode and is not valid for a bare RTSP backend",
+        );
+    }
+    range(
+        rtsp.max_frame_bytes,
+        MIB,
+        2 * GIB,
+        &format!("{path}.maxFrameBytes"),
+    )?;
+    if rtsp.max_frame_bytes > global.limits.max_in_flight_bytes {
+        return config_error(
+            format!("{path}.maxFrameBytes"),
+            "must not exceed global maxInFlightBytes",
+        );
+    }
+    let configured_plaintext = Url::parse(&rtsp.url)
+        .ok()
+        .is_some_and(|url| url.scheme() == "rtsp");
+    if rtsp.authentication_mode == AuthenticationMode::Basic
+        && configured_plaintext
+        && !(rtsp.allow_insecure && global.security.allow_basic_over_plaintext)
+    {
+        return config_error(
+            format!("{path}.authenticationMode"),
+            "Basic over plaintext requires security.allowBasicOverPlaintext=true",
+        );
+    }
+    if !rtsp.tls.verify_hostname && !rtsp.allow_insecure {
+        return config_error(
+            format!("{path}.tls.verifyHostname"),
+            "false requires allowInsecure=true",
+        );
+    }
+    for (index, host) in rtsp.allowed_uri_hosts.iter().enumerate() {
+        if host.is_empty()
+            || host.len() > 253
+            || host.chars().any(char::is_control)
+            || host.contains(['/', '@'])
+        {
+            return config_error(
+                format!("{path}.allowedUriHosts[{index}]"),
+                "must be a hostname or IP without path/userinfo",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validates a raw RTSP stream URL. It parallels [`validate_endpoint_url`] but requires an
+/// `rtsp`/`rtsps` scheme and gates plaintext `rtsp` behind `allowInsecure` exactly as `http` is
+/// gated for ONVIF.
+#[cfg(feature = "rtsp")]
+fn validate_rtsp_url(value: &str, allow_insecure: bool, path: &str) -> Result<()> {
+    let url = Url::parse(value).map_err(|error| CameraError::Config {
+        path: path.to_string(),
+        message: error.to_string(),
+    })?;
+    if url.username() != "" || url.password().is_some() {
+        return config_error(path, "URI user information is forbidden");
+    }
+    if url.host_str().is_none() {
+        return config_error(path, "URI must contain a host");
+    }
+    match url.scheme() {
+        "rtsps" => {}
+        "rtsp" if allow_insecure => {}
+        "rtsp" => return config_error(path, "plaintext RTSP requires allowInsecure=true"),
+        _ => return config_error(path, "scheme must be rtsp or rtsps"),
+    }
+    let port = url.port().unwrap_or(match url.scheme() {
+        "rtsps" => 322,
+        _ => 554,
+    });
+    if port == 0 {
+        return config_error(path, "URI port is invalid");
     }
     Ok(())
 }
@@ -2134,6 +2277,9 @@ fn default_sim_capture_delay() -> u64 {
 }
 fn default_onvif_capture_mode() -> CaptureMode {
     CaptureMode::SnapshotUri
+}
+fn default_rtsp_capture_mode() -> CaptureMode {
+    CaptureMode::RtspFrame
 }
 fn default_max_soap_bytes() -> u64 {
     MIB
@@ -2733,6 +2879,171 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "rtsp")]
+    fn rtsp_config(backend: Value) -> Value {
+        let mut value = valid_config();
+        value["component"]["instances"][0]["backend"] = backend;
+        value
+    }
+
+    #[cfg(feature = "rtsp")]
+    #[test]
+    fn rtsp_backend_accepts_a_minimal_valid_stream_url() {
+        let value = rtsp_config(json!({ "type": "rtsp", "url": "rtsps://camera.test/stream" }));
+        assert!(AdapterConfig::from_core_reload(&core(value)).is_ok());
+
+        let credentialed = rtsp_config(json!({
+            "type": "rtsp",
+            "url": "rtsps://camera.test/stream",
+            "credentials": { "$secret": "camera/login" },
+            "tls": { "ca": { "$secret": "camera/ca" } }
+        }));
+        assert!(AdapterConfig::from_core_reload(&core(credentialed)).is_ok());
+    }
+
+    #[cfg(feature = "rtsp")]
+    #[test]
+    fn rtsp_backend_rejects_bad_scheme_userinfo_and_missing_host() {
+        assert_eq!(
+            reload_error_path(rtsp_config(
+                json!({ "type": "rtsp", "url": "https://camera.test/stream" })
+            )),
+            "component.instances[0].backend.url"
+        );
+        assert_eq!(
+            reload_error_path(rtsp_config(json!({
+                "type": "rtsp",
+                "url": "rtsps://operator:secret@camera.test/stream"
+            }))),
+            "component.instances[0].backend.url"
+        );
+        assert_eq!(
+            reload_error_path(rtsp_config(json!({ "type": "rtsp", "url": "rtsps:/stream" }))),
+            "component.instances[0].backend.url"
+        );
+    }
+
+    #[cfg(feature = "rtsp")]
+    #[test]
+    fn rtsp_plaintext_requires_the_insecure_gate() {
+        assert_eq!(
+            reload_error_path(rtsp_config(
+                json!({ "type": "rtsp", "url": "rtsp://camera.test/stream" })
+            )),
+            "component.instances[0].backend.url"
+        );
+        let gated = rtsp_config(json!({
+            "type": "rtsp",
+            "url": "rtsp://camera.test/stream",
+            "allowInsecure": true
+        }));
+        assert!(AdapterConfig::from_core_reload(&core(gated)).is_ok());
+    }
+
+    #[cfg(feature = "rtsp")]
+    #[test]
+    fn rtsp_hostname_verification_override_requires_insecure_gate() {
+        assert_eq!(
+            reload_error_path(rtsp_config(json!({
+                "type": "rtsp",
+                "url": "rtsps://camera.test/stream",
+                "tls": { "verifyHostname": false }
+            }))),
+            "component.instances[0].backend.tls.verifyHostname"
+        );
+        let gated = rtsp_config(json!({
+            "type": "rtsp",
+            "url": "rtsps://camera.test/stream",
+            "allowInsecure": true,
+            "tls": { "verifyHostname": false }
+        }));
+        assert!(AdapterConfig::from_core_reload(&core(gated)).is_ok());
+    }
+
+    #[cfg(feature = "rtsp")]
+    #[test]
+    fn rtsp_allowed_uri_hosts_are_bounded() {
+        assert_eq!(
+            reload_error_path(rtsp_config(json!({
+                "type": "rtsp",
+                "url": "rtsps://camera.test/stream",
+                "allowedUriHosts": ["user@camera.test"]
+            }))),
+            "component.instances[0].backend.allowedUriHosts[0]"
+        );
+    }
+
+    #[cfg(feature = "rtsp")]
+    #[test]
+    fn rtsp_frame_byte_ceiling_is_range_checked() {
+        assert_eq!(
+            reload_error_path(rtsp_config(json!({
+                "type": "rtsp",
+                "url": "rtsps://camera.test/stream",
+                "maxFrameBytes": 1024
+            }))),
+            "component.instances[0].backend.maxFrameBytes"
+        );
+    }
+
+    #[cfg(feature = "rtsp")]
+    #[test]
+    fn rtsp_backend_capture_mode_must_be_rtsp_frame() {
+        assert_eq!(
+            reload_error_path(rtsp_config(json!({
+                "type": "rtsp",
+                "url": "rtsps://camera.test/stream",
+                "captureMode": "snapshot-uri"
+            }))),
+            "component.instances[0].backend.captureMode"
+        );
+    }
+
+    #[cfg(feature = "rtsp")]
+    #[test]
+    fn rtsp_backend_rejects_the_onvif_only_wsse_digest_mode() {
+        assert_eq!(
+            reload_error_path(rtsp_config(json!({
+                "type": "rtsp",
+                "url": "rtsps://camera.test/stream",
+                "authenticationMode": "wsse-digest"
+            }))),
+            "component.instances[0].backend.authenticationMode"
+        );
+    }
+
+    /// The captureMode capability gate rejects a non-rtsp-frame profile on an RTSP backend. This is
+    /// enforced by `validate_profile`, which runs before the backend feature gate, so it holds in
+    /// every build.
+    #[test]
+    fn rtsp_backend_rejects_a_non_rtsp_frame_profile_capture_mode() {
+        let mut value = valid_config();
+        value["component"]["instances"][0]["backend"] =
+            json!({ "type": "rtsp", "url": "rtsps://camera.test/stream" });
+        value["component"]["instances"][0]["captureProfiles"]["main"] = json!({
+            "captureMode": "snapshot-uri",
+            "output": { "encoding": "png" }
+        });
+        assert_eq!(
+            reload_error_path(value),
+            "component.instances[0].captureProfiles.main.captureMode"
+        );
+    }
+
+    #[cfg(not(feature = "rtsp"))]
+    #[test]
+    fn rtsp_backend_fails_with_stable_feature_error_when_absent() {
+        let mut value = valid_config();
+        value["component"]["instances"][0]["backend"] =
+            json!({ "type": "rtsp", "url": "rtsps://camera.test/stream" });
+        let error = AdapterConfig::from_core_reload(&core(value))
+            .expect_err("rtsp backend must fail without the feature");
+        assert_eq!(
+            error.to_string(),
+            "configuration error at component.instances[0].backend: the 'rtsp' backend requires the 'rtsp' build feature"
+        );
+    }
+
     #[test]
     fn templates_reject_traversal_and_unknown_variables() {
         let mut traversal = valid_config();
@@ -3178,7 +3489,8 @@ mod tests {
 
     #[test]
     fn genicam_and_onvif_security_validators_reject_their_protocol_specific_edges() {
-        let cases: Vec<(&str, ConfigMutation, &str)> = vec![
+        #[cfg_attr(not(feature = "rtsp"), allow(unused_mut))]
+        let mut cases: Vec<(&str, ConfigMutation, &str)> = vec![
             (
                 "multiple genicam selectors",
                 Box::new(|value| {
@@ -3247,6 +3559,40 @@ mod tests {
                 "component.instances[0].backend.allowedUriHosts[0]",
             ),
         ];
+
+        #[cfg(feature = "rtsp")]
+        {
+            cases.push((
+                "rtsp userinfo",
+                Box::new(|value| {
+                    value["component"]["instances"][0]["backend"] = json!({
+                        "type": "rtsp",
+                        "url": "rtsp://operator:secret@camera.test/stream",
+                        "allowInsecure": true
+                    });
+                }),
+                "component.instances[0].backend.url",
+            ));
+            cases.push((
+                "rtsp unsupported scheme",
+                Box::new(|value| {
+                    value["component"]["instances"][0]["backend"] = json!({
+                        "type": "rtsp", "url": "ftp://camera.test/stream"
+                    });
+                }),
+                "component.instances[0].backend.url",
+            ));
+            cases.push((
+                "rtsp allowed uri host",
+                Box::new(|value| {
+                    value["component"]["instances"][0]["backend"] = json!({
+                        "type": "rtsp", "url": "rtsps://camera.test/stream",
+                        "allowedUriHosts": ["user@camera.test"]
+                    });
+                }),
+                "component.instances[0].backend.allowedUriHosts[0]",
+            ));
+        }
 
         for (name, mutate, expected_path) in cases {
             let mut value = valid_config();
