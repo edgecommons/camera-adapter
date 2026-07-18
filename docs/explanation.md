@@ -161,7 +161,13 @@ has:
 - **`sim`** is a deterministic in-process camera for logic testing and development. It synthesizes seeded
   frames (color-bars, gradient, checkerboard, solid), can model PTZ, and can inject deterministic faults
   (fail every *n*th capture, deliver an incomplete frame, disconnect after *n*). It exercises the adapter's
-  own behavior, never a real protocol or device timing.
+  own behavior, never a real protocol or device timing. Where the native backends are opt-in build features
+  — some needing system libraries (Aravis for GenICam, GStreamer for RTSP) — `sim` adds no dependencies of
+  its own and is **compiled into every build**, so a `type: "sim"` camera works in any binary, including a
+  production ONVIF or Greengrass image. That is what lets you smoke-test config, scheduling, and the command
+  and message plumbing on the real deployment. (This in-process backend is distinct from the external
+  simulator *stack* — the ONVIF simulator, MediaMTX, and the Aravis fake camera under `simulators/` — which
+  is the protocol-validation harness and is not part of the component binary.)
 - **`onvif-rtsp`** does strict ONVIF service and media-profile selection and captures via the snapshot URI;
   when the `rtsp` feature is compiled in, it can also extract a complete frame from the RTSP stream, either
   as a fallback from a bad snapshot or as the required capture mode. It provides the PTZ implementation.
