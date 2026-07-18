@@ -706,6 +706,50 @@ mod tests {
         );
     }
 
+    /// Every entry point handles a bare-RTSP backend when the `rtsp` feature is not compiled in.
+    ///
+    /// `validate_config` must still reach the RTSP match arm and extract its secret references, and
+    /// both the runtime and static factories must fail closed rather than silently omit the camera.
+    #[cfg(not(feature = "rtsp"))]
+    #[test]
+    fn rtsp_backends_validate_and_fail_closed_without_the_protocol_feature() {
+        let rtsp = config(serde_json::json!({
+            "type": "rtsp",
+            "url": "rtsp://cam.example:554/s",
+            "allowInsecure": true,
+            "credentials": { "$secret": "camera/login" }
+        }));
+        assert!(matches!(rtsp, BackendConfig::Rtsp(_)));
+
+        // A credential-bearing RTSP instance without a credentials service is rejected: the Rtsp
+        // arm of validate_config inspects the config's secret references.
+        let mut adapter = adapter_config(serde_json::json!({"type": "sim"}));
+        adapter.instances[0].backend = rtsp.clone();
+        let context = BackendRuntimeContext::new(None, &LimitsConfig::default());
+        let validation_error = context
+            .validate_config(&adapter)
+            .expect_err("an RTSP secret reference requires a configured credentials service");
+        assert!(matches!(
+            validation_error,
+            crate::CameraError::Config { .. }
+        ));
+
+        // The runtime-bound factory fails closed because the rtsp feature is absent.
+        let runtime_error = context
+            .factory_for(&rtsp, &adapter.global)
+            .err()
+            .expect("RTSP must fail closed without the rtsp feature");
+        assert_eq!(runtime_error.code(), crate::ErrorCode::UnsupportedCapability);
+        assert!(runtime_error.to_string().contains("rtsp"));
+
+        // The static factory fails closed on the same backend.
+        let static_error = factory_for(&rtsp)
+            .err()
+            .expect("static RTSP construction must fail closed without the rtsp feature");
+        assert_eq!(static_error.code(), crate::ErrorCode::UnsupportedCapability);
+        assert!(static_error.to_string().contains("rtsp"));
+    }
+
     /// A protocol call that reaches the camera the moment it is polled, and is answered at once.
     ///
     /// `reached_camera` is the assertion these tests actually turn on: once a `ContinuousMove` has

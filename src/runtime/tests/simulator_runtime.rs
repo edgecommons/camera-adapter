@@ -3331,6 +3331,41 @@ async fn reload_connection_change_restarts_only_the_session_and_keeps_compatible
     runtime.shutdown().await;
 }
 
+/// A reload that changes only the global security policy still re-evaluates the per-camera
+/// restart guard. That guard tests each retained camera's backend kind against the ONVIF and RTSP
+/// protocol backends; for a simulator roster both comparisons are simply false, but they must run.
+#[tokio::test]
+async fn reload_with_a_changed_security_policy_reevaluates_the_restart_guard() {
+    let directory = TempDir::new().unwrap();
+    let initial = config(directory.path(), &["camera-a"], false);
+    let runtime = runtime(initial.clone(), &directory).await;
+
+    let mut replacement = config(directory.path(), &["camera-a"], false);
+    replacement.global.security.max_header_bytes = 32_768;
+    assert_ne!(
+        initial.global.security.max_header_bytes,
+        replacement.global.security.max_header_bytes,
+        "the reload must actually change the security policy for the guard to be exercised"
+    );
+
+    runtime
+        .apply_reloaded_config(replacement, BTreeMap::new(), BTreeMap::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runtime
+            .config_snapshot()
+            .unwrap()
+            .global
+            .security
+            .max_header_bytes,
+        32_768
+    );
+    assert_eq!(runtime.registry.ids().unwrap(), vec!["camera-a".to_string()]);
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn rejected_runtime_reload_leaves_the_generation_and_roster_unchanged() {
     let directory = TempDir::new().unwrap();

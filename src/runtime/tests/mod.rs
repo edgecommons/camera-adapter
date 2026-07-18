@@ -162,6 +162,34 @@ fn retained_discovery_hides_only_matching_stable_configured_selectors() {
     assert!(!candidate_is_configured(&other, &[camera]));
 }
 
+/// A bare-RTSP camera carries no stable discovery selector, so no discovery candidate is ever
+/// treated as already configured against it. This exercises the RTSP arm of the selector match.
+#[test]
+fn a_bare_rtsp_camera_never_hides_a_discovery_candidate() {
+    let camera: crate::config::CameraConfig = serde_json::from_value(json!({
+        "id": "camera-rtsp",
+        "backend": {
+            "type": "rtsp",
+            "url": "rtsp://cam.example:554/s",
+            "allowInsecure": true
+        },
+        "defaultCaptureProfile": "main",
+        "captureProfiles": {}
+    }))
+    .expect("a bare-RTSP camera config deserializes");
+    let candidate = DiscoveryCandidate {
+        backend: crate::model::BackendKind::Rtsp,
+        selector: json!({ "endpointReference": "urn:uuid:whatever" }),
+        vendor: None,
+        model: None,
+        capabilities: json!({}),
+    };
+    assert!(!candidate_is_configured(
+        &candidate,
+        std::slice::from_ref(&camera)
+    ));
+}
+
 #[test]
 fn retained_cursor_expiry_and_kind_confusion_fail_closed() {
     let cursors = CursorStore::default();
