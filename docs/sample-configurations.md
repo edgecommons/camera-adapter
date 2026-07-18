@@ -94,6 +94,14 @@ token — the minimum HOST shape is:
 }
 ```
 
+`component.token` is a **core** EdgeCommons field (not adapter-owned): it is the component's UNS identity —
+the `{component}` segment in `ecv1/{device}/{component}/{instance}/{class}` — under which the adapter
+publishes and is addressed on the bus (its command inbox, state, metrics, and per-camera messages). Set it
+to `camera-adapter` as shown. If you omit it, the core falls back to the short form of the full component
+name (`com.mbreissi.edgecommons.CameraAdapter` → `CameraAdapter`), and the component would appear at
+`ecv1/{device}/CameraAdapter/...` instead of the documented `ecv1/{device}/camera-adapter/...` that
+consumers subscribe to.
+
 Both roots must be absolute and durable, and the file-name or camera-directory template must include
 `{captureId}` so two captures can never collide on one path. Camera credentials are **never** inline: they
 are `{ "$secret": "<name>" }` references to the EdgeCommons credential service, allowed only at
