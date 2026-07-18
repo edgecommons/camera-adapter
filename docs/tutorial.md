@@ -1,10 +1,14 @@
-# Tutorial: first capture
+# Tutorial: your first capture
 
-This tutorial starts one adapter against the checked-in ONVIF simulator, submits a real MQTT command,
-and receives the correlated acceptance reply. It is a local functional tutorial; it is not physical-camera
-certification.
+This tutorial brings up one adapter against the checked-in ONVIF **simulator**, submits a real MQTT command,
+and receives the correlated acceptance reply — the whole command path, end to end, with no camera hardware.
+It then shows the one change that turns the simulated camera into a real ONVIF one. It is a local functional
+walkthrough, not physical-camera certification.
 
-## Run the simulator deployment
+By the end you will have seen an `sb/capture-submit` command accepted, a durable `captureId` returned, and
+understood why acceptance is not yet a written image.
+
+## 1. Run the simulator deployment
 
 From the EdgeCommons umbrella, start the isolated stack and wait for readiness:
 
@@ -13,12 +17,14 @@ docker compose -f camera-adapter/deploy/docker/compose.yaml up --build -d --wait
 curl --fail http://127.0.0.1:18081/readyz
 ```
 
-The stack binds its anonymous EMQX listener only to `127.0.0.1:1884`. It is an acceptance fixture,
-not a production broker.
+The stack is a self-contained acceptance fixture: a pinned EMQX broker, an anonymous ONVIF simulator, and
+the adapter, wired together. It binds its EMQX listener only to `127.0.0.1:1884` and its health port only to
+`127.0.0.1:18081` — loopback, not a production broker. A `200` from `/readyz` means the adapter validated its
+config, recovered its catalog, found its output usable, and acknowledged its command subscription.
 
-## Submit a capture
+## 2. Submit a capture
 
-Run the test client from the adapter checkout:
+Run the test client from the adapter checkout. It publishes a genuine MQTT command and asserts the reply:
 
 ```bash
 CAMERA_ADAPTER_DOCKER_E2E=1 \
@@ -27,27 +33,45 @@ CAMERA_ADAPTER_DOCKER_E2E_PORT=1884 \
 cargo test --no-default-features --features standalone --test docker_capture_submit
 ```
 
-The test publishes to `ecv1/NOT_GREENGRASS/camera-adapter/cmd/sb/capture-submit` and asserts
-that the reply has the same correlation ID, `ok: true`, and a durable `captureId`. Completion is
-reported later as a terminal application message; acceptance never means an image has already been
-written.
+It publishes to the component command inbox `ecv1/NOT_GREENGRASS/camera-adapter/cmd/sb/capture-submit` and
+asserts that the reply carries the **same correlation ID**, `ok: true`, and a durable `captureId`, and that
+the capture is recorded as `ACCEPTED`/`QUEUED`.
 
-## Connect one physical ONVIF camera
+That is the key idea to carry forward: `sb/capture-submit` returns *acceptance*, not an image. The capture
+completes a moment later and is announced as a terminal `ImageCaptured` application message — or, if you must
+not miss it, read it back with `sb/capture-status`. The [explanation](explanation.md#the-capture-lifecycle-acceptance-is-not-completion)
+covers why the two are separate.
 
-Physical camera models are not certified — validate your specific model's firmware, authentication
-mode, PTZ behavior, and selected profile before relying on it. Create durable output and state roots
-as described in the [HOST runbook](deployment/host.md), then replace the simulator backend with one
-explicit `onvif-rtsp` instance. Use a whole credential reference, not a password in configuration:
+## 3. Turn the simulated camera into a real ONVIF one
+
+Create durable output and state roots as described in the [HOST runbook](deployment/host.md), then replace
+the simulator instance with an `onvif-rtsp` one. The only structural change is the **`backend`** object —
+everything else about an instance (its `id`, `defaultCaptureProfile`, `captureProfiles`) stays the same:
 
 ```json
 {
-  "type": "onvif-rtsp",
-  "credentials": { "$secret": "cameras/loading-dock" },
-  "deviceServiceUrl": "https://camera.example/onvif/device_service",
-  "mediaProfile": "main",
-  "allowedUriHosts": ["camera.example"]
+  "id": "loading-dock",
+  "backend": {
+    "type": "onvif-rtsp",
+    "credentials": { "$secret": "cameras/loading-dock" },
+    "deviceServiceUrl": "https://camera.example/onvif/device_service",
+    "mediaProfile": "main",
+    "allowedUriHosts": ["camera.example"],
+    "tls": { "verifyHostname": true }
+  },
+  "defaultCaptureProfile": "inspection",
+  "captureProfiles": { "inspection": { "output": { "encoding": "png" } } }
 }
 ```
 
-The referenced UTF-8 JSON secret contains exactly `username` and `password`. Keep `allowInsecure`
-false and use a TLS CA reference when a private camera CA is required.
+Use a **whole credential reference**, not a password in the file: the `cameras/loading-dock` secret is a
+UTF-8 JSON value containing exactly `username` and `password`. Keep `backend.allowInsecure` false, keep
+`backend.tls.verifyHostname` true, and point `backend.tls.ca` at a PEM secret when the camera presents a
+private CA. Physical camera models are not certified — validate your specific model's firmware,
+authentication mode, PTZ behavior, and selected media profile before relying on it.
+
+## What next
+
+- Copy a complete config for your scenario from the [sample configurations](sample-configurations.md).
+- Add a schedule, PTZ, or RTSP fallback from the [how-to guides](how-to-guides.md).
+- Look up any command, message field, or option in the [reference](reference/configuration.md).
