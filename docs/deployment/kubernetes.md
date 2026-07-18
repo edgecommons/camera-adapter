@@ -71,4 +71,5 @@ The checked-in image does not claim Prometheus support. Add an EdgeCommons Prome
 Service, and ServiceMonitor only as one coordinated, tested packaging change; do not create a
 scrape target for a port the image has not compiled.
 
-Physical cameras and hardware-cluster camera-network access are not supported.
+Physical cameras and hardware-cluster camera-network access are not validated; validate them for your own
+cameras and cluster networking before relying on them.

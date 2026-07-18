@@ -10,8 +10,8 @@ a camera connects or disconnects.
 | Measure | Unit | Meaning |
 |---|---|---|
 | `connectionState` | Count | 1 while the camera's session is live, 0 otherwise. |
-| `pollLatencyMs` | Milliseconds | The last acquisition round-trip. Absent until the camera has produced a frame. |
 | `publishLatencyMs` | Milliseconds | How long the camera's last terminal message took to reach the transport. Absent until one has. |
+| `pollLatencyMs` | Milliseconds | The last acquisition round-trip. Absent until the camera has produced a frame. |
 | `readErrors` | Count | Acquisition failures in the interval. A failure to encode or to write to disk is not counted: it is not the camera's fault. |
 | `staleSignals` | Count | 1 when the camera has produced nothing within `healthThresholds.staleSignalSecs`, 0 otherwise. A camera can be connected and stale. |
 | `reconnects` | Count | Sessions re-established in the interval. A camera's first connection is not a reconnect. |
@@ -53,7 +53,7 @@ per measure. Per-camera queue depth is answered by `sb/queue-status`.
 
 ## Per-camera presence
 
-Every configured camera's reachability is published in the component's `main` state keepalive, in the
+Every configured camera's reachability is published in the component's state keepalive, in the
 `instances[]` array, and the same element answers the built-in `status` verb. Consumers learn that a
 camera has dropped from the keepalive rather than by polling `sb/list` or `sb/status`.
 
