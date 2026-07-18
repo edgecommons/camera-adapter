@@ -56,5 +56,6 @@ shadow, broad file, or cloud permissions. Add a separate, narrow dependency and 
 concrete deployment needs one; for example, a vault backed by a cloud provider needs its own
 reviewed credential integration.
 
-Native ONVIF and RTSP capture and command/reply run over Greengrass IPC. Physical cameras and
-camera-VLAN access are not supported.
+Native ONVIF and RTSP capture and command/reply run over Greengrass IPC. This path has been validated
+only with the simulators; physical cameras and camera-VLAN access are not validated here and must be
+validated for your own devices and network.

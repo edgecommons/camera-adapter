@@ -1,8 +1,11 @@
 # Compatibility
 
-The camera adapter is validated against deterministic protocol simulators. A passing simulator
-exercises a protocol path; it does not establish that a specific physical camera model, NIC, USB
-topology, cluster CNI, or deployment platform is supported.
+The camera adapter is designed for standards-compliant ONVIF/RTSP network cameras and GenICam (GigE
+Vision and USB3 Vision) machine-vision cameras. It is **validated against deterministic protocol
+simulators**, not against physical hardware: a passing simulator exercises a protocol path, but it does
+not establish that a specific physical camera model, NIC, USB topology, cluster CNI, or deployment
+platform will interoperate without adjustment. Real devices vary in how faithfully they implement the
+standards, so you must validate your own cameras — see [Physical cameras](#physical-cameras).
 
 ## Simulator stack
 
@@ -20,15 +23,25 @@ discovery.
 
 ## Physical cameras
 
-Physical cameras are not supported. No physical camera model, firmware, NIC, USB topology, or encoder
-is validated, including:
+No physical camera has been validated. No hardware was available for this project, so no specific camera
+model, firmware, NIC, USB topology, or encoder has been exercised against the adapter, and none is
+certified — the adapter must not be represented as hardware-certified on the strength of simulator
+results.
+
+This is a **validation gap, not a design limitation**. The adapter implements the ONVIF, RTSP, and
+GenICam standards and is intended to work with compliant devices. In practice, cameras differ in how
+faithfully they implement those standards, and a specific model's quirks — a non-conformant SOAP
+response, an unusual authentication flow, an encoder that negotiates unexpectedly — may require a change
+to the adapter to interoperate. **Validate each camera model and firmware in your own environment before
+relying on it in production**, and treat a newly introduced model as unproven until you have. Exercise at
+least:
 
 - GigE Vision and USB3 Vision vendor cameras
 - ONVIF Profile S/T vendor cameras
 - ONVIF PTZ operations and presets on hardware
 - HTTPS/Digest ONVIF cameras
-- ONVIF cameras requiring RTSP fallback
-- the high-resolution and pixel-format matrix
+- ONVIF cameras that fall back to RTSP
+- your resolution and pixel-format matrix
 
 ## Platform support
 

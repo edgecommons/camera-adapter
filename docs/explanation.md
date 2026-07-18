@@ -168,9 +168,10 @@ has:
 - **`genicam-aravis`** is an optional Linux-native backend (built only with the `genicam` feature) for GigE
   Vision and USB3 Vision cameras, using a software trigger and buffer acquisition through Aravis.
 
-These are software implementations of the protocols. Specific physical camera models, NICs, USB topologies,
-and deployment environments are **not** certified by the adapter — see [compatibility](reference/compatibility.md)
-for exactly what the simulator stack does and does not establish.
+These are software implementations of the standards, intended to work with compliant devices. No specific
+physical camera model, NIC, USB topology, or environment has been validated against real hardware, and a
+device that deviates from the standard may need an adapter change to interoperate — see
+[compatibility](reference/compatibility.md) for what the simulator stack does and does not establish.
 
 ## Thumbnails: an optional preview on the bus
 

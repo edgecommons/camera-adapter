@@ -49,7 +49,7 @@ so a broker outage degrades the adapter (it keeps capturing and persisting) rath
 - **"Where do captured files go, and how does the consumer read them?"** → [How-to — Hand completed files to file-replicator](how-to-guides.md#hand-completed-files-to-file-replicator).
 - **"Why didn't I get a capture message?"** → [Explanation — Announcement, not delivery](explanation.md#the-result-is-durable-the-announcement-is-not).
 - **"What does this metric or alarm mean?"** → [Reference — Metrics and alarms](reference/metrics.md).
-- **"Is my physical camera supported?"** → [Reference — Compatibility](reference/compatibility.md).
+- **"Will my physical camera work, and how do I validate it?"** → [Reference — Compatibility](reference/compatibility.md).
 
 ## Audience
 

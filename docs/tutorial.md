@@ -67,8 +67,8 @@ everything else about an instance (its `id`, `defaultCaptureProfile`, `capturePr
 Use a **whole credential reference**, not a password in the file: the `cameras/loading-dock` secret is a
 UTF-8 JSON value containing exactly `username` and `password`. Keep `backend.allowInsecure` false, keep
 `backend.tls.verifyHostname` true, and point `backend.tls.ca` at a PEM secret when the camera presents a
-private CA. Physical camera models are not certified — validate your specific model's firmware,
-authentication mode, PTZ behavior, and selected media profile before relying on it.
+private CA. No physical camera model has been validated against hardware — validate your specific model's
+firmware, authentication mode, PTZ behavior, and selected media profile before relying on it.
 
 ## What next
 
