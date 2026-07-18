@@ -671,6 +671,7 @@ fn candidate_is_configured(
                 )
             }
             crate::config::BackendConfig::Sim(_) => false,
+            crate::config::BackendConfig::Rtsp(_) => false,
         }
     })
 }
@@ -2270,16 +2271,19 @@ pub fn validate_configuration_candidate_with_credentials(
         ConfigurationValidationPhase::Reload => (|| -> Result<()> {
             let replacement = AdapterConfig::from_core_reload(&core)?;
             if !credential_service_available
-                && replacement.instances.iter().any(|camera| {
-                    let crate::config::BackendConfig::OnvifRtsp(onvif) = &camera.backend else {
-                        return false;
-                    };
-                    onvif.credentials.is_some() || onvif.tls.ca.is_some()
+                && replacement.instances.iter().any(|camera| match &camera.backend {
+                    crate::config::BackendConfig::OnvifRtsp(onvif) => {
+                        onvif.credentials.is_some() || onvif.tls.ca.is_some()
+                    }
+                    crate::config::BackendConfig::Rtsp(rtsp) => {
+                        rtsp.credentials.is_some() || rtsp.tls.ca.is_some()
+                    }
+                    _ => false,
                 })
             {
                 return Err(crate::CameraError::Config {
                     path: "component.instances[].backend".to_string(),
-                    message: "ONVIF secret references require credentials configured at component startup"
+                    message: "camera secret references require credentials configured at component startup"
                         .to_string(),
                 });
             }

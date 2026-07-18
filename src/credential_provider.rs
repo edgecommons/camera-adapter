@@ -11,15 +11,14 @@ use serde::Deserialize;
 use tokio::sync::Semaphore;
 use zeroize::Zeroize;
 
-use crate::backend::net::{NetworkCredentials, SecretBytes};
-use crate::backend::onvif::OnvifCredentialProvider;
+use crate::backend::net::{CredentialProvider, NetworkCredentials, SecretBytes};
 use crate::config::SecretRef;
 use crate::{CameraError, Result};
 
 const MAX_CONCURRENT_VAULT_READS: usize = 4;
 const MAX_SECRET_BYTES: usize = 1024 * 1024;
 
-/// Production ONVIF credential provider backed by the component-scoped EdgeCommons vault.
+/// Production credential provider backed by the component-scoped EdgeCommons vault.
 #[derive(Clone)]
 pub struct EdgeCommonsCredentialProvider {
     service: Arc<dyn CredentialService>,
@@ -69,7 +68,7 @@ impl std::fmt::Debug for EdgeCommonsCredentialProvider {
 }
 
 #[async_trait]
-impl OnvifCredentialProvider for EdgeCommonsCredentialProvider {
+impl CredentialProvider for EdgeCommonsCredentialProvider {
     async fn resolve_login(&self, reference: &SecretRef) -> Result<Arc<NetworkCredentials>> {
         let selected = self.selected_bytes(reference).await?;
         let document: LoginDocument = serde_json::from_slice(selected.as_slice())

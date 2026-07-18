@@ -20,8 +20,11 @@ use md5::{Digest as _, Md5};
 use rand::RngCore;
 use sha2::Sha256;
 use tokio::sync::Semaphore;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+use crate::config::SecretRef;
 use crate::{CameraError, ErrorCode, Result};
 
 /// Backend label shared by the network primitives errors. Keeping it identical to the ONVIF
@@ -125,6 +128,63 @@ impl NetworkCredentials {
 impl std::fmt::Debug for NetworkCredentials {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("NetworkCredentials(<redacted>)")
+    }
+}
+
+/// Lazy standard-secret resolution seam shared by the ONVIF and RTSP backends.
+///
+/// It lives here rather than in `onvif` so that the RTSP backend, which can be built without the
+/// ONVIF feature, resolves its `credentials`/`tls.ca` references through the exact same
+/// EdgeCommons-backed provider the ONVIF factory uses.
+#[async_trait]
+pub trait CredentialProvider: Send + Sync {
+    /// Resolves a login object containing `username` and `password`.
+    async fn resolve_login(&self, reference: &SecretRef) -> Result<Arc<NetworkCredentials>>;
+
+    /// Resolves opaque bytes, used for a private CA bundle.
+    async fn resolve_bytes(&self, reference: &SecretRef) -> Result<Arc<SecretBytes>>;
+}
+
+/// Resolves login credentials under the caller's deadline and cancellation signal.
+///
+/// A credential store that hangs must not hang a camera connect: the deadline and token bound the
+/// resolution exactly as production requires.
+pub(crate) async fn resolve_login_bounded(
+    provider: &dyn CredentialProvider,
+    reference: &SecretRef,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Arc<NetworkCredentials>> {
+    if deadline <= Instant::now() {
+        return Err(timeout_error("credential resolution"));
+    }
+    let resolution = provider.resolve_login(reference);
+    tokio::pin!(resolution);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(cancelled_error("credential resolution")),
+        _ = tokio::time::sleep_until(deadline) => Err(timeout_error("credential resolution")),
+        result = &mut resolution => result,
+    }
+}
+
+/// Resolves opaque secret bytes under the caller's deadline and cancellation signal.
+pub(crate) async fn resolve_bytes_bounded(
+    provider: &dyn CredentialProvider,
+    reference: &SecretRef,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<Arc<SecretBytes>> {
+    if deadline <= Instant::now() {
+        return Err(timeout_error("credential resolution"));
+    }
+    let resolution = provider.resolve_bytes(reference);
+    tokio::pin!(resolution);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(cancelled_error("credential resolution")),
+        _ = tokio::time::sleep_until(deadline) => Err(timeout_error("credential resolution")),
+        result = &mut resolution => result,
     }
 }
 

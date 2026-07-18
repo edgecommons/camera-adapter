@@ -35,19 +35,23 @@ use super::{
     DiscoveryCandidate, DiscoveryRequest,
 };
 use crate::config::{
-    AuthenticationMode, BackendConfig, MediaService, OnvifBackendConfig, OnvifSelector, SecretRef,
+    AuthenticationMode, BackendConfig, MediaService, OnvifBackendConfig, OnvifSelector,
     SecurityConfig,
 };
+// `SecretRef` is referenced only by the credential-resolution test seam now that the
+// `CredentialProvider` trait lives in `super::net`.
+#[cfg(test)]
+use crate::config::SecretRef;
 use crate::model::{
     BackendKind, CameraCapabilities, CaptureFrame, CaptureMode, FrameTimestampQuality, PixelFormat,
     PtzPreset, PtzRequest, PtzResult, PtzStatus, PtzVector,
 };
 use crate::{CameraError, ErrorCode, Result};
 use super::net::{
-    AddressResolver, DigestChallenge, NetClock, NetworkCredentials, NonceSource, SecretBytes,
-    basic_authorization, cancelled_error, digest_authorization_for_method, find_auth_scheme,
-    is_forbidden_network_address, normalize_host_text, parse_digest_challenge, security_error,
-    timeout_error,
+    AddressResolver, CredentialProvider, DigestChallenge, NetClock, NetworkCredentials, NonceSource,
+    SecretBytes, basic_authorization, cancelled_error, digest_authorization_for_method,
+    find_auth_scheme, is_forbidden_network_address, normalize_host_text, parse_digest_challenge,
+    resolve_bytes_bounded, resolve_login_bounded, security_error, timeout_error,
 };
 #[cfg(any(feature = "rtsp", test))]
 use super::net::RtspNetworkAnchor;
@@ -72,54 +76,6 @@ const PTZ_NAMESPACE: &str = "http://www.onvif.org/ver20/ptz/wsdl";
 const DEVICE_NAMESPACE: &str = "http://www.onvif.org/ver10/device/wsdl";
 #[cfg(feature = "rtsp")]
 const SCHEMA_NAMESPACE: &str = "http://www.onvif.org/ver10/schema";
-
-/// Lazy standard-secret resolution seam.
-#[async_trait]
-pub trait OnvifCredentialProvider: Send + Sync {
-    /// Resolves a login object containing `username` and `password`.
-    async fn resolve_login(&self, reference: &SecretRef) -> Result<Arc<NetworkCredentials>>;
-
-    /// Resolves opaque bytes, used for a private CA bundle.
-    async fn resolve_bytes(&self, reference: &SecretRef) -> Result<Arc<SecretBytes>>;
-}
-
-async fn resolve_login_bounded(
-    provider: &dyn OnvifCredentialProvider,
-    reference: &SecretRef,
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<Arc<NetworkCredentials>> {
-    if deadline <= Instant::now() {
-        return Err(timeout_error("credential resolution"));
-    }
-    let resolution = provider.resolve_login(reference);
-    tokio::pin!(resolution);
-    tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => Err(cancelled_error("credential resolution")),
-        _ = tokio::time::sleep_until(deadline) => Err(timeout_error("credential resolution")),
-        result = &mut resolution => result,
-    }
-}
-
-async fn resolve_bytes_bounded(
-    provider: &dyn OnvifCredentialProvider,
-    reference: &SecretRef,
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<Arc<SecretBytes>> {
-    if deadline <= Instant::now() {
-        return Err(timeout_error("credential resolution"));
-    }
-    let resolution = provider.resolve_bytes(reference);
-    tokio::pin!(resolution);
-    tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => Err(cancelled_error("credential resolution")),
-        _ = tokio::time::sleep_until(deadline) => Err(timeout_error("credential resolution")),
-        result = &mut resolution => result,
-    }
-}
 
 /// One bounded WS-Discovery response.
 #[derive(Clone, PartialEq, Eq)]
@@ -2031,7 +1987,7 @@ pub struct OnvifBackendDependencies {
     /// Lazy secret-reference resolver.  It is absent only when the complete configuration has
     /// no ONVIF secret references; attempting to resolve a reference without it is a closed
     /// configuration error rather than an implicit fallback provider.
-    pub credentials: Option<Arc<dyn OnvifCredentialProvider>>,
+    pub credentials: Option<Arc<dyn CredentialProvider>>,
     /// UTC clock.
     pub clock: Arc<dyn NetClock>,
     /// Cryptographic nonce source.
@@ -3941,7 +3897,7 @@ mod tests {
     struct FixedCredentials;
 
     #[async_trait]
-    impl OnvifCredentialProvider for FixedCredentials {
+    impl CredentialProvider for FixedCredentials {
         async fn resolve_login(&self, _reference: &SecretRef) -> Result<Arc<NetworkCredentials>> {
             Ok(Arc::new(NetworkCredentials::new(
                 b"operator".to_vec(),

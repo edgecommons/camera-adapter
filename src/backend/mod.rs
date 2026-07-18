@@ -27,6 +27,8 @@ pub mod genicam_aravis;
 pub mod onvif;
 #[cfg(feature = "rtsp")]
 pub mod rtsp;
+#[cfg(feature = "rtsp")]
+pub mod rtsp_backend;
 #[cfg(any(feature = "onvif", feature = "rtsp"))]
 pub(crate) mod net;
 #[cfg(all(test, feature = "onvif", not(feature = "rtsp")))]
@@ -250,13 +252,17 @@ impl BackendRuntimeContext {
             return Ok(());
         }
         for (index, camera) in config.instances.iter().enumerate() {
-            let BackendConfig::OnvifRtsp(onvif) = &camera.backend else {
-                continue;
+            let (credentials, ca) = match &camera.backend {
+                BackendConfig::OnvifRtsp(onvif) => {
+                    (onvif.credentials.is_some(), onvif.tls.ca.is_some())
+                }
+                BackendConfig::Rtsp(rtsp) => (rtsp.credentials.is_some(), rtsp.tls.ca.is_some()),
+                _ => continue,
             };
-            if onvif.credentials.is_some() || onvif.tls.ca.is_some() {
+            if credentials || ca {
                 return Err(crate::CameraError::Config {
                     path: format!("component.instances[{index}].backend"),
-                    message: "ONVIF secret references require a configured EdgeCommons credentials service"
+                    message: "camera secret references require a configured EdgeCommons credentials service"
                         .to_owned(),
                 });
             }
@@ -274,7 +280,7 @@ impl BackendRuntimeContext {
         config: &BackendConfig,
         global: &GlobalConfig,
     ) -> Result<Arc<dyn CameraBackendFactory>> {
-        #[cfg(not(feature = "onvif"))]
+        #[cfg(all(not(feature = "onvif"), not(feature = "rtsp")))]
         let _ = global;
         match config {
             BackendConfig::OnvifRtsp(_) => {
@@ -287,8 +293,36 @@ impl BackendRuntimeContext {
                     unavailable("onvif-rtsp", "onvif")
                 }
             }
+            BackendConfig::Rtsp(_) => {
+                #[cfg(feature = "rtsp")]
+                {
+                    Ok(Arc::new(self.rtsp_factory(global)))
+                }
+                #[cfg(not(feature = "rtsp"))]
+                {
+                    unavailable("rtsp", "rtsp")
+                }
+            }
             _ => factory_for(config),
         }
+    }
+
+    /// Builds a bare-RTSP factory bound to the current global security policy.
+    ///
+    /// It shares the component-wide decode gate and resolves any `credentials`/`tls.ca` secret
+    /// references through the same EdgeCommons-backed provider the ONVIF factory uses.
+    #[cfg(feature = "rtsp")]
+    fn rtsp_factory(&self, global: &GlobalConfig) -> rtsp_backend::RtspBackendFactory {
+        let credentials = self.credential_service.as_ref().map(|service| {
+            Arc::new(
+                crate::credential_provider::EdgeCommonsCredentialProvider::new(Arc::clone(service)),
+            ) as Arc<dyn net::CredentialProvider>
+        });
+        rtsp_backend::RtspBackendFactory::new(
+            credentials,
+            global.security.clone(),
+            Arc::clone(&self.decode_gate),
+        )
     }
 
     #[cfg(feature = "onvif")]
@@ -304,7 +338,7 @@ impl BackendRuntimeContext {
         let credentials = self.credential_service.as_ref().map(|service| {
             Arc::new(
                 crate::credential_provider::EdgeCommonsCredentialProvider::new(Arc::clone(service)),
-            ) as Arc<dyn onvif::OnvifCredentialProvider>
+            ) as Arc<dyn net::CredentialProvider>
         });
         Ok(onvif::OnvifBackendFactory::new(
             onvif::OnvifBackendDependencies {
@@ -355,6 +389,19 @@ pub fn factory_for(config: &BackendConfig) -> Result<Arc<dyn CameraBackendFactor
             #[cfg(not(feature = "onvif"))]
             {
                 unavailable("onvif-rtsp", "onvif")
+            }
+        }
+        BackendConfig::Rtsp(_) => {
+            #[cfg(feature = "rtsp")]
+            {
+                Err(crate::CameraError::Config {
+                    path: "component.instances[].backend".to_owned(),
+                    message: "RTSP backend construction requires BackendRuntimeContext".to_owned(),
+                })
+            }
+            #[cfg(not(feature = "rtsp"))]
+            {
+                unavailable("rtsp", "rtsp")
             }
         }
     }

@@ -47,6 +47,7 @@ impl CameraRuntime {
                     crate::model::CaptureMode::SoftwareTrigger
                 }
                 crate::config::BackendConfig::OnvifRtsp(config) => config.capture_mode,
+                crate::config::BackendConfig::Rtsp(_) => crate::model::CaptureMode::RtspFrame,
             });
         let snapshot = self.registry.snapshot(instance)?;
         let camera_summary = crate::messages::CameraSummary {
