@@ -375,3 +375,82 @@ impl CameraSession for RtspSession {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio::sync::Semaphore;
+    use tokio_util::sync::CancellationToken;
+
+    use super::RtspBackendFactory;
+    use crate::backend::{CameraBackendFactory, CaptureRequest, ConnectRequest};
+    use crate::config::{BackendConfig, CaptureProfile, SecurityConfig};
+    use crate::model::{CaptureMode, PixelFormat};
+
+    /// Drives the bare-RTSP backend end to end against the pinned MediaMTX simulator: `connect()`
+    /// performs the live RTSP `DESCRIBE`/`SETUP` handshake and codec check, and `capture()` returns
+    /// one complete RGB frame. Invoke with `CAMERA_ADAPTER_RTSP_URI` pointed at a pinned MediaMTX
+    /// path (e.g. `rtsp://mediamtx:8554/camera`); ordinary unit tests stay hermetic.
+    #[tokio::test]
+    #[ignore = "requires the pinned MediaMTX simulator on the Compose network"]
+    async fn pinned_mediamtx_backend_captures_a_complete_rgb_frame() {
+        let stream_uri = std::env::var("CAMERA_ADAPTER_RTSP_URI")
+            .expect("live RTSP backend test requires CAMERA_ADAPTER_RTSP_URI");
+        let backend: BackendConfig = serde_json::from_value(json!({
+            "type": "rtsp",
+            "url": stream_uri,
+            "allowInsecure": true,
+        }))
+        .expect("valid rtsp backend config");
+        // The fixture's efficient H.265 IDR can exceed the production default ratio; raise it to the
+        // documented, operator-configurable maximum, exactly as the engine fixture test does.
+        let security = SecurityConfig {
+            max_decompression_ratio: 1_000,
+            ..SecurityConfig::default()
+        };
+        let factory = RtspBackendFactory::new(None, security, Arc::new(Semaphore::new(4)));
+
+        let mut session = factory
+            .connect(ConnectRequest {
+                instance_id: "rtsp-cam".to_string(),
+                backend,
+                timeout: Duration::from_secs(10),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("connect establishes the live RTSP session");
+
+        let capabilities = session.capabilities();
+        assert_eq!(capabilities.capture_modes, vec![CaptureMode::RtspFrame]);
+        assert!(capabilities.rtsp);
+        assert!(!capabilities.ptz && !capabilities.snapshot_uri);
+
+        let profile: CaptureProfile =
+            serde_json::from_value(json!({ "output": { "encoding": "png" } })).unwrap();
+        let frame = session
+            .capture(CaptureRequest {
+                capture_id: "cap-live-1".to_string(),
+                profile,
+                maximum_frame_bytes: 1_048_576,
+                timeout: Duration::from_secs(15),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("a complete decoded RTSP frame");
+
+        assert_eq!(frame.capture_mode, CaptureMode::RtspFrame);
+        assert_eq!(frame.pixel_format, PixelFormat::Rgb8);
+        assert_eq!((frame.width, frame.height), (320, 240));
+        assert_eq!(frame.bytes.len(), 320 * 240 * 3);
+        assert_eq!(
+            frame.backend_metadata.get("captureId").and_then(|v| v.as_str()),
+            Some("cap-live-1"),
+        );
+
+        session.close().await.expect("idempotent close");
+        session.close().await.expect("close is idempotent");
+    }
+}
