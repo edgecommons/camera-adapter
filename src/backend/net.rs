@@ -671,3 +671,242 @@ pub(crate) fn basic_authorization(
     Ok(SecretBytes::new(header))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn creds(username: &str, password: &str) -> NetworkCredentials {
+        NetworkCredentials::new(username.as_bytes().to_vec(), password.as_bytes().to_vec())
+            .expect("valid credentials")
+    }
+
+    /// Deterministic 16-byte client nonce for reproducible Digest headers.
+    struct FixedNonce;
+    impl NonceSource for FixedNonce {
+        fn nonce(&self, length: usize) -> Result<Vec<u8>> {
+            Ok(vec![0xAB; length])
+        }
+    }
+
+    /// A nonce source that violates the 16-byte contract.
+    struct ShortNonce;
+    impl NonceSource for ShortNonce {
+        fn nonce(&self, _length: usize) -> Result<Vec<u8>> {
+            Ok(vec![0x00; 8])
+        }
+    }
+
+    /// A credential provider that must never be polled: the bounded resolver has to reject a
+    /// past deadline before it ever touches the provider.
+    struct UnusedProvider;
+    #[async_trait]
+    impl CredentialProvider for UnusedProvider {
+        async fn resolve_login(&self, _reference: &SecretRef) -> Result<Arc<NetworkCredentials>> {
+            unreachable!("a past deadline must short-circuit before the provider runs")
+        }
+        async fn resolve_bytes(&self, _reference: &SecretRef) -> Result<Arc<SecretBytes>> {
+            unreachable!("a past deadline must short-circuit before the provider runs")
+        }
+    }
+
+    fn digest_challenge(algorithm: DigestAlgorithm, qop_auth: bool) -> DigestChallenge {
+        DigestChallenge {
+            realm: "example-realm".to_owned(),
+            nonce: "server-nonce".to_owned(),
+            opaque: Some("server-opaque".to_owned()),
+            algorithm,
+            qop_auth,
+        }
+    }
+
+    #[test]
+    fn credentials_reject_fields_outside_the_permitted_bounds() {
+        // Empty username, over-long username, and over-long password each trip the bounds guard.
+        assert!(NetworkCredentials::new(Vec::new(), b"password".to_vec()).is_err());
+        assert!(NetworkCredentials::new(vec![b'u'; 1_025], b"password".to_vec()).is_err());
+        assert!(NetworkCredentials::new(b"user".to_vec(), vec![b'p'; 16 * 1024 + 1]).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_bytes_bounded_rejects_a_deadline_that_has_already_passed() {
+        let provider = UnusedProvider;
+        let reference = SecretRef {
+            secret: "tls/ca".to_owned(),
+            field: None,
+        };
+        // The function reads its own `Instant::now()` after we build the deadline, so a deadline
+        // captured here is guaranteed to be <= that later reading and takes the timeout path.
+        let deadline = Instant::now();
+        let error = resolve_bytes_bounded(
+            &provider,
+            &reference,
+            deadline,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a past deadline must abort opaque-secret resolution");
+        assert_eq!(error.code(), ErrorCode::CaptureTimeout);
+    }
+
+    #[tokio::test]
+    async fn system_resolver_returns_the_deduplicated_literal_address() {
+        // A literal IPv4 address resolves through `to_socket_addrs` without any network access,
+        // exercising the blocking-lookup limiter and result-normalization path end to end.
+        let addresses = SystemResolver
+            .resolve("127.0.0.1", 554)
+            .await
+            .expect("a literal loopback address resolves offline");
+        assert_eq!(addresses, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+    }
+
+    #[test]
+    fn parse_digest_challenge_rejects_an_oversized_header() {
+        let header = format!("Digest realm=\"r\", nonce=\"{}\"", "n".repeat(20_000));
+        let error = parse_digest_challenge(&header).expect_err("oversized headers are rejected");
+        assert!(error.to_string().contains("oversized"));
+    }
+
+    #[test]
+    fn parse_digest_challenge_enforces_field_bounds_and_algorithm_and_qop() {
+        // Empty nonce trips the field-bounds guard.
+        assert!(parse_digest_challenge("Digest realm=\"r\", nonce=\"\"").is_err());
+        // An unsupported algorithm token is rejected by DigestAlgorithm::parse.
+        assert!(
+            parse_digest_challenge("Digest realm=\"r\", nonce=\"abc\", algorithm=whirlpool").is_err()
+        );
+        // A qop offer that does not include `auth` is rejected.
+        assert!(
+            parse_digest_challenge("Digest realm=\"r\", nonce=\"abc\", qop=\"auth-int\"").is_err()
+        );
+    }
+
+    #[test]
+    fn parse_digest_challenge_accepts_every_supported_algorithm() {
+        for token in ["MD5", "MD5-sess", "SHA-256", "SHA-256-sess"] {
+            let header = format!("Digest realm=\"r\", nonce=\"abc\", algorithm={token}, qop=\"auth\"");
+            let challenge =
+                parse_digest_challenge(&header).expect("a supported algorithm parses");
+            assert!(challenge.qop_auth);
+            assert_eq!(challenge.algorithm.token(), token);
+            assert_eq!(
+                challenge.algorithm.is_session(),
+                token.ends_with("-sess"),
+                "the session flag must track the -sess suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_digest_challenge_isolates_a_trailing_scheme_and_unescapes_quotes() {
+        // Digest is offered first with a backslash-escaped quote inside the realm, and a second
+        // Basic scheme follows. Isolation must return only the Digest parameters, and the escaped
+        // quote must survive unescaping.
+        let header = r#"Digest realm="ex\"tra", nonce="abc", Basic realm="b""#;
+        let challenge = parse_digest_challenge(header).expect("the digest scheme is isolated");
+        assert_eq!(challenge.realm, "ex\"tra");
+        assert_eq!(challenge.nonce, "abc");
+    }
+
+    #[test]
+    fn parse_digest_challenge_tolerates_whitespace_around_a_parameter_equals() {
+        // `nonce = "abc"` places whitespace before `=`. During scheme isolation the comma is
+        // followed by a token and then whitespace, and the whitespace is followed by `=`, so the
+        // scan falls through without treating the token as a new auth scheme.
+        let challenge = parse_digest_challenge("Digest realm=\"r\", nonce = \"abc\"")
+            .expect("whitespace around the parameter equals is tolerated");
+        assert_eq!(challenge.nonce, "abc");
+    }
+
+    #[test]
+    fn unescape_http_quoted_reports_a_dangling_trailing_escape() {
+        // A quoted-string body that ends mid-escape is malformed and is rejected rather than
+        // silently dropping the dangling backslash.
+        assert!(unescape_http_quoted("abc\\").is_err());
+        assert_eq!(
+            unescape_http_quoted("a\\\"b").expect("a well-formed escape decodes"),
+            "a\"b"
+        );
+    }
+
+    #[test]
+    fn parse_digest_challenge_skips_a_comma_not_followed_by_a_token() {
+        // The top-level comma before `="x"` is not followed by an HTTP token, so isolation
+        // continues past it; the empty parameter name is then rejected by the splitter.
+        let error = parse_digest_challenge(r#"Digest realm="r", nonce="n", ="x""#)
+            .expect_err("an empty parameter name is rejected");
+        assert!(error.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn digest_authorization_covers_every_algorithm_and_qop_branch() {
+        let credentials = creds("operator", "s3cret");
+        for (algorithm, qop_auth) in [
+            (DigestAlgorithm::Md5, true),
+            (DigestAlgorithm::Md5Sess, false),
+            (DigestAlgorithm::Sha256, true),
+            (DigestAlgorithm::Sha256Sess, false),
+        ] {
+            let challenge = digest_challenge(algorithm, qop_auth);
+            let header = digest_authorization_for_method(
+                &challenge,
+                &credentials,
+                "GET",
+                "rtsp://camera.example/stream",
+                1,
+                &FixedNonce,
+            )
+            .expect("a valid digest header is produced");
+            let text = std::str::from_utf8(header.expose()).expect("the header is UTF-8");
+            assert!(text.starts_with("Digest username=\"operator\""));
+            assert!(text.contains(&format!("algorithm={}", algorithm.token())));
+            assert!(text.contains("opaque=\"server-opaque\""));
+            if qop_auth {
+                assert!(text.contains("qop=auth"));
+            } else {
+                assert!(!text.contains("qop="));
+            }
+        }
+    }
+
+    #[test]
+    fn digest_authorization_rejects_invalid_inputs() {
+        let credentials = creds("operator", "s3cret");
+        let challenge = digest_challenge(DigestAlgorithm::Md5, true);
+        // A wrapped nonce counter is rejected.
+        assert!(
+            digest_authorization_for_method(&challenge, &credentials, "GET", "t", 0, &FixedNonce)
+                .is_err()
+        );
+        // A non-uppercase method token is rejected.
+        assert!(
+            digest_authorization_for_method(&challenge, &credentials, "get", "t", 1, &FixedNonce)
+                .is_err()
+        );
+        // A nonce source that returns the wrong byte count is rejected.
+        assert!(
+            digest_authorization_for_method(&challenge, &credentials, "GET", "t", 1, &ShortNonce)
+                .is_err()
+        );
+        // A target long enough to overflow the header budget is rejected.
+        let long_target = "a".repeat(MAX_AUTH_HEADER_BYTES + 1);
+        assert!(digest_authorization_for_method(
+            &challenge,
+            &credentials,
+            "GET",
+            &long_target,
+            1,
+            &FixedNonce,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn basic_authorization_encodes_only_over_a_secure_transport() {
+        let credentials = creds("operator", "s3cret");
+        assert!(basic_authorization(&credentials, false).is_err());
+        let header = basic_authorization(&credentials, true).expect("secure basic header");
+        let text = std::str::from_utf8(header.expose()).expect("the header is UTF-8");
+        assert!(text.starts_with("Basic "));
+    }
+}
+
