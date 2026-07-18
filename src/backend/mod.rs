@@ -27,6 +27,8 @@ pub mod genicam_aravis;
 pub mod onvif;
 #[cfg(feature = "rtsp")]
 pub mod rtsp;
+#[cfg(any(feature = "onvif", feature = "rtsp"))]
+pub(crate) mod net;
 #[cfg(all(test, feature = "onvif", not(feature = "rtsp")))]
 #[path = "rtsp.rs"]
 mod rtsp_contract_tests;
@@ -306,12 +308,12 @@ impl BackendRuntimeContext {
         });
         Ok(onvif::OnvifBackendFactory::new(
             onvif::OnvifBackendDependencies {
-                resolver: Arc::new(onvif::SystemResolver),
+                resolver: Arc::new(net::SystemResolver),
                 discovery,
                 transport: Arc::new(onvif::ReqwestOnvifTransport::default()),
                 credentials,
-                clock: Arc::new(onvif::SystemOnvifClock),
-                nonce_source: Arc::new(onvif::SystemNonceSource),
+                clock: Arc::new(net::SystemNetClock),
+                nonce_source: Arc::new(net::SystemNonceSource),
                 security: global.security.clone(),
                 decode_gate: Arc::clone(&self.decode_gate),
             },

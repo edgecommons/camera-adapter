@@ -23,8 +23,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use super::onvif::{
-    OnvifResolver, RtspNetworkAnchor, is_forbidden_network_address, normalize_host_text,
+use super::net::{
+    AddressResolver, RtspNetworkAnchor, is_forbidden_network_address, normalize_host_text,
 };
 use crate::config::AuthenticationMode;
 use crate::{CameraError, ErrorCode, Result};
@@ -53,8 +53,8 @@ use tokio_rustls::TlsConnector;
 use zeroize::Zeroizing;
 
 #[cfg(feature = "rtsp")]
-use super::onvif::{
-    DigestChallenge, OnvifClock, OnvifCredentials, OnvifNonceSource, SecretBytes,
+use super::net::{
+    DigestChallenge, NetClock, NetworkCredentials, NonceSource, SecretBytes,
     basic_authorization, digest_authorization_for_method, find_auth_scheme, parse_digest_challenge,
 };
 #[cfg(feature = "rtsp")]
@@ -177,7 +177,7 @@ impl RtspUriPolicy {
         candidate: &str,
         anchor: RtspNetworkAnchor,
         allow_insecure: bool,
-        resolver: &dyn OnvifResolver,
+        resolver: &dyn AddressResolver,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<(Self, PinnedRtspUri)> {
@@ -214,7 +214,7 @@ impl RtspUriPolicy {
     /// new control connection. This catches both mixed answers and rebinding.
     pub(crate) async fn pin(
         &self,
-        resolver: &dyn OnvifResolver,
+        resolver: &dyn AddressResolver,
         deadline: Instant,
         cancellation: &CancellationToken,
     ) -> Result<PinnedRtspUri> {
@@ -332,7 +332,7 @@ fn validate_rtsp_addresses(
 }
 
 async fn resolve_rtsp_bounded(
-    resolver: &dyn OnvifResolver,
+    resolver: &dyn AddressResolver,
     host: &str,
     port: u16,
     deadline: Instant,
@@ -2139,8 +2139,8 @@ async fn build_tls_client_config_bounded(
 #[cfg(feature = "rtsp")]
 #[derive(Clone)]
 struct RtspClientOptions {
-    credentials: Option<Arc<OnvifCredentials>>,
-    nonce_source: Arc<dyn OnvifNonceSource>,
+    credentials: Option<Arc<NetworkCredentials>>,
+    nonce_source: Arc<dyn NonceSource>,
     authentication_mode: AuthenticationMode,
     basic_over_plaintext: bool,
     max_header_bytes: usize,
@@ -2172,8 +2172,8 @@ impl std::fmt::Debug for RtspAuthentication {
 impl RtspAuthentication {
     fn authorization(
         &mut self,
-        credentials: Option<&OnvifCredentials>,
-        nonce_source: &dyn OnvifNonceSource,
+        credentials: Option<&NetworkCredentials>,
+        nonce_source: &dyn NonceSource,
         method: &str,
         target: &str,
         basic_allowed: bool,
@@ -2945,13 +2945,13 @@ impl Drop for RtspWorkerHandle {
 #[cfg(feature = "rtsp")]
 pub(crate) struct RtspCaptureController {
     policy: RtspUriPolicy,
-    resolver: Arc<dyn OnvifResolver>,
+    resolver: Arc<dyn AddressResolver>,
     options: RtspClientOptions,
     session_policy: RtspSessionPolicy,
     maximum_frame_bytes: u64,
     maximum_decompression_ratio: u32,
     source_host: String,
-    clock: Arc<dyn OnvifClock>,
+    clock: Arc<dyn NetClock>,
     decode_gate: Arc<Semaphore>,
     worker: Option<RtspWorkerHandle>,
 }
@@ -2980,9 +2980,9 @@ impl std::fmt::Debug for RtspCaptureController {
 pub(crate) struct RtspControllerConfig {
     pub(crate) stream_uri: String,
     pub(crate) anchor: RtspNetworkAnchor,
-    pub(crate) resolver: Arc<dyn OnvifResolver>,
-    pub(crate) credentials: Option<Arc<OnvifCredentials>>,
-    pub(crate) nonce_source: Arc<dyn OnvifNonceSource>,
+    pub(crate) resolver: Arc<dyn AddressResolver>,
+    pub(crate) credentials: Option<Arc<NetworkCredentials>>,
+    pub(crate) nonce_source: Arc<dyn NonceSource>,
     pub(crate) private_ca: Option<Arc<SecretBytes>>,
     pub(crate) verify_hostname: bool,
     pub(crate) allow_insecure: bool,
@@ -2990,7 +2990,7 @@ pub(crate) struct RtspControllerConfig {
     pub(crate) security: SecurityConfig,
     pub(crate) session_policy: RtspSessionPolicy,
     pub(crate) maximum_frame_bytes: u64,
-    pub(crate) clock: Arc<dyn OnvifClock>,
+    pub(crate) clock: Arc<dyn NetClock>,
     /// Component-wide bound on concurrent blocking GStreamer operations, shared by every camera.
     ///
     /// Every decoder creation and every access-unit decode takes a permit, so this is the real
@@ -3286,7 +3286,7 @@ impl Drop for RtspCaptureController {
 #[allow(clippy::too_many_arguments)]
 async fn run_rtsp_worker(
     policy: RtspUriPolicy,
-    resolver: Arc<dyn OnvifResolver>,
+    resolver: Arc<dyn AddressResolver>,
     options: RtspClientOptions,
     session_policy: RtspSessionPolicy,
     maximum_frame_bytes: u64,
@@ -3518,7 +3518,7 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "rtsp")]
-    use crate::backend::onvif::{SystemNonceSource, SystemOnvifClock, SystemResolver};
+    use crate::backend::net::{SystemNonceSource, SystemNetClock, SystemResolver};
 
     /// The shared decode gate, sized exactly as production sizes it.
     ///
@@ -3573,7 +3573,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl OnvifResolver for SequenceResolver {
+    impl AddressResolver for SequenceResolver {
         async fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<IpAddr>> {
             self.0
                 .lock()
@@ -3608,7 +3608,7 @@ mod tests {
         let url = Url::parse(&stream_uri).expect("test URI must be valid");
         let host = url.host_str().expect("test URI has a host").to_owned();
         let port = url.port_or_known_default().expect("test URI has a port");
-        let resolver: Arc<dyn OnvifResolver> = Arc::new(SystemResolver);
+        let resolver: Arc<dyn AddressResolver> = Arc::new(SystemResolver);
         let addresses = resolver
             .resolve(&host, port)
             .await
@@ -3639,7 +3639,7 @@ mod tests {
                 security,
                 session_policy: RtspSessionPolicy::OnDemand,
                 maximum_frame_bytes: 1_048_576,
-                clock: Arc::new(SystemOnvifClock),
+                clock: Arc::new(SystemNetClock),
                 decode_gate: test_decode_gate(),
             },
             Instant::now() + Duration::from_secs(10),
@@ -3675,7 +3675,7 @@ mod tests {
         let url = Url::parse(&stream_uri).expect("test URI must be valid");
         let host = url.host_str().expect("test URI has a host").to_owned();
         let port = url.port_or_known_default().expect("test URI has a port");
-        let resolver: Arc<dyn OnvifResolver> = Arc::new(SystemResolver);
+        let resolver: Arc<dyn AddressResolver> = Arc::new(SystemResolver);
         let addresses = resolver
             .resolve(&host, port)
             .await
@@ -3702,7 +3702,7 @@ mod tests {
                 },
                 session_policy: RtspSessionPolicy::Warm,
                 maximum_frame_bytes: 1_048_576,
-                clock: Arc::new(SystemOnvifClock),
+                clock: Arc::new(SystemNetClock),
                 decode_gate: test_decode_gate(),
             },
             Instant::now() + Duration::from_secs(10),
