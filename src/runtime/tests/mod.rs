@@ -77,7 +77,7 @@ fn retained_snapshot_cursor_is_opaque_query_bound_and_stable() {
             .snapshot_page("list", &changed_query, Some(&cursor), None, None, 1)
             .unwrap_err()
             .code(),
-        crate::ErrorCode::InvalidRequest
+        crate::ErrorCode::BadArgs
     );
 }
 

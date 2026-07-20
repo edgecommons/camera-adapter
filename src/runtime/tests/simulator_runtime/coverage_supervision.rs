@@ -76,6 +76,7 @@ async fn runtime_with_component_events(
         cursors: CursorStore::default(),
         reload_gate: tokio::sync::Mutex::new(()),
         reloading: AtomicBool::new(false),
+        paused: RwLock::new(std::collections::BTreeSet::new()),
         self_reference: OnceLock::new(),
     });
     let _ = runtime.self_reference.set(Arc::downgrade(&runtime));
@@ -629,7 +630,7 @@ async fn a_supervisor_cannot_be_started_for_a_camera_that_is_not_configured() {
 
     assert_eq!(
         error.code(),
-        crate::ErrorCode::UnknownInstance,
+        crate::ErrorCode::NoSuchInstance,
         "an unconfigured camera must be rejected by name"
     );
     runtime.shutdown().await;
@@ -692,7 +693,7 @@ async fn a_camera_whose_actor_cannot_be_built_is_held_in_backoff_and_retried() {
             .last_error
             .as_ref()
             .map(|error| error.code.as_str()),
-        Some("INVALID_REQUEST"),
+        Some("BAD_ARGS"),
         "the camera must carry the reason it cannot be served"
     );
     assert!(

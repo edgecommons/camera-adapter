@@ -118,7 +118,7 @@ async fn a_group_capture_of_one_camera_is_refused() {
         .unwrap_err();
     assert_eq!(
         error.code(),
-        crate::ErrorCode::InvalidRequest,
+        crate::ErrorCode::BadArgs,
         "a one-camera group is not a group"
     );
     assert!(
@@ -190,7 +190,7 @@ async fn a_group_naming_an_unknown_camera_creates_nothing_at_all() {
         .unwrap_err();
     assert_eq!(
         error.code(),
-        crate::ErrorCode::UnknownInstance,
+        crate::ErrorCode::NoSuchInstance,
         "a group naming a camera that is not configured is refused whole"
     );
     assert!(
@@ -929,7 +929,7 @@ async fn a_deferred_verb_rejects_an_invalid_body_immediately() {
     {
         CommandOutcome::ImmediateError(error) => assert_eq!(
             error.code,
-            crate::ErrorCode::InvalidRequest.as_str(),
+            crate::ErrorCode::BadArgs.as_str(),
             "the closed schema must refuse an unknown field"
         ),
         other => panic!("an unparseable capture body must be refused, got {other:?}"),
@@ -947,7 +947,7 @@ async fn a_deferred_verb_rejects_an_invalid_body_immediately() {
     {
         CommandOutcome::ImmediateError(error) => assert_eq!(
             error.code,
-            crate::ErrorCode::InvalidRequest.as_str(),
+            crate::ErrorCode::BadArgs.as_str(),
             "a one-camera group is refused before it is ever deferred"
         ),
         other => panic!("an invalid group body must be refused, got {other:?}"),
@@ -1245,7 +1245,7 @@ async fn preset_mutation_is_refused_where_recall_is_not() {
     .unwrap();
     assert_eq!(
         runtime.perform_presets(recall).await.unwrap_err().code(),
-        crate::ErrorCode::InvalidRequest,
+        crate::ErrorCode::BadArgs,
         "recall is not a mutation: it reaches the camera, which rejects the unknown token itself"
     );
     runtime.shutdown().await;
@@ -1490,7 +1490,7 @@ async fn a_cancellation_whose_camera_is_gone_records_its_failure_and_replays_it(
         .cancel_capture(request.clone())
         .await
         .expect_err("a capture whose camera is no longer configured cannot be cancelled");
-    assert_eq!(error.code(), crate::ErrorCode::UnknownInstance);
+    assert_eq!(error.code(), crate::ErrorCode::NoSuchInstance);
 
     let replayed = runtime
         .cancel_capture(request)
@@ -1498,7 +1498,7 @@ async fn a_cancellation_whose_camera_is_gone_records_its_failure_and_replays_it(
         .expect("the retry is answered from the ledger rather than run a second time");
     assert_eq!(
         replayed["errorCode"],
-        crate::ErrorCode::UnknownInstance.as_str(),
+        crate::ErrorCode::NoSuchInstance.as_str(),
         "the recorded failure is what the retry gets back"
     );
     assert!(
@@ -1590,7 +1590,7 @@ async fn the_queue_verbs_refuse_a_malformed_or_unconsented_request() {
             .await
             .unwrap_err()
             .code(),
-        crate::ErrorCode::InvalidRequest,
+        crate::ErrorCode::BadArgs,
         "an instance that is not a UNS token is refused before the catalog is touched"
     );
     assert_eq!(
@@ -1605,7 +1605,7 @@ async fn the_queue_verbs_refuse_a_malformed_or_unconsented_request() {
             .await
             .unwrap_err()
             .code(),
-        crate::ErrorCode::InvalidRequest,
+        crate::ErrorCode::BadArgs,
         "draining every camera requires the caller to say allCameras=true"
     );
     runtime.shutdown().await;
@@ -2436,7 +2436,7 @@ async fn a_camera_that_is_down_reports_why_on_the_connectivity_surface() {
                 .and_then(serde_json::Value::as_str);
             assert!(
                 code == Some(crate::ErrorCode::UnsupportedCapability.as_str())
-                    || code == Some(crate::ErrorCode::InvalidRequest.as_str()),
+                    || code == Some(crate::ErrorCode::BadArgs.as_str()),
                 "a camera that is down must carry a stable error code an operator can act on without                  reading prose; got {code:?}"
             );
             assert!(
@@ -2529,7 +2529,7 @@ async fn a_discovery_cursor_that_belongs_to_no_snapshot_is_refused() {
         .expect_err("a cursor with no snapshot behind it cannot be paged");
     assert_eq!(
         error.code(),
-        crate::ErrorCode::InvalidRequest,
+        crate::ErrorCode::BadArgs,
         "an unresolvable cursor is refused, not silently turned into a new discovery pass"
     );
     runtime.shutdown().await;
@@ -2922,7 +2922,7 @@ async fn the_list_verb_pages_capabilities_on_demand_and_offers_only_unclaimed_di
     );
     assert_eq!(
         stale.code,
-        crate::ErrorCode::InvalidRequest.as_str(),
+        crate::ErrorCode::BadArgs.as_str(),
         "a cursor that resolves to no retained result is refused, not answered from the head"
     );
     assert_eq!(
@@ -3213,7 +3213,7 @@ async fn the_capture_status_verb_answers_by_capture_group_request_and_list() {
     );
     assert_eq!(
         bad_cursor.code,
-        crate::ErrorCode::InvalidRequest.as_str(),
+        crate::ErrorCode::BadArgs.as_str(),
         "a member cursor that belongs to no retained page is refused, not answered from the head"
     );
 
@@ -3574,7 +3574,7 @@ async fn a_group_capture_with_an_unusable_request_id_is_refused_before_anything_
         .expect_err("an empty requestId cannot key a durable group");
     assert_eq!(
         error.code(),
-        crate::ErrorCode::InvalidRequest,
+        crate::ErrorCode::BadArgs,
         "the caller is told its key is unusable rather than given un-retryable work"
     );
     assert!(
@@ -4064,7 +4064,7 @@ async fn queue_status_for_a_camera_that_does_not_exist_is_refused() {
         .expect_err("an unknown camera has no queue to report");
     assert_eq!(
         error.code(),
-        crate::ErrorCode::UnknownInstance,
+        crate::ErrorCode::NoSuchInstance,
         "the caller is told the camera does not exist, not handed an empty queue"
     );
 
@@ -4144,7 +4144,7 @@ async fn a_preset_cursor_that_belongs_to_no_snapshot_is_refused() {
         .expect_err("a cursor with no retained preset snapshot behind it cannot be paged");
     assert_eq!(
         error.code(),
-        crate::ErrorCode::InvalidRequest,
+        crate::ErrorCode::BadArgs,
         "an unresolvable cursor is refused, not turned into a second read of the camera"
     );
     runtime.shutdown().await;
@@ -4720,10 +4720,13 @@ async fn a_thumbnail_that_fails_or_is_dropped_is_counted_on_the_capture_metric()
     runtime.waiters.thumbnail_dropped().await;
     runtime.waiters.thumbnail_dropped().await;
 
+    // The counts accumulate on the hooks; a drain emits their Total/Interval pairs.
+    runtime.metrics.drain_captures().await;
+
     assert_eq!(
         recorder.counts(
             crate::observability::CAPTURE_METRIC,
-            crate::observability::THUMBNAIL_FAILED_MEASURE
+            &format!("{}Total", crate::observability::THUMBNAIL_FAILED_MEASURE)
         ),
         1.0,
         "a thumbnail that could not be rendered must be visible outside the process"
@@ -4731,7 +4734,7 @@ async fn a_thumbnail_that_fails_or_is_dropped_is_counted_on_the_capture_metric()
     assert_eq!(
         recorder.counts(
             crate::observability::CAPTURE_METRIC,
-            crate::observability::THUMBNAIL_DROPPED_MEASURE
+            &format!("{}Total", crate::observability::THUMBNAIL_DROPPED_MEASURE)
         ),
         2.0,
         "and so must every thumbnail that did not fit the ceiling"
@@ -4746,4 +4749,148 @@ async fn a_thumbnail_that_fails_or_is_dropped_is_counted_on_the_capture_metric()
     );
 
     runtime.shutdown().await;
+}
+
+/// The lifecycle verbs suspend a camera's new capture work and surface the state in `sb/status`.
+///
+/// `sb/pause` / `sb/resume` are the standardized lifecycle verbs (SOUTHBOUND.md §2.2). Pausing a
+/// camera refuses NEW capture work with a stable `INSTANCE_PAUSED` code while leaving its sibling
+/// untouched; the toggle is idempotent (`changed` reports whether it moved); and the paused flag is
+/// visible where an operator and the overview panel read status. Resuming clears it.
+#[tokio::test]
+async fn pause_and_resume_suspend_new_capture_work_and_surface_in_status() {
+    let (port, _broker) = spawn_recording_mqtt_broker().await;
+    let directory = TempDir::new().unwrap();
+    let runtime = runtime(config(directory.path(), &["camera-a", "camera-b"], false), &directory).await;
+    let (_app, deferred) = command_deferred_registry(&directory, port).await;
+
+    // Pause camera-a — idempotent, and it names the instance it moved.
+    let paused = immediate_success(
+        runtime
+            .handle_camera_command(
+                "sb/pause",
+                command_message("sb/pause", "p1", json!({ "instance": "camera-a" })),
+                deferred.clone(),
+            )
+            .await,
+    );
+    assert_eq!(paused["id"], json!("camera-a"));
+    assert_eq!(paused["paused"], json!(true));
+    assert_eq!(paused["changed"], json!(true));
+
+    let again = immediate_success(
+        runtime
+            .handle_camera_command(
+                "sb/pause",
+                command_message("sb/pause", "p2", json!({ "instance": "camera-a" })),
+                deferred.clone(),
+            )
+            .await,
+    );
+    assert_eq!(again["changed"], json!(false), "pausing an already-paused camera changes nothing");
+
+    // Status carries the paused flag, per instance and in the fleet listing.
+    let status = immediate_success(
+        runtime
+            .handle_camera_command(
+                "sb/status",
+                command_message("sb/status", "s1", json!({ "instance": "camera-a" })),
+                deferred.clone(),
+            )
+            .await,
+    );
+    assert_eq!(status["paused"], json!(true), "a paused camera says so in its status");
+
+    let fleet = immediate_success(
+        runtime
+            .handle_camera_command(
+                "sb/status",
+                command_message("sb/status", "s2", json!({})),
+                deferred.clone(),
+            )
+            .await,
+    );
+    let cameras = fleet["cameras"].as_array().expect("a fleet status lists every camera");
+    let a = cameras.iter().find(|c| c["instance"] == json!("camera-a")).unwrap();
+    let b = cameras.iter().find(|c| c["instance"] == json!("camera-b")).unwrap();
+    assert_eq!(a["paused"], json!(true));
+    assert_eq!(b["paused"], json!(false), "pausing one camera must not pause its siblings");
+
+    // New capture work for the paused camera is refused with the stable code; the sibling still works.
+    let refused = runtime
+        .submit_capture(
+            "camera-a".to_string(),
+            "while-paused".to_string(),
+            None,
+            None,
+            serde_json::Map::new(),
+            "while-paused-correlation".to_string(),
+            "sb/capture-submit",
+            crate::admission::CapturePriority::Submitted,
+        )
+        .await
+        .expect_err("a paused camera must refuse new capture work");
+    assert_eq!(refused.code(), crate::ErrorCode::InstancePaused);
+
+    runtime
+        .submit_capture(
+            "camera-b".to_string(),
+            "sibling-ok".to_string(),
+            None,
+            None,
+            serde_json::Map::new(),
+            "sibling-ok-correlation".to_string(),
+            "sb/capture-submit",
+            crate::admission::CapturePriority::Submitted,
+        )
+        .await
+        .expect("an un-paused sibling must still accept work");
+
+    // Resume clears it, and capture work is admitted again.
+    let resumed = immediate_success(
+        runtime
+            .handle_camera_command(
+                "sb/resume",
+                command_message("sb/resume", "r1", json!({ "instance": "camera-a" })),
+                deferred.clone(),
+            )
+            .await,
+    );
+    assert_eq!(resumed["paused"], json!(false));
+    assert_eq!(resumed["changed"], json!(true));
+
+    runtime
+        .submit_capture(
+            "camera-a".to_string(),
+            "after-resume".to_string(),
+            None,
+            None,
+            serde_json::Map::new(),
+            "after-resume-correlation".to_string(),
+            "sb/capture-submit",
+            crate::admission::CapturePriority::Submitted,
+        )
+        .await
+        .expect("a resumed camera accepts capture work again");
+
+    runtime.shutdown().await;
+}
+
+/// The panel trio is registered with the ids, orders, and instance scope the baseline prescribes.
+#[test]
+fn the_panel_trio_is_registered_with_the_right_ids_orders_and_scope() {
+    let panels = crate::runtime::camera_panels();
+    let ids: Vec<&str> = panels.iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["overview", "signals", "diagnostics"]);
+    let orders: Vec<u64> = panels.iter().map(|p| p["order"].as_u64().unwrap()).collect();
+    assert_eq!(orders, vec![10, 20, 30]);
+    for panel in &panels {
+        assert_eq!(panel["scope"], json!("instance"), "every panel is instance-scoped");
+    }
+    // The overview panel binds the lifecycle verbs the adapter actually serves.
+    assert_eq!(
+        panels[0]["verbs"],
+        json!(["sb/status", "sb/reconnect", "sb/pause", "sb/resume"])
+    );
+    assert_eq!(panels[2]["verbs"], json!(["sb/discover", "sb/queue-status"]));
 }

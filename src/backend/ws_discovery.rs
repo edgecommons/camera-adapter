@@ -149,7 +149,7 @@ impl WsDiscovery for ExplicitInterfaceWsDiscovery {
     ) -> Result<Vec<DiscoveryProbeMatch>> {
         if max_results == 0 || max_results > 10_000 {
             return Err(rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "WS-Discovery result bound must be in 1..=10000",
             ));
         }
@@ -1397,7 +1397,7 @@ xmlns:d=\"http://schemas.xmlsoap.org/ws/2005/04/discovery\">\
                 .await
                 .expect_err("result limit is a public input bound")
                 .code(),
-                ErrorCode::InvalidRequest
+                ErrorCode::BadArgs
             );
         }
     }

@@ -692,7 +692,7 @@ impl JobEngine {
                 });
             }
             return Err(CameraError::rejected(
-                ErrorCode::CameraUnavailable,
+                ErrorCode::DeviceUnavailable,
                 "capture is owned by recovery or an unavailable actor",
             ));
         };
@@ -2294,7 +2294,7 @@ fn validate_submission(submission: &JobSubmission) -> Result<()> {
         || spec.profile.maximum_frame_bytes == 0
     {
         return Err(CameraError::rejected(
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             "immutable capture snapshot contains an empty/zero required field",
         ));
     }
@@ -2435,7 +2435,7 @@ fn cancelled_error(stage: &'static str) -> CameraError {
 fn is_retriable(code: ErrorCode) -> bool {
     matches!(
         code,
-        ErrorCode::CameraUnavailable
+        ErrorCode::DeviceUnavailable
             | ErrorCode::QueueFull
             | ErrorCode::ResourceLimit
             | ErrorCode::CaptureTimeout
@@ -3341,7 +3341,7 @@ mod tests {
         empty.spec.capture_id.clear();
         assert_eq!(
             validate_submission(&empty).unwrap_err().code(),
-            ErrorCode::InvalidRequest
+            ErrorCode::BadArgs
         );
 
         let mut effective_profile = submission();
@@ -3456,7 +3456,7 @@ mod tests {
         );
 
         for code in [
-            ErrorCode::CameraUnavailable,
+            ErrorCode::DeviceUnavailable,
             ErrorCode::QueueFull,
             ErrorCode::ResourceLimit,
             ErrorCode::CaptureTimeout,
@@ -3466,7 +3466,7 @@ mod tests {
         ] {
             assert!(is_retriable(code), "{code}");
         }
-        assert!(!is_retriable(ErrorCode::InvalidRequest));
+        assert!(!is_retriable(ErrorCode::BadArgs));
 
         assert_eq!(bounded_detail("one\ntwo\u{7f}".to_string()), "one two ");
         let bounded = bounded_detail("é".repeat(600));

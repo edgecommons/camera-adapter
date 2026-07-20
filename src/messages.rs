@@ -535,7 +535,7 @@ fn invalid<T>(message: impl Into<String>) -> Result<T> {
 }
 
 fn invalid_error(message: impl Into<String>) -> CameraError {
-    CameraError::rejected(ErrorCode::InvalidRequest, message.into())
+    CameraError::rejected(ErrorCode::BadArgs, message.into())
 }
 
 #[cfg(test)]
@@ -638,7 +638,7 @@ mod tests {
         let mut schema = base_body();
         schema.schema_version = 2;
         let error = TerminalMessage::new(TerminalKind::Cancelled, schema).unwrap_err();
-        assert_eq!(error.code(), ErrorCode::InvalidRequest);
+        assert_eq!(error.code(), ErrorCode::BadArgs);
 
         for field in [
             "event_id",
@@ -657,7 +657,7 @@ mod tests {
                 _ => unreachable!("test field list is exhaustive"),
             }
             let error = TerminalMessage::new(TerminalKind::Cancelled, body).unwrap_err();
-            assert_eq!(error.code(), ErrorCode::InvalidRequest, "{field}");
+            assert_eq!(error.code(), ErrorCode::BadArgs, "{field}");
         }
     }
 

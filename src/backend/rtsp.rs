@@ -3166,7 +3166,7 @@ impl RtspCaptureController {
                         closed.stop(deadline).await;
                     }
                     return Err(CameraError::rejected(
-                        ErrorCode::CameraUnavailable,
+                        ErrorCode::DeviceUnavailable,
                         "RTSP stream closed before a fresh complete frame",
                     ));
                 }
@@ -3209,7 +3209,7 @@ impl RtspCaptureController {
                 WaitOutcome::Changed(result) => {
                     if result.is_err() {
                         return Err(CameraError::rejected(
-                            ErrorCode::CameraUnavailable,
+                            ErrorCode::DeviceUnavailable,
                             "RTSP worker stopped before producing a complete frame",
                         ));
                     }

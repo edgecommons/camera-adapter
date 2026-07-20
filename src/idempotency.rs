@@ -49,7 +49,7 @@ impl std::fmt::Debug for RequestHash {
 pub fn validate_request_id(request_id: &str) -> Result<()> {
     if request_id.is_empty() || request_id.len() > 256 {
         return Err(CameraError::rejected(
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             "requestId must contain 1 to 256 UTF-8 bytes",
         ));
     }
@@ -61,7 +61,7 @@ pub fn validate_request_id(request_id: &str) -> Result<()> {
         )
     }) {
         return Err(CameraError::rejected(
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             "requestId must not contain control or format characters",
         ));
     }
@@ -76,7 +76,7 @@ pub fn validate_request_id(request_id: &str) -> Result<()> {
 pub fn canonical_request_hash(request: &Value, sort_instances: bool) -> Result<RequestHash> {
     if !request.is_object() {
         return Err(CameraError::rejected(
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             "command arguments must be a JSON object",
         ));
     }
@@ -95,7 +95,7 @@ pub fn canonical_request_hash(request: &Value, sort_instances: bool) -> Result<R
 pub fn canonical_request_bytes(request: &Value, sort_instances: bool) -> Result<Vec<u8>> {
     if !request.is_object() {
         return Err(CameraError::rejected(
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             "command arguments must be a JSON object",
         ));
     }
@@ -181,13 +181,13 @@ fn encode_array(values: &[Value], output: &mut Vec<u8>) -> Result<()> {
 
 fn encode_sorted_instances(value: &Value, output: &mut Vec<u8>) -> Result<()> {
     let values = value.as_array().ok_or_else(|| {
-        CameraError::rejected(ErrorCode::InvalidRequest, "instances must be an array")
+        CameraError::rejected(ErrorCode::BadArgs, "instances must be an array")
     })?;
     let mut instances = Vec::with_capacity(values.len());
     for value in values {
         let instance = value.as_str().ok_or_else(|| {
             CameraError::rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "instances entries must be strings",
             )
         })?;
@@ -196,7 +196,7 @@ fn encode_sorted_instances(value: &Value, output: &mut Vec<u8>) -> Result<()> {
     instances.sort_unstable();
     if instances.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(CameraError::rejected(
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             "instances must not contain duplicates",
         ));
     }
@@ -323,7 +323,7 @@ mod tests {
         ] {
             let error = canonical_request_hash(&invalid, true)
                 .expect_err("invalid group targets must not acquire a durable ledger key");
-            assert_eq!(error.code(), ErrorCode::InvalidRequest);
+            assert_eq!(error.code(), ErrorCode::BadArgs);
         }
 
         assert_eq!(

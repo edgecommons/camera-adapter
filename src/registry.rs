@@ -151,7 +151,7 @@ impl CameraRegistry {
             .map(|entry| entry.sender.borrow().clone())
             .ok_or_else(|| {
                 CameraError::rejected(
-                    ErrorCode::UnknownInstance,
+                    ErrorCode::NoSuchInstance,
                     format!("camera instance '{instance}' is not configured"),
                 )
             })
@@ -164,10 +164,41 @@ impl CameraRegistry {
             .map(|entry| entry.config.clone())
             .ok_or_else(|| {
                 CameraError::rejected(
-                    ErrorCode::UnknownInstance,
+                    ErrorCode::NoSuchInstance,
                     format!("camera instance '{instance}' is not configured"),
                 )
             })
+    }
+
+    /// Resolves the single-camera omission rule to a configured instance, WITHOUT enforcing enabled
+    /// state.
+    ///
+    /// The lifecycle verbs (`sb/pause` / `sb/resume`) address a camera that need not be enabled --
+    /// pausing a camera an operator is about to disable, or resuming one after re-enabling it, are
+    /// both legitimate. So this is the routing-only sibling of [`Self::resolve_actuation_instance`]:
+    /// same D-EIP-13 omission rule and the same `BAD_ARGS` / `NO_SUCH_INSTANCE` codes, but no
+    /// `CAMERA_DISABLED` gate.
+    pub fn resolve_instance(&self, requested: Option<&str>) -> Result<String> {
+        let entries = self.read_entries()?;
+        let instance = match requested {
+            Some(instance) => instance.to_string(),
+            None if entries.len() == 1 => entries.keys().next().cloned().ok_or_else(|| {
+                CameraError::Catalog("registry changed during lookup".to_string())
+            })?,
+            None => {
+                return Err(CameraError::rejected(
+                    ErrorCode::BadArgs,
+                    "instance is required when more than one camera is configured",
+                ));
+            }
+        };
+        if !entries.contains_key(&instance) {
+            return Err(CameraError::rejected(
+                ErrorCode::NoSuchInstance,
+                format!("camera instance '{instance}' is not configured"),
+            ));
+        }
+        Ok(instance)
     }
 
     /// Resolves the single-camera omission rule and enforces enabled state for actuation.
@@ -180,14 +211,14 @@ impl CameraRegistry {
             })?,
             None => {
                 return Err(CameraError::rejected(
-                    ErrorCode::InstanceRequired,
+                    ErrorCode::BadArgs,
                     "instance is required when more than one camera is configured",
                 ));
             }
         };
         let entry = entries.get(&instance).ok_or_else(|| {
             CameraError::rejected(
-                ErrorCode::UnknownInstance,
+                ErrorCode::NoSuchInstance,
                 format!("camera instance '{instance}' is not configured"),
             )
         })?;
@@ -207,7 +238,7 @@ impl CameraRegistry {
             .map(|entry| entry.sender.subscribe())
             .ok_or_else(|| {
                 CameraError::rejected(
-                    ErrorCode::UnknownInstance,
+                    ErrorCode::NoSuchInstance,
                     format!("camera instance '{instance}' is not configured"),
                 )
             })
@@ -436,7 +467,7 @@ mod tests {
         let two = CameraRegistry::new(&config(true, false)).unwrap();
         assert_eq!(
             two.resolve_actuation_instance(None).unwrap_err().code(),
-            ErrorCode::InstanceRequired
+            ErrorCode::BadArgs
         );
         assert_eq!(
             two.resolve_actuation_instance(Some("camera-b"))
@@ -447,6 +478,30 @@ mod tests {
         assert_eq!(
             two.snapshot("camera-b").unwrap().state,
             CameraConnectionState::Disabled
+        );
+    }
+
+    /// The routing-only resolver applies the same omission rule and codes as actuation, but does NOT
+    /// gate on enabled state -- a disabled camera can still be paused or resumed.
+    #[test]
+    fn resolve_instance_routes_without_the_enabled_gate() {
+        let one = CameraRegistry::new(&config(false, true)).unwrap();
+        assert_eq!(one.resolve_instance(None).unwrap(), "camera-a");
+
+        let two = CameraRegistry::new(&config(true, false)).unwrap();
+        assert_eq!(
+            two.resolve_instance(None).unwrap_err().code(),
+            ErrorCode::BadArgs,
+            "a missing instance with two cameras is BAD_ARGS"
+        );
+        assert_eq!(
+            two.resolve_instance(Some("missing")).unwrap_err().code(),
+            ErrorCode::NoSuchInstance
+        );
+        assert_eq!(
+            two.resolve_instance(Some("camera-b")).unwrap(),
+            "camera-b",
+            "a DISABLED camera still resolves -- pause/resume do not require it to be enabled"
         );
     }
 
@@ -567,15 +622,15 @@ mod tests {
                 .resolve_actuation_instance(Some("missing"))
                 .unwrap_err()
                 .code(),
-            ErrorCode::UnknownInstance
+            ErrorCode::NoSuchInstance
         );
         assert_eq!(
             registry.camera_config("missing").unwrap_err().code(),
-            ErrorCode::UnknownInstance
+            ErrorCode::NoSuchInstance
         );
         assert_eq!(
             registry.subscribe("missing").unwrap_err().code(),
-            ErrorCode::UnknownInstance
+            ErrorCode::NoSuchInstance
         );
         assert!(
             !registry

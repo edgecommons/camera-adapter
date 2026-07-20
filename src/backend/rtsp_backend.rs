@@ -298,7 +298,7 @@ impl RtspSession {
     fn ensure_open(&self) -> Result<()> {
         if self.closed {
             Err(CameraError::rejected(
-                ErrorCode::CameraUnavailable,
+                ErrorCode::DeviceUnavailable,
                 "RTSP camera session is closed",
             ))
         } else {

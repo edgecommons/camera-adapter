@@ -316,37 +316,109 @@ impl FleetHealth {
     }
 }
 
+/// A `<name>Total` (monotonic since start) + `<name>Interval` (since the previous emit; reset on
+/// emit) counter pair — the operational-family convention every EdgeCommons adapter follows
+/// (SOUTHBOUND.md §5), so a fleet dashboard reads every adapter the same way.
+#[derive(Debug, Default, Clone, Copy)]
+struct Pair {
+    total: f64,
+    interval: f64,
+}
+
+impl Pair {
+    fn add(&mut self, value: f64) {
+        self.total += value;
+        self.interval += value;
+    }
+
+    /// Writes both measures into `out` and RESETS the interval — the emit convention.
+    fn drain_into(&self, out: &mut std::collections::HashMap<String, f64>, prefix: &str) {
+        out.insert(format!("{prefix}Total"), self.total);
+        out.insert(format!("{prefix}Interval"), self.interval);
+    }
+
+    fn reset_interval(&mut self) {
+        self.interval = 0.0;
+    }
+}
+
+/// The `(verb, result)` command counters for one `(instance, verb, result)` cell of `CameraCommand`.
+#[derive(Debug, Default)]
+struct CmdCounters {
+    requests: Pair,
+    errors: Pair,
+    latency_ms: f64,
+}
+
+/// The `camera_captures` counter set, one [`Pair`] per capture-lifecycle measure. Keyed by the
+/// `&'static str` measure name the job hooks already pass to [`CaptureMetrics::count`].
+type CaptureCounters = std::collections::BTreeMap<&'static str, Pair>;
+
+/// A `(instance, verb, result)` key into the `CameraCommand` family.
+type CommandKey = (String, &'static str, &'static str);
+
 /// The component's metric surface.
 ///
-/// The camera adapter emitted no metrics at all: there was not one call site for `metrics()`,
-/// `MetricBuilder`, or `MetricService` anywhere in the crate. Every number an operator would want --
-/// how much work is queued, how much is in flight, how much succeeded, how much failed -- existed
-/// somewhere inside the process and left no trace outside it. A capture that failed was a log line.
+/// Three families, following the SOUTHBOUND.md §5 operational-family pattern:
 ///
-/// Two metrics, and the split is deliberate:
+/// * `camera_captures` COUNTS the capture lifecycle on the job hooks the runtime fires — every
+///   measure is a `(Total, Interval)` counter pair, accumulated in-process and drained on the metric
+///   sampler's tick. The interval counter is what preserves the "every event must be seen" guarantee
+///   the immediate-emit design was reaching for: a capture that succeeded and one that failed between
+///   two drains both land in the interval, so nothing is lost — the drain is a reset, not a sample.
+/// * `camera_queue` SAMPLES what the component is holding right now — a level, not an event, so its
+///   measures are single gauges (there is nothing to miss between samples).
+/// * `CameraCommand` counts the `sb/*` command surface, dimensioned `instance` × `verb` × `result`,
+///   with `(Total, Interval)` request/error pairs plus a latency sum — the reference command family.
 ///
-/// * `camera_captures` is COUNTED as it happens, on the job hooks the runtime already fires. It
-///   answers "what has this component done", and it must not be sampled: a capture that succeeded
-///   and a capture that failed between two samples both have to be seen.
-/// * `camera_queue` is SAMPLED on a timer. It answers "what is this component holding right now",
-///   which is a level, not an event -- there is nothing to miss between samples.
-///
-/// Deliberately free of per-camera dimensions. A 256-camera fleet would otherwise mint 256 metric
-/// streams per measure, which is how a metrics bill and a Prometheus server both die. Per-camera
-/// state is answered by `sb/queue-status` and by the per-instance connectivity the heartbeat
-/// publishes.
+/// **Recorded cardinality decision (DESIGN.md).** `camera_captures` / `camera_queue` stay
+/// **fleet-scoped** (no per-instance dimension): a 256-camera fleet would otherwise mint 256 streams
+/// PER MEASURE on the highest-frequency families, which is how a metrics bill and a Prometheus server
+/// both die. Per-camera capture state is answered by `sb/queue-status` and the per-instance
+/// connectivity the heartbeat publishes. `CameraCommand` DOES carry the `instance` dimension the
+/// family pattern prescribes, because commands are operator-frequency, not capture-frequency; its
+/// `(instance, verb, result)` cells are defined **lazily on first use** rather than pre-populated, so
+/// its cardinality tracks what an operator actually commands rather than 256 × 16 × 2 cold streams.
 pub struct CaptureMetrics {
     metrics: Arc<dyn edgecommons::metrics::MetricService>,
     /// Serializes the define-then-emit pair that `southbound_health` needs. See [`Self::emit_health`].
     health: tokio::sync::Mutex<()>,
+    /// Accumulated `camera_captures` counter pairs, drained on the metric sampler's tick.
+    captures: std::sync::Mutex<CaptureCounters>,
+    /// Accumulated `CameraCommand` cells, drained on the metric sampler's tick.
+    commands: std::sync::Mutex<std::collections::BTreeMap<CommandKey, CmdCounters>>,
 }
 
-/// Counted as captures move: emitted at the moment, never sampled.
+/// Capture-lifecycle counters, drained as `(Total, Interval)` pairs on the sampler tick.
 pub const CAPTURE_METRIC: &str = "camera_captures";
 /// Sampled levels: what the component is holding right now.
 pub const QUEUE_METRIC: &str = "camera_queue";
 /// The standard per-instance southbound metric every adapter in the ecosystem emits.
 pub const HEALTH_METRIC: &str = "southbound_health";
+/// The operational command family: `sb/*` request/error counts and latency, by `instance`/`verb`/`result`.
+pub const COMMAND_METRIC: &str = "CameraCommand";
+/// The `result` dimension value for a command that succeeded.
+pub const RESULT_SUCCESS: &str = "success";
+/// The `result` dimension value for a command that failed.
+pub const RESULT_ERROR: &str = "error";
+
+/// Every `camera_captures` measure. Each becomes a `<measure>Total` + `<measure>Interval` pair.
+///
+/// The set is the parity anchor: `define_captures` and the drain both read it, so a measure the job
+/// hooks count but this list omits fails to define, and one this list carries but nothing counts
+/// simply reports zero — never a silent drop.
+pub const CAPTURE_MEASURES: [&str; 10] = [
+    "queued",
+    "started",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "interrupted",
+    ANNOUNCEMENT_FAILED_MEASURE,
+    THUMBNAIL_FAILED_MEASURE,
+    THUMBNAIL_DROPPED_MEASURE,
+    ANNOUNCEMENT_RETRIED_WITHOUT_PREVIEW_MEASURE,
+];
 /// Terminal results that are durable but were never announced.
 ///
 /// The announcement is best-effort, so a broker that is down costs announcements and nothing else.
@@ -378,23 +450,22 @@ pub const THUMBNAIL_DROPPED_MEASURE: &str = "thumbnailDropped";
 pub const ANNOUNCEMENT_RETRIED_WITHOUT_PREVIEW_MEASURE: &str = "announcementRetriedWithoutPreview";
 
 impl CaptureMetrics {
-    /// Defines both metrics against the component's metric service.
+    /// Defines the fleet-scoped metrics against the component's metric service.
+    ///
+    /// `camera_captures` and `camera_queue` are defined once (no dimensions vary); `CameraCommand`
+    /// carries the `instance`/`verb`/`result` dimensions, so its cells are defined lazily at emit time
+    /// like `southbound_health`.
     #[must_use]
     pub fn new(metrics: Arc<dyn edgecommons::metrics::MetricService>) -> Self {
-        metrics.define_metric(
-            edgecommons::metrics::MetricBuilder::create(CAPTURE_METRIC)
-                .add_measure("queued", "Count", 60)
-                .add_measure("started", "Count", 60)
-                .add_measure("succeeded", "Count", 60)
-                .add_measure("failed", "Count", 60)
-                .add_measure("cancelled", "Count", 60)
-                .add_measure("interrupted", "Count", 60)
-                .add_measure(ANNOUNCEMENT_FAILED_MEASURE, "Count", 60)
-                .add_measure(THUMBNAIL_FAILED_MEASURE, "Count", 60)
-                .add_measure(THUMBNAIL_DROPPED_MEASURE, "Count", 60)
-                .add_measure(ANNOUNCEMENT_RETRIED_WITHOUT_PREVIEW_MEASURE, "Count", 60)
-                .build(),
-        );
+        // camera_captures: every measure is a Total/Interval counter pair (SOUTHBOUND.md §5 pattern).
+        let mut captures = edgecommons::metrics::MetricBuilder::create(CAPTURE_METRIC);
+        for measure in CAPTURE_MEASURES {
+            captures = captures
+                .add_measure(format!("{measure}Total"), "Count", 60)
+                .add_measure(format!("{measure}Interval"), "Count", 60);
+        }
+        metrics.define_metric(captures.build());
+        // camera_queue: sampled levels — single gauges, nothing to pair.
         metrics.define_metric(
             edgecommons::metrics::MetricBuilder::create(QUEUE_METRIC)
                 .add_measure("dispatchQueued", "Count", 60)
@@ -412,6 +483,8 @@ impl CaptureMetrics {
         Self {
             metrics,
             health: tokio::sync::Mutex::new(()),
+            captures: std::sync::Mutex::new(CaptureCounters::new()),
+            commands: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -475,13 +548,125 @@ impl CaptureMetrics {
         }
     }
 
-    /// Counts one capture event. Best effort: a metric target that is unhappy must never be able to
-    /// fail a capture, so this reports and moves on.
+    /// The current monotonic total accumulated for a `camera_captures` measure, without emitting.
+    ///
+    /// A test seam only: it lets a test observe that a capture has been counted without draining
+    /// (which would emit and reset the interval), so the count-landed race can be polled cleanly.
+    #[cfg(test)]
+    #[must_use]
+    pub fn captured_total(&self, measure: &str) -> f64 {
+        self.captures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(measure)
+            .map_or(0.0, |pair| pair.total)
+    }
+
+    /// Records one `camera_captures` event into its `(Total, Interval)` accumulator.
+    ///
+    /// No longer emits at the call site: the interval counter accumulates every event since the last
+    /// drain, so nothing is lost between the sampler's ticks — a success and a failure in the same
+    /// window both land, which is the guarantee the old immediate-emit design was reaching for. Kept
+    /// `async` (and infallible) so the job-hook call sites are unchanged.
+    #[allow(clippy::unused_async)]
     pub async fn count(&self, measure: &'static str) {
-        let mut values = std::collections::HashMap::with_capacity(1);
-        values.insert(measure.to_owned(), 1.0);
+        self.captures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(measure)
+            .or_default()
+            .add(1.0);
+    }
+
+    /// Records one `sb/*` command outcome into the `CameraCommand` family cell for its
+    /// `(instance, verb, result)`. Lazily creates the cell on first sight — see the cardinality note
+    /// on [`CaptureMetrics`].
+    pub fn record_command(&self, instance: &str, verb: &'static str, ok: bool, latency_ms: u64) {
+        let result = if ok { RESULT_SUCCESS } else { RESULT_ERROR };
+        let mut commands = self
+            .commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cell = commands.entry((instance.to_owned(), verb, result)).or_default();
+        cell.requests.add(1.0);
+        cell.latency_ms += latency_ms as f64;
+        if !ok {
+            cell.errors.add(1.0);
+        }
+    }
+
+    /// Drains the `camera_captures` counters to the metric target and resets the intervals.
+    ///
+    /// Best effort: a metric target that is unhappy must never disturb the component, so this reports
+    /// and moves on. Called on the metric sampler's tick.
+    pub async fn drain_captures(&self) {
+        let values = {
+            let mut captures = self
+                .captures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Always emit the full measure set (zeros for what has not happened), so a dashboard sees
+            // a stable schema rather than measures that blink in and out of existence.
+            let mut values = std::collections::HashMap::with_capacity(CAPTURE_MEASURES.len() * 2);
+            for measure in CAPTURE_MEASURES {
+                let pair = captures.entry(measure).or_default();
+                pair.drain_into(&mut values, measure);
+                pair.reset_interval();
+            }
+            values
+        };
         if let Err(error) = self.metrics.emit_metric(CAPTURE_METRIC, values).await {
-            tracing::warn!(measure, error = %error, "camera capture metric could not be emitted");
+            tracing::warn!(error = %error, "camera capture metrics could not be emitted");
+        }
+    }
+
+    /// Drains every accumulated `CameraCommand` cell to the metric target and resets the intervals.
+    ///
+    /// Each `(instance, verb, result)` cell is defined immediately before it is emitted — the same
+    /// define-then-emit pattern `southbound_health` uses, and for the same reason: the core metric API
+    /// carries dimensions on the definition. Called on the metric sampler's tick.
+    pub async fn drain_commands(&self) {
+        let cells: Vec<(CommandKey, std::collections::HashMap<String, f64>)> = {
+            let mut commands = self
+                .commands
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            commands
+                .iter_mut()
+                .map(|(key, cell)| {
+                    let mut values = std::collections::HashMap::with_capacity(5);
+                    cell.requests.drain_into(&mut values, "commandRequests");
+                    cell.errors.drain_into(&mut values, "commandErrors");
+                    values.insert("commandLatencyMs".to_owned(), cell.latency_ms);
+                    cell.requests.reset_interval();
+                    cell.errors.reset_interval();
+                    cell.latency_ms = 0.0;
+                    (key.clone(), values)
+                })
+                .collect()
+        };
+        let _serialized = self.health.lock().await;
+        for ((instance, verb, result), values) in cells {
+            let metric = edgecommons::metrics::MetricBuilder::create(COMMAND_METRIC)
+                .add_dimension("instance", &instance)
+                .add_dimension("verb", verb)
+                .add_dimension("result", result)
+                .add_measure("commandRequestsTotal", "Count", 60)
+                .add_measure("commandRequestsInterval", "Count", 60)
+                .add_measure("commandErrorsTotal", "Count", 60)
+                .add_measure("commandErrorsInterval", "Count", 60)
+                .add_measure("commandLatencyMs", "Milliseconds", 60)
+                .build();
+            self.metrics.define_metric(metric);
+            if let Err(error) = self.metrics.emit_metric(COMMAND_METRIC, values).await {
+                tracing::warn!(
+                    instance,
+                    verb,
+                    result,
+                    error = %error,
+                    "camera command metric could not be emitted"
+                );
+            }
         }
     }
 
@@ -982,5 +1167,109 @@ mod tests {
         assert_eq!(sample.read_errors, u64::MAX);
         assert_eq!(sample.reconnects, u64::MAX);
         assert_eq!(duration_millis(Duration::MAX), u64::MAX);
+    }
+
+    // --- the operational-family pattern: camera_captures pairs + CameraCommand -----------------------
+
+    /// A counter Pair is monotonic in total and resets its interval on drain.
+    #[test]
+    fn a_counter_pair_totals_monotonically_and_its_interval_resets() {
+        let mut pair = Pair::default();
+        pair.add(3.0);
+        let mut out = std::collections::HashMap::new();
+        pair.drain_into(&mut out, "x");
+        assert_eq!(out["xTotal"], 3.0);
+        assert_eq!(out["xInterval"], 3.0);
+        pair.reset_interval();
+
+        pair.add(2.0);
+        let mut out2 = std::collections::HashMap::new();
+        pair.drain_into(&mut out2, "x");
+        assert_eq!(out2["xTotal"], 5.0, "the total is monotonic across drains");
+        assert_eq!(out2["xInterval"], 2.0, "the interval carries only what accrued since the reset");
+    }
+
+    /// `count` accumulates on the job hooks; a drain emits every measure as a Total/Interval pair and
+    /// resets the intervals -- so a second drain with no new events reports Total unchanged, Interval 0.
+    #[tokio::test]
+    async fn camera_captures_accumulates_and_drains_as_total_interval_pairs() {
+        let target = Arc::new(RecordingMetrics::default());
+        let metrics =
+            CaptureMetrics::new(Arc::clone(&target) as Arc<dyn edgecommons::metrics::MetricService>);
+
+        metrics.count("succeeded").await;
+        metrics.count("succeeded").await;
+        metrics.count("failed").await;
+        assert_eq!(metrics.captured_total("succeeded"), 2.0, "counts accumulate without emitting");
+        assert!(
+            target.emitted.lock().unwrap().is_empty(),
+            "counting must not emit -- the pattern drains on the sampler tick"
+        );
+
+        metrics.drain_captures().await;
+        let (_, _, first) = target.last_emission();
+        assert_eq!(first["succeededTotal"], 2.0);
+        assert_eq!(first["succeededInterval"], 2.0);
+        assert_eq!(first["failedTotal"], 1.0);
+        assert_eq!(first["queuedTotal"], 0.0, "the full schema is always emitted, zeros included");
+
+        metrics.drain_captures().await;
+        let (_, _, second) = target.last_emission();
+        assert_eq!(second["succeededTotal"], 2.0, "total is monotonic across drains");
+        assert_eq!(second["succeededInterval"], 0.0, "the interval reset on the previous drain");
+    }
+
+    /// A command outcome lands in its `(instance, verb, result)` cell; a drain defines and emits each
+    /// cell, a failure counts BOTH a request and an error, and the definitions carry the exact dims.
+    #[tokio::test]
+    async fn camera_command_records_by_instance_verb_result_and_drains_with_those_dimensions() {
+        use edgecommons::metrics::MetricService as _;
+
+        let target = Arc::new(RecordingMetrics::default());
+        let metrics =
+            CaptureMetrics::new(Arc::clone(&target) as Arc<dyn edgecommons::metrics::MetricService>);
+
+        metrics.record_command("camera-a", "sb/status", true, 4);
+        metrics.record_command("camera-a", "sb/status", false, 6);
+        metrics.drain_commands().await;
+
+        // The success cell (errors = 0) and the error cell (a request AND an error, latency summed).
+        let cells: Vec<std::collections::HashMap<String, f64>> = target
+            .emitted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _, _)| name == COMMAND_METRIC)
+            .map(|(_, _, values)| values.clone())
+            .collect();
+        assert_eq!(cells.len(), 2, "one cell per (verb, result) touched");
+        let success = cells
+            .iter()
+            .find(|v| v["commandErrorsTotal"] == 0.0)
+            .expect("a success cell");
+        assert_eq!(success["commandRequestsTotal"], 1.0);
+        let error = cells
+            .iter()
+            .find(|v| v["commandErrorsTotal"] == 1.0)
+            .expect("an error cell");
+        assert_eq!(error["commandRequestsTotal"], 1.0, "a failure counts a request AND an error");
+        assert_eq!(error["commandLatencyMs"], 6.0);
+
+        // The definitions carry the low-cardinality dimensions the family pattern prescribes.
+        let defined_dims: Vec<std::collections::BTreeMap<String, String>> = target
+            .defined
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|metric| metric.get_name() == COMMAND_METRIC)
+            .map(|metric| metric.get_dimensions().clone())
+            .collect();
+        assert!(!defined_dims.is_empty(), "each cell defines before it emits");
+        for dims in &defined_dims {
+            assert_eq!(dims.get("instance").map(String::as_str), Some("camera-a"));
+            assert_eq!(dims.get("verb").map(String::as_str), Some("sb/status"));
+            assert!(dims.contains_key("result"), "the result dimension is present");
+        }
+        assert!(target.is_metric_defined(COMMAND_METRIC));
     }
 }

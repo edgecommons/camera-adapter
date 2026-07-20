@@ -619,7 +619,7 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("static ONVIF construction is intentionally unavailable"),
         };
-        assert_eq!(static_error.code(), crate::ErrorCode::InvalidRequest);
+        assert_eq!(static_error.code(), crate::ErrorCode::BadArgs);
 
         assert_eq!(
             BackendRuntimeContext::new(None, &LimitsConfig::default())

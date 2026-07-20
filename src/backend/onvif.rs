@@ -2120,7 +2120,7 @@ impl OnvifBackendFactory {
         }
         let selected_identity = selected_identity.ok_or_else(|| {
             CameraError::rejected(
-                ErrorCode::CameraUnavailable,
+                ErrorCode::DeviceUnavailable,
                 "selected ONVIF endpoint reference was not discovered",
             )
         })?;
@@ -2362,7 +2362,7 @@ impl CameraBackendFactory for OnvifBackendFactory {
     async fn discover(&self, request: DiscoveryRequest) -> Result<Vec<DiscoveryCandidate>> {
         if request.timeout.is_zero() || request.max_results == 0 {
             return Err(CameraError::rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "ONVIF discovery requires positive timeout and result bounds",
             ));
         }
@@ -2777,7 +2777,7 @@ impl OnvifSession {
     fn ensure_open(&self) -> Result<()> {
         if self.closed {
             Err(CameraError::rejected(
-                ErrorCode::CameraUnavailable,
+                ErrorCode::DeviceUnavailable,
                 "ONVIF camera session is closed",
             ))
         } else {
@@ -4891,7 +4891,7 @@ wkWsh7u3nnr9fXRpWsamYEAKGzNo0istMB6rD6cMzNfRZCMk4rXuokYWOw==
         session.close().await.expect("idempotent close");
         assert_eq!(
             session.status().await.expect_err("closed status").code(),
-            ErrorCode::CameraUnavailable
+            ErrorCode::DeviceUnavailable
         );
     }
 
@@ -6665,8 +6665,8 @@ wkWsh7u3nnr9fXRpWsamYEAKGzNo0istMB6rD6cMzNfRZCMk4rXuokYWOw==
             ErrorCode::PtzTimeout
         );
         assert_eq!(
-            map_ptz_error(CameraError::rejected(ErrorCode::InvalidRequest, "invalid")).code(),
-            ErrorCode::InvalidRequest
+            map_ptz_error(CameraError::rejected(ErrorCode::BadArgs, "invalid")).code(),
+            ErrorCode::BadArgs
         );
         assert_eq!(
             onvif_capture_modes(true, false),

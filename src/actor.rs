@@ -104,7 +104,7 @@ impl CaptureDispatcher for CameraActorHandle {
     fn reserve(&self, camera_id: &str) -> Result<Box<dyn DispatchReservation>> {
         if camera_id != self.shared.instance {
             return Err(CameraError::rejected(
-                ErrorCode::UnknownInstance,
+                ErrorCode::NoSuchInstance,
                 "capture was dispatched to the wrong camera actor",
             ));
         }
@@ -146,7 +146,7 @@ impl CameraActor {
         let instance = instance.into();
         if instance.is_empty() || max_queued_captures == 0 {
             return Err(CameraError::rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "actor instance and capture queue capacity must be non-empty",
             ));
         }
@@ -482,7 +482,7 @@ impl DispatchReservation for ActorDispatchReservation {
     fn commit(mut self: Box<Self>, descriptor: CaptureDescriptor) -> Result<usize> {
         if descriptor.instance() != self.shared.instance {
             return Err(CameraError::rejected(
-                ErrorCode::UnknownInstance,
+                ErrorCode::NoSuchInstance,
                 "capture descriptor was dispatched to the wrong camera actor",
             ));
         }
@@ -627,7 +627,7 @@ mod tests {
         ) -> Result<()> {
             assert_eq!(policy, OfflinePolicy::WaitUntilDeadline);
             Err(CameraError::rejected(
-                ErrorCode::CameraUnavailable,
+                ErrorCode::DeviceUnavailable,
                 "injected offline camera",
             ))
         }
@@ -1750,7 +1750,7 @@ mod tests {
 
         let record = terminal(&harness.catalog, "cap-offline").await;
         assert_eq!(record.state, JobState::Failed);
-        assert_eq!(record.error_code.as_deref(), Some("CAMERA_UNAVAILABLE"));
+        assert_eq!(record.error_code.as_deref(), Some("DEVICE_UNAVAILABLE"));
         assert_eq!(
             record.terminal_result.as_ref().unwrap()["failure"]["stage"],
             "QUEUED"
@@ -1783,7 +1783,7 @@ mod tests {
             .reserve("cam-b")
             .err()
             .expect("a capture for another camera must never be run by this one");
-        assert_eq!(misrouted.code(), ErrorCode::UnknownInstance);
+        assert_eq!(misrouted.code(), ErrorCode::NoSuchInstance);
         assert_eq!(
             harness.handle.queued_captures(),
             0,

@@ -446,7 +446,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{bound} of zero must not produce a usable queue"));
             assert_eq!(
                 error.code(),
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "{bound} of zero is a configuration fault, not a runtime rejection"
             );
         }

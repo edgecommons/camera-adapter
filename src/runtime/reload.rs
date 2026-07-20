@@ -20,7 +20,7 @@ impl CameraRuntime {
     ) -> Result<crate::registry::RegistryDiff> {
         if self.reloading.swap(true, Ordering::AcqRel) {
             return Err(crate::CameraError::rejected(
-                crate::ErrorCode::CameraUnavailable,
+                crate::ErrorCode::DeviceUnavailable,
                 "a configuration replacement is already draining camera work",
             ));
         }
@@ -51,7 +51,7 @@ impl CameraRuntime {
             || previous.global.output.file_mode != replacement.global.output.file_mode
         {
             return Err(crate::CameraError::rejected(
-                crate::ErrorCode::InvalidRequest,
+                crate::ErrorCode::BadArgs,
                 "state/output root security settings require component restart",
             ));
         }
@@ -125,7 +125,7 @@ impl CameraRuntime {
     ) -> Result<()> {
         if self.reloading.swap(true, Ordering::AcqRel) {
             return Err(crate::CameraError::rejected(
-                crate::ErrorCode::CameraUnavailable,
+                crate::ErrorCode::DeviceUnavailable,
                 "a configuration replacement is still active while restoring the prior generation",
             ));
         }
@@ -484,7 +484,7 @@ impl CameraRuntime {
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(crate::CameraError::rejected(
-                    crate::ErrorCode::CameraUnavailable,
+                    crate::ErrorCode::DeviceUnavailable,
                     "camera supervisor did not stop within reloadDrainTimeoutMs",
                 ));
             }

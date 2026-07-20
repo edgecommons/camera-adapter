@@ -532,7 +532,7 @@ impl CameraRuntime {
             .find(|schedule| schedule.id == occurrence.schedule_id && schedule.enabled)
             .ok_or_else(|| {
                 crate::CameraError::rejected(
-                    crate::ErrorCode::InvalidRequest,
+                    crate::ErrorCode::BadArgs,
                     "group schedule is no longer enabled",
                 )
             })?;
@@ -664,13 +664,23 @@ impl CameraRuntime {
                 "camera was disabled before scheduled admission",
             ));
         }
+        // A paused camera's schedules are suspended: the occurrence is consumed (the one-occurrence
+        // guarantee holds) but no capture is admitted until the camera is resumed (SOUTHBOUND.md §2.2).
+        if self.is_paused(instance) {
+            tracing::info!(
+                instance = %instance,
+                schedule_id = %occurrence.schedule_id,
+                "scheduled capture suspended: camera is paused"
+            );
+            return Ok(());
+        }
         let schedule = camera
             .schedules
             .iter()
             .find(|schedule| schedule.id == occurrence.schedule_id && schedule.enabled)
             .ok_or_else(|| {
                 crate::CameraError::rejected(
-                    crate::ErrorCode::InvalidRequest,
+                    crate::ErrorCode::BadArgs,
                     "schedule is no longer enabled for this camera",
                 )
             })?;

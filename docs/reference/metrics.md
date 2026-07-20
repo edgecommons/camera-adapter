@@ -1,7 +1,11 @@
 # Metrics and alarms reference
 
-The adapter emits three metrics through the EdgeCommons metric subsystem, which routes them to the target
+The adapter emits four metrics through the EdgeCommons metric subsystem, which routes them to the target
 selected by the component's `metricEmission` configuration.
+
+The operational families follow the EdgeCommons `(Total, Interval)` counter convention: every counter is
+emitted as a pair — `<name>Total` is monotonic since start, and `<name>Interval` is what accrued since the
+previous emission and resets on each one. Levels (gauges) and latency sums are single measures.
 
 `southbound_health` is the standard metric every adapter in the ecosystem emits, dimensioned by
 `instance` so each camera reports its own. It is sampled every 30 seconds, and emitted immediately when
@@ -16,8 +20,11 @@ a camera connects or disconnects.
 | `staleSignals` | Count | 1 when the camera has produced nothing within `healthThresholds.staleSignalSecs`, 0 otherwise. A camera can be connected and stale. |
 | `reconnects` | Count | Sessions re-established in the interval. A camera's first connection is not a reconnect. |
 
-`camera_captures` counts captures as they happen. It is emitted at the moment of each event, never sampled,
-so a capture that starts and finishes between two collection intervals is still counted.
+`camera_captures` counts the capture lifecycle. Each measure below is a `(Total, Interval)` counter pair,
+accumulated on the capture hooks and drained every 30 seconds. The interval counter carries every event
+since the last drain, so a capture that starts and finishes between two drains is still counted — the drain
+is a reset, not a sample, and nothing is lost. Each row names the base measure; the emitted names are
+`<measure>Total` and `<measure>Interval`.
 
 | Measure | Unit | Counted when |
 |---|---|---|
@@ -31,6 +38,17 @@ so a capture that starts and finishes between two collection intervals is still 
 | `thumbnailFailed` | Count | A capture profile asked for a thumbnail and the component could not render one from the frame. The capture succeeds and is announced without it. |
 | `thumbnailDropped` | Count | A thumbnail rendered but exceeded the byte ceiling a message may carry, so it was left out. The capture succeeds and is announced without it. |
 | `announcementRetriedWithoutPreview` | Count | An announcement carrying a thumbnail could not be published, so it was re-published without the thumbnail. The capture succeeds; the preview is shed so the result is still announced. |
+
+`CameraCommand` is the operational command family, dimensioned by `instance`, `verb` (the `sb/*` command),
+and `result` (`success` or `error`). Its cells are drained every 30 seconds, and a cell is created the
+first time an `(instance, verb, result)` combination is seen, so its cardinality tracks the commands an
+operator actually issues.
+
+| Measure | Unit | Meaning |
+|---|---|---|
+| `commandRequests` | Count | Commands handled for this `(instance, verb, result)` — a `(Total, Interval)` pair. |
+| `commandErrors` | Count | Of those, the ones that failed — a `(Total, Interval)` pair (the `error` result cell). |
+| `commandLatencyMs` | Milliseconds | Summed command-handling latency over the interval. |
 
 `camera_queue` samples what the component is currently holding, every 30 seconds. These are levels rather
 than events, so there is nothing to miss between samples.
@@ -48,8 +66,11 @@ than events, so there is nothing to miss between samples.
 | `camerasOnline` | Count | Cameras whose session is online. |
 | `camerasConfigured` | Count | Cameras in the current configuration. |
 
-Neither metric carries a per-camera dimension. A 256-camera fleet would otherwise mint 256 metric streams
-per measure. Per-camera queue depth is answered by `sb/queue-status`.
+`camera_captures` and `camera_queue` are fleet-scoped and carry no per-camera dimension: a 256-camera fleet
+would otherwise mint 256 metric streams per measure on the highest-frequency families. Per-camera queue
+depth is answered by `sb/queue-status`, and per-camera reachability by the state keepalive below.
+`CameraCommand` does carry the `instance` dimension, because commands are operator-frequency rather than
+capture-frequency.
 
 ## Per-camera presence
 

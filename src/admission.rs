@@ -204,13 +204,13 @@ impl<T: Send + 'static> CaptureAdmissionQueue<T> {
     ) -> Result<Self> {
         if max_global_pending == 0 || max_per_camera == 0 {
             return Err(CameraError::rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "capture queue bounds must be non-zero",
             ));
         }
         if aging_interval.is_zero() {
             return Err(CameraError::rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "capture queue aging interval must be non-zero",
             ));
         }
@@ -254,7 +254,7 @@ impl<T: Send + 'static> CaptureAdmissionQueue<T> {
         let camera_id = camera_id.into();
         if camera_id.is_empty() {
             return Err(CameraError::rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "camera id must not be empty",
             ));
         }
@@ -498,7 +498,7 @@ impl<T> ControlLanes<T> {
     pub fn new(ordinary_capacity: usize) -> Result<Self> {
         if !(1..=1_024).contains(&ordinary_capacity) {
             return Err(CameraError::rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "ordinary control capacity must be between 1 and 1024",
             ));
         }
@@ -529,7 +529,7 @@ impl<T> ControlLanes<T> {
     pub fn push_safety_stop(&self, stop: SafetyStop) -> Result<()> {
         if !stop.pan && !stop.tilt && !stop.zoom {
             return Err(CameraError::rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "safety stop must select at least one axis",
             ));
         }
@@ -667,7 +667,7 @@ impl ByteBudget {
     fn new(capacity: u64) -> Result<Self> {
         if capacity == 0 {
             return Err(CameraError::rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "byte budget must be non-zero",
             ));
         }
@@ -784,7 +784,7 @@ impl DiskBudget {
     fn new(output: &OutputConfig, probe: Arc<dyn DiskSpaceProbe>) -> Result<Self> {
         if output.minimum_free_percent > 100 {
             return Err(CameraError::rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "minimum free percent must not exceed 100",
             ));
         }
@@ -948,7 +948,7 @@ impl AdmissionController {
             || limits.max_concurrent_writes == 0
         {
             return Err(CameraError::rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "admission semaphore limits must be non-zero",
             ));
         }
@@ -960,7 +960,7 @@ impl AdmissionController {
                     || group.max_concurrent_captures > limits.max_concurrent_captures
                 {
                     return Err(CameraError::rejected(
-                        ErrorCode::InvalidRequest,
+                        ErrorCode::BadArgs,
                         "resource-group capacity must be between 1 and the global capture limit",
                     ));
                 }

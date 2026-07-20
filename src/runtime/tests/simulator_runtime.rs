@@ -342,6 +342,7 @@ async fn runtime_with_everything(
         cursors: CursorStore::default(),
         reload_gate: tokio::sync::Mutex::new(()),
         reloading: AtomicBool::new(false),
+        paused: RwLock::new(std::collections::BTreeSet::new()),
         self_reference: OnceLock::new(),
     });
     let _ = runtime.self_reference.set(Arc::downgrade(&runtime));
@@ -877,6 +878,21 @@ async fn wait_for_online(runtime: &CameraRuntime, instance: &str) {
             "simulator supervisor did not reach ONLINE"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Polls the `camera_captures` accumulator until a measure reaches `at_least`, without draining.
+///
+/// The outcome counters land on the job hooks just after the durable terminal write, so a terminal
+/// job does not yet imply a counted one; this waits for the count to accumulate.
+async fn wait_for_capture_count(runtime: &CameraRuntime, measure: &str, at_least: f64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while runtime.metrics.captured_total(measure) < at_least {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "camera_captures.{measure} never reached {at_least} -- the count an operator watches was lost"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -2280,7 +2296,7 @@ async fn simulator_runtime_discovery_and_capture_status_use_stable_bounded_pages
             .await
             .unwrap_err()
             .code(),
-        crate::ErrorCode::InvalidRequest,
+        crate::ErrorCode::BadArgs,
         "a cursor must be bound to its original state filter"
     );
     runtime.shutdown().await;
@@ -2727,7 +2743,7 @@ async fn command_service_dispatches_immediate_verbs_with_a_real_inbox_registry()
         .await
     {
         CommandOutcome::ImmediateError(error) => {
-            assert_eq!(error.code, crate::ErrorCode::InvalidRequest.as_str());
+            assert_eq!(error.code, crate::ErrorCode::BadArgs.as_str());
         }
         other => panic!("invalid request must return an immediate error, got {other:?}"),
     }
@@ -2874,7 +2890,7 @@ async fn reload_timeout_preserves_prior_generation_until_a_safe_retry() {
         .apply_reloaded_config(replacement.clone(), BTreeMap::new(), BTreeMap::new())
         .await
         .expect_err("a candidate must be vetoed while an old supervisor is unconfirmed");
-    assert_eq!(error.code(), crate::ErrorCode::CameraUnavailable);
+    assert_eq!(error.code(), crate::ErrorCode::DeviceUnavailable);
     assert!(old_cancellation.is_cancelled());
     assert!(
         runtime
@@ -2969,7 +2985,7 @@ async fn supervisor_reports_unavailable_genicam_as_backoff_without_creating_an_a
     match runtime.actor("camera-a") {
         Err(error) => assert_eq!(
             error.code(),
-            crate::ErrorCode::CameraUnavailable,
+            crate::ErrorCode::DeviceUnavailable,
             "a rejected backend factory must never leave a live actor handle"
         ),
         Ok(_) => panic!("a rejected backend factory must never leave a live actor handle"),
@@ -3237,7 +3253,7 @@ async fn reload_supervisor_barrier_cancels_before_timing_out_and_then_allows_ret
         .replace_supervisors(&["camera-a".to_string()], Duration::ZERO)
         .await
         .expect_err("an unconfirmed supervisor must veto the replacement");
-    assert_eq!(error.code(), crate::ErrorCode::CameraUnavailable);
+    assert_eq!(error.code(), crate::ErrorCode::DeviceUnavailable);
     assert!(
         cancellation.is_cancelled(),
         "the old generation must be cancelled even when its drain deadline is already elapsed"
@@ -4266,7 +4282,7 @@ fn cursor_store_preserves_page_boundaries_and_rejects_cross_query_reuse() {
             )
             .unwrap_err()
             .code(),
-        crate::ErrorCode::InvalidRequest,
+        crate::ErrorCode::BadArgs,
         "a retained list cursor is bound to its original capability view"
     );
 
@@ -4309,7 +4325,7 @@ fn cursor_store_preserves_page_boundaries_and_rejects_cross_query_reuse() {
             )
             .unwrap_err()
             .code(),
-        crate::ErrorCode::InvalidRequest,
+        crate::ErrorCode::BadArgs,
         "a retained snapshot cursor cannot be replayed under another operation"
     );
 
@@ -4330,7 +4346,7 @@ fn cursor_store_preserves_page_boundaries_and_rejects_cross_query_reuse() {
             )
             .unwrap_err()
             .code(),
-        crate::ErrorCode::InvalidRequest,
+        crate::ErrorCode::BadArgs,
         "a durable status cursor is bound to its original filter"
     );
 }
@@ -4406,7 +4422,7 @@ async fn simulator_runtime_rejects_invalid_requests_without_creating_durable_wor
             .await
             .unwrap_err()
             .code(),
-        crate::ErrorCode::UnknownInstance
+        crate::ErrorCode::NoSuchInstance
     );
     assert_eq!(
         runtime
@@ -4499,7 +4515,7 @@ async fn simulator_runtime_rejects_invalid_requests_without_creating_durable_wor
             .await
             .unwrap_err()
             .code(),
-        crate::ErrorCode::InstanceRequired,
+        crate::ErrorCode::BadArgs,
         "multi-camera reconnect requires an explicit target"
     );
     assert_eq!(
@@ -4859,7 +4875,7 @@ async fn runtime_startup_router_and_deferred_capture_flows_use_real_core_facades
         .await
     {
         CommandOutcome::ImmediateError(error) => {
-            assert_eq!(error.code, "CAMERA_UNAVAILABLE");
+            assert_eq!(error.code, "DEVICE_UNAVAILABLE");
         }
         other => panic!("uninstalled router must reject requests, got {other:?}"),
     }
@@ -7174,17 +7190,28 @@ async fn captures_are_counted_even_when_every_event_slot_is_taken() {
     let terminal = wait_for_terminal(&runtime, &capture_id).await;
     assert_eq!(terminal.state, crate::model::JobState::Succeeded);
 
+    // The counters accumulate on the job hooks even with the event pipe starved; a drain emits the
+    // Total/Interval pairs. The outcome count lands just after the durable terminal write, so poll the
+    // accumulator (without emitting) before draining.
+    wait_for_capture_count(&runtime, "succeeded", 1.0).await;
+    runtime.metrics.drain_captures().await;
+
     let counted = crate::observability::CAPTURE_METRIC;
     assert_eq!(
-        metrics.counts(counted, "queued"),
+        metrics.counts(counted, "queuedTotal"),
         1.0,
         "the capture happened; a saturated EVENT pipe must not stop it being COUNTED"
     );
-    assert_eq!(metrics.counts(counted, "started"), 1.0);
+    assert_eq!(metrics.counts(counted, "startedTotal"), 1.0);
     assert_eq!(
-        metrics.counts(counted, "succeeded"),
+        metrics.counts(counted, "succeededTotal"),
         1.0,
         "and its outcome is the number an operator watches -- it must survive the overload                  that makes them look"
+    );
+    assert_eq!(
+        metrics.counts(counted, "succeededInterval"),
+        1.0,
+        "the interval counter carries every event since the last drain -- nothing is sampled away"
     );
 
     runtime.shutdown().await;
@@ -7315,35 +7342,28 @@ async fn captures_are_counted_as_they_happen() {
 
     let counted = crate::observability::CAPTURE_METRIC;
 
-    // The outcome counter is emitted AFTER the durable terminal write, so a terminal job does not yet
-    // imply a counted one. Sampling here once made this test right almost always and wrong under load,
-    // which is the worst kind of test. Wait for the count instead of assuming it has landed.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while metrics.counts(counted, "succeeded") < 1.0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the capture succeeded but was never counted -- this is the number an operator watches"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    // The outcome counter accumulates AFTER the durable terminal write, so a terminal job does not yet
+    // imply a counted one. Wait for it to land in the accumulator, then drain to emit the pairs.
+    wait_for_capture_count(&runtime, "succeeded", 1.0).await;
+    runtime.metrics.drain_captures().await;
 
     assert_eq!(
-        metrics.counts(counted, "queued"),
+        metrics.counts(counted, "queuedTotal"),
         1.0,
         "an accepted capture must be counted when it is accepted"
     );
     assert_eq!(
-        metrics.counts(counted, "started"),
+        metrics.counts(counted, "startedTotal"),
         1.0,
         "and again when it actually starts doing physical work"
     );
     assert_eq!(
-        metrics.counts(counted, "succeeded"),
+        metrics.counts(counted, "succeededTotal"),
         1.0,
         "and its outcome must be counted -- this is the number an operator watches"
     );
     assert_eq!(
-        metrics.counts(counted, "failed"),
+        metrics.counts(counted, "failedTotal"),
         0.0,
         "a capture that succeeded must not also be counted as a failure"
     );
@@ -7727,7 +7747,7 @@ async fn an_occurrence_of_a_removed_group_schedule_is_not_submitted() {
         .submit_scheduled_group(&occurrence)
         .await
         .expect_err("a disabled schedule must not fire");
-    assert_eq!(error.code(), crate::ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), crate::ErrorCode::BadArgs);
 
     let unknown = ScheduleOccurrence {
         scope: crate::scheduler::ScheduleScope::Group("gone".to_string()),
@@ -7872,7 +7892,7 @@ async fn queue_status_and_clear_reject_an_unknown_camera() {
             .await
             .expect_err("an unknown camera must be rejected, not reported as empty")
             .code(),
-        crate::ErrorCode::UnknownInstance
+        crate::ErrorCode::NoSuchInstance
     );
     assert_eq!(
         runtime
@@ -7880,7 +7900,7 @@ async fn queue_status_and_clear_reject_an_unknown_camera() {
             .await
             .expect_err("an unknown camera must be rejected")
             .code(),
-        crate::ErrorCode::UnknownInstance
+        crate::ErrorCode::NoSuchInstance
     );
 }
 

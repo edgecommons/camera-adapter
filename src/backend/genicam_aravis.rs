@@ -106,7 +106,7 @@ impl CameraBackendFactory for GenicamAravisBackendFactory {
     async fn discover(&self, request: DiscoveryRequest) -> Result<Vec<DiscoveryCandidate>> {
         if request.max_results == 0 || request.max_results > 10_000 {
             return rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "GenICam discovery result bound is outside 1..=10000",
             );
         }
@@ -142,7 +142,7 @@ impl CameraBackendFactory for GenicamAravisBackendFactory {
     async fn connect(&self, request: ConnectRequest) -> Result<Box<dyn CameraSession>> {
         let BackendConfig::GenicamAravis(config) = request.backend else {
             return rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "GenICam factory received another backend configuration",
             );
         };
@@ -1294,7 +1294,7 @@ fn requested_i32(value: Option<u32>, current: i32, label: &'static str) -> Resul
     value.map_or(Ok(current), |value| {
         i32::try_from(value).map_err(|_| {
             CameraError::rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 format!("GenICam {label} exceeds the native range"),
             )
         })
@@ -1313,7 +1313,7 @@ fn validate_axis(
         .max(1);
     if !(minimum..=maximum).contains(&value) || (value - minimum) % increment != 0 {
         return rejected(
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             format!("GenICam {label} violates device bounds or increment"),
         );
     }
@@ -1329,7 +1329,7 @@ fn validate_float_feature(camera: &aravis::Camera, feature: &str, value: f64) ->
         .map_err(|_| backend_error("failed to read GenICam numeric increment"))?;
     if !value.is_finite() || !(minimum..=maximum).contains(&value) {
         return rejected(
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             "GenICam numeric feature violates device bounds",
         );
     }
@@ -1337,7 +1337,7 @@ fn validate_float_feature(camera: &aravis::Camera, feature: &str, value: f64) ->
         let steps = (value - minimum) / increment;
         if (steps - steps.round()).abs() > 1e-6 {
             return rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "GenICam numeric feature violates its device increment",
             );
         }
@@ -1397,7 +1397,7 @@ fn apply_connection_settings(
             Some(requested) => {
                 let requested = i64::try_from(requested).map_err(|_| {
                     CameraError::rejected(
-                        ErrorCode::InvalidRequest,
+                        ErrorCode::BadArgs,
                         "GenICam packetDelayNs exceeds the native range",
                     )
                 })?;
@@ -1590,7 +1590,7 @@ fn resolve_and_open(
                     return Ok((camera, identity, WireTransport::Usb3Vision, None));
                 }
                 Err(CameraError::Rejected {
-                    code: ErrorCode::CameraUnavailable,
+                    code: ErrorCode::DeviceUnavailable,
                     ..
                 }) => {}
                 Err(error) => return Err(error),
@@ -1610,7 +1610,7 @@ fn resolve_and_open(
 fn required_interface(config: &GenicamBackendConfig) -> Result<&str> {
     config.interface.as_deref().ok_or_else(|| {
         CameraError::rejected(
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             "GigE GenICam connection requires an explicit OS interface",
         )
     })
@@ -1631,7 +1631,7 @@ fn open_scoped(
         matches.retain(|device| device.transport == transport && selector_matches(config, device));
         if matches.len() > 1 {
             return rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "GenICam stable selector is ambiguous on its configured interface",
             );
         }
@@ -1841,7 +1841,7 @@ fn validate_native_field(value: &str, label: &'static str) -> Result<()> {
 fn validate_interfaces(interfaces: &[String]) -> Result<()> {
     if interfaces.len() > 64 {
         return rejected(
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             "GenICam discovery accepts at most 64 eligible interfaces",
         );
     }
@@ -1850,7 +1850,7 @@ fn validate_interfaces(interfaces: &[String]) -> Result<()> {
         validate_interface(interface)?;
         if !unique.insert(interface) {
             return rejected(
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "GenICam discovery interfaces must be distinct",
             );
         }
@@ -1861,7 +1861,7 @@ fn validate_interfaces(interfaces: &[String]) -> Result<()> {
 fn validate_interface(interface: &str) -> Result<()> {
     if interface.is_empty() || interface.len() > 256 || interface.chars().any(char::is_control) {
         return rejected(
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             "GenICam interface must be 1..256 UTF-8 bytes without controls",
         );
     }
@@ -1913,7 +1913,7 @@ fn timeout<T>(stage: &'static str) -> Result<T> {
 }
 
 fn unavailable(message: &'static str) -> CameraError {
-    CameraError::rejected(ErrorCode::CameraUnavailable, message)
+    CameraError::rejected(ErrorCode::DeviceUnavailable, message)
 }
 
 fn backend_error(message: impl Into<String>) -> CameraError {
@@ -2678,7 +2678,7 @@ mod tests {
             requested_i32(Some(u32::MAX), 7, "width")
                 .expect_err("u32 outside native range")
                 .code(),
-            ErrorCode::InvalidRequest
+            ErrorCode::BadArgs
         );
         assert!(validate_axis(Ok((2, 10)), Ok(2), 6, "width").is_ok());
         assert!(validate_axis(Ok((2, 10)), Ok(2), 7, "width").is_err());
