@@ -1,0 +1,574 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.edgecommons.mbreissi.com/schemas/camera-adapter/config.schema.json",
+  "title": "camera-adapter component configuration",
+  "description": "The configuration camera-adapter itself understands: the object at `component.global` (this schema's root), with each entry of `component.instances[]` validated against `#/$defs/camera`. Derived from `src/config.rs`. camera-adapter is a camera, not a signal adapter: an instance is a camera and a profile produces an image. The library envelope (logging, messaging, metricEmission, heartbeat, health, hierarchy, identity, topic, tags, credentials, parameters) is owned by the canonical schema and is deliberately not redeclared here. `component.token` is the core component token and likewise belongs to the envelope.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["output"],
+  "properties": {
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rootDirectory"],
+      "description": "Output root, path templates, durability, and disk-pressure floors.",
+      "properties": {
+        "rootDirectory": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute output root. Every camera writes under it."
+        },
+        "cameraDirectoryTemplate": {
+          "type": "string",
+          "default": "{cameraId}",
+          "description": "Relative per-camera directory template."
+        },
+        "fileNameTemplate": {
+          "type": "string",
+          "default": "{captureId}.{extension}",
+          "description": "Relative filename template. Must contain `{captureId}` (in this field or the directory template) so two captures cannot resolve to the same file."
+        },
+        "writeMetadataSidecar": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether a durable JSON sidecar is written before the final image is exposed."
+        },
+        "minimumFreeBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Absolute free bytes retained after outstanding reservations."
+        },
+        "minimumFreePercent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Free-space percentage retained after outstanding reservations."
+        },
+        "directoryMode": {
+          "type": "string",
+          "default": "0755",
+          "description": "Unix mode (octal string) for new output directories."
+        },
+        "fileMode": {
+          "type": "string",
+          "default": "0644",
+          "description": "Unix mode (octal string) for new images and sidecars."
+        }
+      }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Durable catalog location and retention policy.",
+      "properties": {
+        "directory": {
+          "type": "string",
+          "description": "Absolute state root, or a platform-bound default where permitted."
+        },
+        "resultRetentionHours": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 72,
+          "description": "Terminal-result and idempotency retention window."
+        },
+        "maxResultRecords": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 100000,
+          "description": "Soft terminal-record count cap."
+        },
+        "queuedRecoveryPolicy": {
+          "$ref": "#/$defs/queuedRecoveryPolicy"
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Process-wide and per-camera capacity bounds.",
+      "properties": {
+        "maxConnectedCameras": { "type": "integer", "minimum": 1, "default": 256 },
+        "maxConcurrentCaptures": { "type": "integer", "minimum": 1, "default": 32 },
+        "maxConcurrentEncodes": { "type": "integer", "minimum": 1 },
+        "maxConcurrentWrites": { "type": "integer", "minimum": 1, "default": 8 },
+        "maxConcurrentConnects": { "type": "integer", "minimum": 1, "default": 16 },
+        "maxInFlightBytes": { "type": "integer", "minimum": 1, "description": "Raw frame bytes reserved across active work. Must cover maxConcurrentCaptures x maxFrameBytesPerCamera." },
+        "maxFrameBytesPerCamera": { "type": "integer", "minimum": 1, "description": "Default and hard per-camera frame ceiling." },
+        "maxMetadataBytes": { "type": "integer", "minimum": 0, "default": 8192 },
+        "maxQueuedCapturesPerCamera": { "type": "integer", "minimum": 1, "default": 4 },
+        "maxQueuedControlsPerCamera": { "type": "integer", "minimum": 1, "default": 32 },
+        "maxDeferredWaitersPerCapture": { "type": "integer", "minimum": 1, "default": 8 },
+        "maxCamerasPerGroup": { "type": "integer", "minimum": 2, "default": 32 },
+        "maxPendingCaptures": { "type": "integer", "minimum": 1, "default": 256, "description": "Fleet-wide backlog bound." },
+        "maxQueueWaitMs": { "type": "integer", "minimum": 0, "default": 300000 },
+        "resourceGroups": {
+          "type": "object",
+          "description": "Named shared NIC/USB transport admission bounds, keyed by group name.",
+          "additionalProperties": { "$ref": "#/$defs/resourceGroup" }
+        }
+      }
+    },
+    "timeouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Runtime deadlines, in milliseconds.",
+      "properties": {
+        "connectMs": { "type": "integer", "minimum": 1, "default": 10000 },
+        "reconnectBackoffMinMs": { "type": "integer", "minimum": 1, "default": 1000 },
+        "reconnectBackoffMaxMs": { "type": "integer", "minimum": 1, "default": 60000 },
+        "jobTerminalMs": { "type": "integer", "minimum": 1, "default": 90000 },
+        "captureMs": { "type": "integer", "minimum": 1, "default": 30000 },
+        "encodeMs": { "type": "integer", "minimum": 1, "default": 30000 },
+        "persistMs": { "type": "integer", "minimum": 1, "default": 30000 },
+        "ptzMs": { "type": "integer", "minimum": 1, "default": 10000 },
+        "replyMarginMs": { "type": "integer", "minimum": 0, "default": 5000 },
+        "maxDeferredReplyLifetimeMs": { "type": "integer", "minimum": 1, "default": 95000 },
+        "reloadDrainTimeoutMs": { "type": "integer", "minimum": 0, "default": 30000 },
+        "shutdownGraceMs": { "type": "integer", "minimum": 0, "default": 30000 }
+      }
+    },
+    "discovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Protocol discovery policy.",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "reportUnconfigured": { "type": "boolean", "default": false },
+        "intervalSeconds": { "type": "integer", "minimum": 1, "default": 60 },
+        "maxResults": { "type": "integer", "minimum": 0, "default": 1000 },
+        "eligibleInterfaces": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Exact OS interface names eligible for credential-free WS-Discovery multicast."
+        }
+      }
+    },
+    "operatorEvents": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional high-volume operator-event policy.",
+      "properties": {
+        "captureLifecycle": {
+          "type": "boolean",
+          "default": false,
+          "description": "Emit capture queued/started diagnostic events."
+        }
+      }
+    },
+    "healthThresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Thresholds feeding the `southbound_health` metric (SOUTHBOUND.md §5).",
+      "properties": {
+        "staleSignalSecs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 300,
+          "description": "Seconds without a successful observation before a camera counts toward `southbound_health.staleSignals`."
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "HTTP/XML/decompression policy shared by ONVIF instances.",
+      "properties": {
+        "maxHeaderBytes": { "type": "integer", "minimum": 0, "default": 65536 },
+        "maxDecompressionRatio": { "type": "integer", "minimum": 0, "default": 100 },
+        "allowBasicOverPlaintext": { "type": "boolean", "default": false }
+      }
+    },
+    "captureGroupSchedules": {
+      "type": "array",
+      "description": "Cron schedules that fire one synchronised capture across several cameras.",
+      "items": { "$ref": "#/$defs/captureGroupSchedule" }
+    }
+  },
+  "$defs": {
+    "camera": {
+      "title": "One camera",
+      "description": "One entry of `component.instances[]`. Each camera gets its own supervisor and connection lifecycle.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "backend", "defaultCaptureProfile", "captureProfiles"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "description": "Stable UNS instance token: the `{instance}` of this camera's topics and its health-metric `instance` dimension."
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether the camera accepts actuation."
+        },
+        "resourceGroup": {
+          "type": "string",
+          "description": "Optional shared NIC/USB admission group (a key of `limits.resourceGroups`)."
+        },
+        "backend": { "$ref": "#/$defs/backend" },
+        "defaultCaptureProfile": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Profile used for a request that names none. Must be a key of `captureProfiles`."
+        },
+        "captureProfiles": {
+          "type": "object",
+          "minProperties": 1,
+          "description": "Named, immutable-at-acceptance capture profiles, keyed by profile name.",
+          "additionalProperties": { "$ref": "#/$defs/captureProfile" }
+        },
+        "schedules": {
+          "type": "array",
+          "description": "Per-camera cron schedules; omission is command-only operation.",
+          "items": { "$ref": "#/$defs/schedule" }
+        },
+        "ptz": { "$ref": "#/$defs/ptz" }
+      }
+    },
+    "backend": {
+      "title": "Protocol backend",
+      "description": "Tagged by `type`. camera is a camera, not a signal adapter — `sim`, `genicam-aravis`, `onvif-rtsp`, or `rtsp`.",
+      "type": "object",
+      "required": ["type"],
+      "oneOf": [
+        { "$ref": "#/$defs/backendSim" },
+        { "$ref": "#/$defs/backendGenicam" },
+        { "$ref": "#/$defs/backendOnvif" },
+        { "$ref": "#/$defs/backendRtsp" }
+      ]
+    },
+    "backendSim": {
+      "title": "Simulator backend",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "sim" },
+        "simulatedId": { "type": "string", "description": "Stable simulated identity; defaults to the camera id." },
+        "seed": { "type": "integer", "minimum": 0, "description": "Deterministic generator seed." },
+        "frame": { "$ref": "#/$defs/simFrame" },
+        "connectDelayMs": { "type": "integer", "minimum": 0, "default": 0 },
+        "captureDelayMs": { "type": "integer", "minimum": 0 },
+        "ptz": { "$ref": "#/$defs/simPtz" },
+        "faults": { "$ref": "#/$defs/simFaults" }
+      }
+    },
+    "simFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Simulator source-frame settings.",
+      "properties": {
+        "width": { "type": "integer", "minimum": 1, "default": 640 },
+        "height": { "type": "integer", "minimum": 1, "default": 480 },
+        "pixelFormat": { "$ref": "#/$defs/pixelFormat" },
+        "pattern": { "$ref": "#/$defs/simPattern" }
+      }
+    },
+    "simPtz": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Simulated PTZ capability switches.",
+      "properties": {
+        "supported": { "type": "boolean", "default": false },
+        "statusSupported": { "type": "boolean", "default": true },
+        "presetsSupported": { "type": "boolean", "default": false }
+      }
+    },
+    "simFaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Simulator deterministic failure counters.",
+      "properties": {
+        "disconnectAfterCaptures": { "type": "integer", "minimum": 0 },
+        "failEveryNthCapture": { "type": "integer", "minimum": 0 },
+        "incompleteEveryNthCapture": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "backendGenicam": {
+      "title": "GenICam/Aravis backend",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "selector"],
+      "properties": {
+        "type": { "const": "genicam-aravis" },
+        "selector": { "$ref": "#/$defs/genicamSelector" },
+        "transport": { "$ref": "#/$defs/genicamTransport" },
+        "interface": { "type": "string", "description": "Explicit host interface when required." },
+        "packetSize": {
+          "description": "`auto` or a numeric device packet size.",
+          "oneOf": [ { "const": "auto" }, { "type": "integer", "minimum": 1 } ]
+        },
+        "packetDelayNs": { "type": "integer", "minimum": 0 },
+        "bufferCount": { "type": "integer", "minimum": 1 },
+        "featureOverrides": {
+          "type": "object",
+          "description": "Allowlisted standard GenICam feature values, keyed by feature name.",
+          "additionalProperties": true
+        }
+      }
+    },
+    "genicamSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Stable GenICam selector; exactly one field must be set (enforced at runtime).",
+      "properties": {
+        "serial": { "type": "string" },
+        "mac": { "type": "string" },
+        "deviceId": { "type": "string" },
+        "ip": { "type": "string" }
+      }
+    },
+    "backendOnvif": {
+      "title": "ONVIF/RTSP backend",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "mediaProfile"],
+      "description": "One of `deviceServiceUrl` or `selector` is also required (enforced at runtime).",
+      "properties": {
+        "type": { "const": "onvif-rtsp" },
+        "deviceServiceUrl": { "type": "string", "description": "Explicit ONVIF Device service URL." },
+        "selector": { "$ref": "#/$defs/onvifSelector" },
+        "credentials": { "$ref": "#/$defs/secretRef" },
+        "mediaProfile": { "type": "string", "minLength": 1, "description": "Opaque profile token or exact profile name." },
+        "captureMode": { "$ref": "#/$defs/captureMode" },
+        "rtspFallback": { "type": "boolean", "default": false },
+        "rtspSessionPolicy": { "$ref": "#/$defs/rtspSessionPolicy" },
+        "allowInsecure": { "type": "boolean", "default": false },
+        "allowedUriHosts": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "allowedUriCidrs": { "type": "array", "items": { "$ref": "#/$defs/cidr" }, "default": [] },
+        "maxSoapBytes": { "type": "integer", "minimum": 1 },
+        "maxSnapshotBytes": { "type": "integer", "minimum": 1 },
+        "maxXmlDepth": { "type": "integer", "minimum": 1 },
+        "tls": { "$ref": "#/$defs/tls" },
+        "mediaService": { "$ref": "#/$defs/mediaService" },
+        "authenticationMode": { "$ref": "#/$defs/authenticationMode" }
+      }
+    },
+    "onvifSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpointReference"],
+      "properties": {
+        "endpointReference": { "type": "string", "minLength": 1, "description": "Exact endpoint-reference URI." }
+      }
+    },
+    "backendRtsp": {
+      "title": "Bare RTSP backend",
+      "description": "A camera addressed by a raw `rtsp`/`rtsps` URL, still-image only. No ONVIF control.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "url"],
+      "properties": {
+        "type": { "const": "rtsp" },
+        "url": { "type": "string", "minLength": 1, "description": "Raw `rtsp`/`rtsps` stream URL. Userinfo in the URL is forbidden." },
+        "credentials": { "$ref": "#/$defs/secretRef" },
+        "tls": { "$ref": "#/$defs/tls" },
+        "allowInsecure": { "type": "boolean", "default": false },
+        "allowedUriHosts": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "allowedUriCidrs": { "type": "array", "items": { "$ref": "#/$defs/cidr" }, "default": [] },
+        "rtspSessionPolicy": { "$ref": "#/$defs/rtspSessionPolicy" },
+        "captureMode": { "$ref": "#/$defs/captureMode" },
+        "maxFrameBytes": { "type": "integer", "minimum": 1 },
+        "authenticationMode": { "$ref": "#/$defs/authenticationMode" }
+      }
+    },
+    "captureProfile": {
+      "title": "Capture profile",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["output"],
+      "description": "Immutable-at-acceptance capture settings. Geometry/exposure fields apply to GenICam.",
+      "properties": {
+        "captureMode": { "$ref": "#/$defs/captureMode" },
+        "offlinePolicy": { "$ref": "#/$defs/offlinePolicy" },
+        "queueExpiryMs": { "type": "integer", "minimum": 0 },
+        "timeoutMs": { "type": "integer", "minimum": 1 },
+        "maximumFrameBytes": { "type": "integer", "minimum": 1 },
+        "pixelFormat": { "$ref": "#/$defs/pixelFormat" },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "offsetX": { "type": "integer", "minimum": 0 },
+        "offsetY": { "type": "integer", "minimum": 0 },
+        "exposureMicros": { "type": "integer", "minimum": 0 },
+        "gain": { "type": "number" },
+        "output": { "$ref": "#/$defs/profileOutput" },
+        "thumbnail": { "$ref": "#/$defs/thumbnail" },
+        "captureInterlock": { "$ref": "#/$defs/captureInterlock" }
+      }
+    },
+    "profileOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["encoding"],
+      "properties": {
+        "encoding": { "$ref": "#/$defs/outputEncoding" },
+        "jpegQuality": { "type": "integer", "minimum": 1, "maximum": 100, "default": 85 }
+      }
+    },
+    "thumbnail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["size"],
+      "description": "Opt-in preview of the captured frame. Presence is the opt-in.",
+      "properties": {
+        "size": { "$ref": "#/$defs/thumbnailSize" }
+      }
+    },
+    "schedule": {
+      "title": "Per-camera schedule",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "cron", "timezone", "captureProfile"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "description": "Stable schedule token." },
+        "enabled": { "type": "boolean", "default": true },
+        "cron": { "type": "string", "description": "Six-field cron expression including seconds." },
+        "timezone": { "type": "string", "description": "IANA timezone identifier." },
+        "captureProfile": { "type": "string", "minLength": 1, "description": "A key of the camera's `captureProfiles`." },
+        "misfirePolicy": { "$ref": "#/$defs/misfirePolicy" },
+        "overlapPolicy": { "$ref": "#/$defs/overlapPolicy" },
+        "jitterSeconds": { "type": "integer", "minimum": 0, "default": 0 }
+      }
+    },
+    "captureGroupSchedule": {
+      "title": "Group schedule",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "cron", "timezone", "instances"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "enabled": { "type": "boolean", "default": true },
+        "cron": { "type": "string", "description": "Six-field cron expression including seconds." },
+        "timezone": { "type": "string", "description": "IANA timezone identifier." },
+        "instances": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 2,
+          "description": "The cameras captured together, in result order."
+        },
+        "captureProfile": { "type": "string", "description": "Profile applied to every member without an override." },
+        "profileOverrides": {
+          "type": "object",
+          "description": "Per-camera capture-profile overrides; every key must be a member.",
+          "additionalProperties": { "type": "string" }
+        },
+        "misfirePolicy": { "$ref": "#/$defs/misfirePolicy" },
+        "overlapPolicy": { "$ref": "#/$defs/overlapPolicy" },
+        "jitterSeconds": { "type": "integer", "minimum": 0, "default": 0 },
+        "timeoutMs": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "ptz": {
+      "title": "Per-camera PTZ policy",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "maximumContinuousMoveMs": { "type": "integer", "minimum": 1, "default": 10000 },
+        "captureInterlock": { "$ref": "#/$defs/captureInterlock" },
+        "settleMs": { "type": "integer", "minimum": 0, "default": 750 },
+        "allowPresetMutation": { "type": "boolean", "default": false }
+      }
+    },
+    "resourceGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxConcurrentCaptures"],
+      "properties": {
+        "maxConcurrentCaptures": { "type": "integer", "minimum": 1, "description": "Simultaneous acquisitions using this resource." }
+      }
+    },
+    "secretRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["$secret"],
+      "description": "A reference resolved lazily through EdgeCommons credentials.",
+      "properties": {
+        "$secret": { "type": "string", "minLength": 1, "description": "Secret name/path." },
+        "field": { "type": "string", "description": "Optional field within a structured secret." }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "TLS trust/hostname policy.",
+      "properties": {
+        "ca": { "$ref": "#/$defs/secretRef" },
+        "verifyHostname": { "type": "boolean", "default": true }
+      }
+    },
+    "cidr": {
+      "type": "string",
+      "description": "A CIDR block, e.g. `192.168.1.0/24` or `2001:db8::/32`."
+    },
+    "queuedRecoveryPolicy": {
+      "enum": ["requeue", "interrupt"],
+      "default": "requeue",
+      "description": "Restart treatment for queued jobs."
+    },
+    "pixelFormat": {
+      "enum": ["Mono8", "RGB8", "BGR8", "JPEG"],
+      "description": "Source-frame pixel format."
+    },
+    "outputEncoding": {
+      "enum": ["passthrough", "jpeg", "png", "tiff", "raw"],
+      "description": "Final file encoding."
+    },
+    "captureMode": {
+      "enum": ["simulated", "software-trigger", "snapshot-uri", "rtsp-frame"],
+      "description": "Capture mechanism."
+    },
+    "simPattern": {
+      "enum": ["color-bars", "gradient", "checkerboard", "solid"],
+      "default": "color-bars",
+      "description": "Simulator frame pattern."
+    },
+    "genicamTransport": {
+      "enum": ["auto", "gige-vision", "usb3-vision"],
+      "default": "auto",
+      "description": "GenICam transport selection."
+    },
+    "rtspSessionPolicy": {
+      "enum": ["on-demand", "warm"],
+      "default": "on-demand",
+      "description": "RTSP connection lifecycle policy."
+    },
+    "mediaService": {
+      "enum": ["auto", "media1", "media2"],
+      "default": "auto",
+      "description": "ONVIF Media service generation."
+    },
+    "authenticationMode": {
+      "enum": ["auto", "http-digest", "wsse-digest", "basic"],
+      "default": "auto",
+      "description": "ONVIF/RTSP authentication negotiation mode."
+    },
+    "thumbnailSize": {
+      "enum": ["small", "medium", "large"],
+      "description": "Thumbnail longest-edge bound: small=160px, medium=320px, large=640px."
+    },
+    "offlinePolicy": {
+      "enum": ["failFast", "waitUntilDeadline", "queue"],
+      "description": "Camera-offline admission policy."
+    },
+    "captureInterlock": {
+      "enum": ["reject", "stopAndSettle", "allow"],
+      "default": "reject",
+      "description": "Capture/PTZ interlock policy."
+    },
+    "misfirePolicy": {
+      "enum": ["skip", "coalesce"],
+      "default": "skip",
+      "description": "Missed-occurrence treatment."
+    },
+    "overlapPolicy": {
+      "enum": ["skip", "queue"],
+      "default": "skip",
+      "description": "Treatment when a schedule already has a nonterminal job/group."
+    }
+  }
+}
