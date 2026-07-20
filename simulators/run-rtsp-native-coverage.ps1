@@ -48,20 +48,18 @@ $registryMount = "${registryVolume}:/usr/local/cargo/registry"
 $gitMount = "${gitVolume}:/usr/local/cargo/git"
 $artifactMount = "${coverageRoot}:/coverage-artifacts"
 
-# THE LOCKFILE. `Cargo.lock` is untracked and gitignored (see the note in .github/workflows/ci.yml), so
-# a clean checkout has none -- and every run below passes `--locked`, which REFUSES to create one:
+# THE LOCKFILE. `Cargo.lock` is committed and git-sourced, but this harness cannot build against the
+# in-tree copy directly: the source is mounted `:ro` on purpose, and the workspace it mounts carries
+# the developer's gitignored `.cargo/config.toml` `[patch]`, which redirects `edgecommons` to a local
+# path -- so a build here would need to REWRITE the committed git-sourced lock to a path source, and
+# cargo cannot write it on the read-only mount (`Read-only file system (os error 30)`).
 #
-#     error: cannot create the lock file ... because --locked was passed to prevent this
-#
-# Dropping `--locked` does not rescue it. The source is mounted `:ro` on purpose, and cargo writes the
-# lock next to the workspace `Cargo.toml` (CARGO_TARGET_DIR does not move it), so cargo would then die
-# on `Read-only file system (os error 30)` instead. Two walls, one behind the other.
-#
-# So the lock is bind-mounted as a single FILE from outside the source tree, and generated once, in a
-# container, by the prep run below. The source tree itself is never written to -- the immutability this
-# script depends on is preserved exactly -- and `--locked` goes back to meaning what it says. Generating
-# it in the container also keeps the lockfile version inside what the pinned toolchain can read, which a
-# host-side `cargo generate-lockfile` would not guarantee.
+# So a WRITABLE OVERLAY lock is bind-mounted as a single FILE from outside the source tree, masking the
+# committed one, and generated once, in a container, by the prep run below (with the patch active, it
+# becomes a path-sourced lock the `:ro` runs then use consistently under `--locked`). The source tree
+# itself is never written to -- the immutability this script depends on is preserved exactly.
+# Generating it in the container also keeps the lockfile version inside what the pinned toolchain can
+# read, which a host-side `cargo generate-lockfile` would not guarantee.
 $lockRoot = Join-Path $coverageRoot 'lock'
 New-Item -ItemType Directory -Force -Path $lockRoot | Out-Null
 $lockFile = Join-Path $lockRoot 'Cargo.lock'

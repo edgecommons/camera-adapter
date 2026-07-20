@@ -34,14 +34,13 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
 
 WORKDIR /build
 
-# Copy only source inputs.
+# Copy only source inputs, including the committed `Cargo.lock`.
 #
-# `Cargo.lock` is deliberately absent: it is untracked and gitignored, because a local build goes
-# through the `[patch]` override above, and a patched build rewrites the lock to a PATH source. A
-# committed lock would therefore either lie to a fresh clone or break the read-only validation mounts.
-# Copying it -- or building `--locked` against a lock that is not there -- fails outright in a clean
-# clone, which is exactly what this file used to do.
-COPY Cargo.toml /build/camera-adapter/
+# `Cargo.lock` is committed and records the git source `edgecommons` is pinned to by REV in Cargo.toml
+# (it is regenerated on a fresh clone with the local `.cargo` `[patch]` inactive, so it never carries a
+# path override). The image build sees no `.cargo` override, so `--locked` resolves the pinned rev
+# reproducibly from the lock.
+COPY Cargo.toml Cargo.lock /build/camera-adapter/
 COPY src /build/camera-adapter/src
 COPY native /build/camera-adapter/native
 
@@ -52,7 +51,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     CARGO_TARGET_DIR=/build/target \
-    cargo build --release --no-default-features --features standalone,onvif \
+    cargo build --release --locked --no-default-features --features standalone,onvif \
     && install -D -m 0755 /build/target/release/camera-adapter /build/artifacts/camera-adapter
 
 FROM build AS build-rtsp
@@ -60,7 +59,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     CARGO_TARGET_DIR=/build/target \
-    cargo build --release --no-default-features --features standalone,onvif,rtsp \
+    cargo build --release --locked --no-default-features --features standalone,onvif,rtsp \
     && install -D -m 0755 /build/target/release/camera-adapter /build/artifacts/camera-adapter
 
 FROM docker.io/library/debian@sha256:1def178129dfb5f24db43afbf2fcac04530012e3264ba4ff81c71184e17a9ee4 AS runtime-base
