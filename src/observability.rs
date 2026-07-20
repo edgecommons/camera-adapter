@@ -1272,4 +1272,33 @@ mod tests {
         }
         assert!(target.is_metric_defined(COMMAND_METRIC));
     }
+
+    /// A metric target that refuses every emission must never take a drain down with it — the drain is
+    /// best-effort, on a timer, and a briefly-unavailable backend must not stall the component.
+    #[tokio::test]
+    async fn a_drain_survives_a_metric_target_that_refuses_every_emission() {
+        let target = Arc::new(RecordingMetrics {
+            refuse: true,
+            ..RecordingMetrics::default()
+        });
+        let metrics =
+            CaptureMetrics::new(Arc::clone(&target) as Arc<dyn edgecommons::metrics::MetricService>);
+
+        metrics.count("succeeded").await;
+        metrics.record_command("camera-a", "sb/status", false, 3);
+
+        // Neither drain may panic or propagate, and both must still attempt the (failing) emission.
+        metrics.drain_captures().await;
+        metrics.drain_commands().await;
+
+        let attempted: Vec<String> = target
+            .emitted
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect();
+        assert!(attempted.iter().any(|n| n == CAPTURE_METRIC), "the capture drain still tried to emit");
+        assert!(attempted.iter().any(|n| n == COMMAND_METRIC), "the command drain still tried to emit");
+    }
 }
