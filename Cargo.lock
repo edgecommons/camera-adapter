@@ -791,6 +791,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 [[package]]
 name = "edgecommons"
 version = "0.2.0"
+source = "git+https://github.com/edgecommons/edgecommons.git?rev=36a70c48b65b35f77bfab70d3a73869debdfc407#36a70c48b65b35f77bfab70d3a73869debdfc407"
 dependencies = [
  "aes-gcm",
  "arc-swap",
