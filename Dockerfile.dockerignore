@@ -4,11 +4,12 @@
 **
 
 !Cargo.toml
+!Cargo.lock
 !src/**
 !native/**
 
-# `Cargo.lock` is NOT admitted, and deliberately so. It is untracked, so a developer's copy is
-# whatever their gitignored `.cargo/config.toml` `[patch]` last wrote -- a PATH source pointing at a
-# checkout that does not exist inside the image. Letting it into the context would put a local,
-# unreviewable file in charge of what the image is built from. `edgecommons` is pinned by REV in
-# Cargo.toml; that is the pin that decides the library source here.
+# `Cargo.lock` IS admitted: it is committed and records the git source `edgecommons` is pinned to by
+# REV in Cargo.toml (a fresh clone regenerates it with the local `.cargo/config.toml` `[patch]`
+# inactive, so the committed lock never carries a developer's path override). The image is built
+# `--locked` against it for reproducibility. The developer's local `.cargo` overrides are still kept
+# out of the context.

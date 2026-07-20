@@ -2124,7 +2124,7 @@ mod tests {
         let error = root
             .prepare_capture(invalid_encoding, &CancellationToken::new())
             .expect_err("invalid encoder settings must remove the exclusive partial");
-        assert_eq!(error.code(), ErrorCode::InvalidRequest);
+        assert_eq!(error.code(), ErrorCode::BadArgs);
 
         let relative = "cam/2026/07/10/20260710T123456.000Z-cap-encoding.raw";
         assert!(!temp.path().join(relative).exists());

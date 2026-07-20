@@ -11,20 +11,23 @@ pub type Result<T> = std::result::Result<T, CameraError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorCode {
-    /// A target is required because more than one camera is configured.
-    InstanceRequired,
-    /// The requested camera is not configured.
-    UnknownInstance,
+    /// The request body, a field value, or the instance routing (a missing instance when more than
+    /// one camera is configured, or an otherwise malformed argument) is invalid. Standardized
+    /// southbound routing/argument code (SOUTHBOUND.md §2.2).
+    BadArgs,
+    /// The requested camera is not configured. Standardized southbound routing code.
+    NoSuchInstance,
     /// The requested camera is disabled.
     CameraDisabled,
-    /// The camera cannot currently serve the request.
-    CameraUnavailable,
+    /// The camera cannot currently serve the request (session down / unreachable). Standardized
+    /// southbound availability code.
+    DeviceUnavailable,
+    /// The camera instance is paused (`sb/pause`) and refuses new capture work until resumed.
+    InstancePaused,
     /// The capture/PTZ interlock rejected the operation.
     CameraMoving,
     /// The backend or camera lacks the requested capability.
     UnsupportedCapability,
-    /// The request body or a value is invalid.
-    InvalidRequest,
     /// The named capture profile is not configured.
     UnknownCaptureProfile,
     /// A bounded camera/control queue is full.
@@ -70,13 +73,13 @@ impl ErrorCode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::InstanceRequired => "INSTANCE_REQUIRED",
-            Self::UnknownInstance => "UNKNOWN_INSTANCE",
+            Self::BadArgs => "BAD_ARGS",
+            Self::NoSuchInstance => "NO_SUCH_INSTANCE",
             Self::CameraDisabled => "CAMERA_DISABLED",
-            Self::CameraUnavailable => "CAMERA_UNAVAILABLE",
+            Self::DeviceUnavailable => "DEVICE_UNAVAILABLE",
+            Self::InstancePaused => "INSTANCE_PAUSED",
             Self::CameraMoving => "CAMERA_MOVING",
             Self::UnsupportedCapability => "UNSUPPORTED_CAPABILITY",
-            Self::InvalidRequest => "INVALID_REQUEST",
             Self::UnknownCaptureProfile => "UNKNOWN_CAPTURE_PROFILE",
             Self::QueueFull => "QUEUE_FULL",
             Self::GroupTooLarge => "GROUP_TOO_LARGE",
@@ -203,7 +206,7 @@ impl CameraError {
             Self::Rejected { code, .. } => *code,
             Self::Storage(_) | Self::Io(_) => ErrorCode::PersistenceFailed,
             Self::Backend { .. } => ErrorCode::BackendError,
-            Self::Config { .. } | Self::Json(_) => ErrorCode::InvalidRequest,
+            Self::Config { .. } | Self::Json(_) => ErrorCode::BadArgs,
             Self::Catalog(_) | Self::Messaging(_) | Self::Sqlite(_) => ErrorCode::BackendError,
         }
     }
@@ -383,7 +386,7 @@ mod tests {
                 message: "bad".to_string()
             }
             .code(),
-            ErrorCode::InvalidRequest
+            ErrorCode::BadArgs
         );
         assert_eq!(
             CameraError::Storage("disk".to_string()).code(),
@@ -398,13 +401,13 @@ mod tests {
     #[test]
     fn every_public_error_code_has_its_contract_wire_spelling() {
         let cases = [
-            (ErrorCode::InstanceRequired, "INSTANCE_REQUIRED"),
-            (ErrorCode::UnknownInstance, "UNKNOWN_INSTANCE"),
+            (ErrorCode::BadArgs, "BAD_ARGS"),
+            (ErrorCode::NoSuchInstance, "NO_SUCH_INSTANCE"),
             (ErrorCode::CameraDisabled, "CAMERA_DISABLED"),
-            (ErrorCode::CameraUnavailable, "CAMERA_UNAVAILABLE"),
+            (ErrorCode::DeviceUnavailable, "DEVICE_UNAVAILABLE"),
+            (ErrorCode::InstancePaused, "INSTANCE_PAUSED"),
             (ErrorCode::CameraMoving, "CAMERA_MOVING"),
             (ErrorCode::UnsupportedCapability, "UNSUPPORTED_CAPABILITY"),
-            (ErrorCode::InvalidRequest, "INVALID_REQUEST"),
             (ErrorCode::UnknownCaptureProfile, "UNKNOWN_CAPTURE_PROFILE"),
             (ErrorCode::QueueFull, "QUEUE_FULL"),
             (ErrorCode::GroupTooLarge, "GROUP_TOO_LARGE"),
@@ -463,7 +466,7 @@ mod tests {
             ),
             (
                 CameraError::Json(json_error),
-                ErrorCode::InvalidRequest,
+                ErrorCode::BadArgs,
                 "JSON error",
             ),
             (

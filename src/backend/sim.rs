@@ -122,7 +122,7 @@ impl SimSession {
     fn ensure_open(&self) -> Result<()> {
         if self.closed {
             Err(CameraError::rejected(
-                ErrorCode::CameraUnavailable,
+                ErrorCode::DeviceUnavailable,
                 "sim camera session is closed",
             ))
         } else {
@@ -258,7 +258,7 @@ impl CameraSession for SimSession {
         {
             self.closed = true;
             return Err(CameraError::rejected(
-                ErrorCode::CameraUnavailable,
+                ErrorCode::DeviceUnavailable,
                 "simulated disconnect threshold reached",
             ));
         }
@@ -427,7 +427,7 @@ impl SimSession {
             }
             PtzRequest::GotoPreset(token) => {
                 let (_, position) = self.presets.get(&token).ok_or_else(|| {
-                    CameraError::rejected(ErrorCode::InvalidRequest, "unknown preset token")
+                    CameraError::rejected(ErrorCode::BadArgs, "unknown preset token")
                 })?;
                 self.position = *position;
                 self.moving = false;
@@ -454,7 +454,7 @@ impl SimSession {
                 }
                 if self.presets.remove(&token).is_none() {
                     return Err(CameraError::rejected(
-                        ErrorCode::InvalidRequest,
+                        ErrorCode::BadArgs,
                         "unknown preset token",
                     ));
                 }
@@ -692,18 +692,18 @@ mod tests {
         };
         assert!(matches!(
             incomplete.capture(request()).await.unwrap_err().code(),
-            ErrorCode::BackendError | ErrorCode::CameraUnavailable
+            ErrorCode::BackendError | ErrorCode::DeviceUnavailable
         ));
         let mut disconnect =
             session(json!({"type":"sim","faults":{"disconnectAfterCaptures":0}})).await;
         assert_eq!(
             disconnect.capture(request()).await.unwrap_err().code(),
-            ErrorCode::CameraUnavailable
+            ErrorCode::DeviceUnavailable
         );
         disconnect.close().await.unwrap();
         assert_eq!(
             disconnect.capture(request()).await.unwrap_err().code(),
-            ErrorCode::CameraUnavailable
+            ErrorCode::DeviceUnavailable
         );
     }
 
@@ -902,7 +902,7 @@ mod tests {
                 .await
                 .expect_err("removed preset cannot be removed twice")
                 .code(),
-            ErrorCode::InvalidRequest
+            ErrorCode::BadArgs
         );
         camera.ptz(PtzRequest::Home).await.expect("home command");
         assert!(matches!(

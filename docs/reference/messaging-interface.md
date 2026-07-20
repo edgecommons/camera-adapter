@@ -15,10 +15,10 @@ application message, not the command reply — see [Terminal application message
 These rules apply to every verb below.
 
 - **Closed request schema.** Bodies are parsed with `deny_unknown_fields`: any field not listed for a
-  verb is rejected with `INVALID_REQUEST`. All field names are **camelCase** on the wire.
+  verb is rejected with `BAD_ARGS`. All field names are **camelCase** on the wire.
 - **Selecting a camera.** Actuation verbs take an optional `instance`. Omit it only when exactly one
   camera is configured — the sole camera is then used. With more than one camera, omission is
-  `INSTANCE_REQUIRED`; an unknown name is `UNKNOWN_INSTANCE`; a disabled camera is `CAMERA_DISABLED`. An
+  `BAD_ARGS`; an unknown name is `NO_SUCH_INSTANCE`; a disabled camera is `CAMERA_DISABLED`. An
   `instance` token is non-empty, ≤128 bytes, ASCII letters/digits/`.`/`_`/`-`.
 - **Idempotency.** Every *mutating* verb requires a caller-owned `requestId` (1–256 bytes, no control
   characters). A retry with the same `requestId` and the same arguments returns the original outcome; a
@@ -33,7 +33,7 @@ These rules apply to every verb below.
   snapshot the first page captured, not a fresh read.
 - **Errors.** A failed command replies `{ "errorCode": "...", "errorMessage": "..." }`. Branch on
   `errorCode` (the stable [error codes](#stable-errors)), never the human-readable message. While a
-  configuration reload is draining, every verb replies `CAMERA_UNAVAILABLE`.
+  configuration reload is draining, every verb replies `DEVICE_UNAVAILABLE`.
 - **`JobState` vocabulary.** A capture's durable state is one of `ACCEPTED`, `QUEUED`, `ACQUIRING`,
   `ENCODING`, `PERSISTING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, `INTERRUPTED`.
 
@@ -121,7 +121,7 @@ resolved, no durable work is written.
 | Field | Type | Required | Meaning |
 |---|---|---|---|
 | `requestId` | string | **yes** | Component-scoped durable key, 1–256 bytes. |
-| `instances` | string[] | **yes** | Result-order camera list. 2 ≤ length ≤ `limits.maxCamerasPerGroup`, no duplicates. Fewer than 2 → `INVALID_REQUEST`; more than the cap → `GROUP_TOO_LARGE`. |
+| `instances` | string[] | **yes** | Result-order camera list. 2 ≤ length ≤ `limits.maxCamerasPerGroup`, no duplicates. Fewer than 2 → `BAD_ARGS`; more than the cap → `GROUP_TOO_LARGE`. |
 | `captureProfile` | string | optional | Common profile applied to every member; defaults per camera. |
 | `profileOverrides` | object | optional | Per-camera profile override (`{ cameraId: profile }`); keys must be a subset of `instances`. |
 | `timeoutMs` | u64 | optional | 1000–1800000, per member. |
@@ -184,7 +184,7 @@ one idempotency namespace on `requestId`.)
 **What it does.** Reads durable status for a capture, a group, or a filtered page of captures. It is the
 authority on what happened — a consumer that must not miss an outcome polls this rather than relying on the
 terminal announcement. It selects **exactly one** of five lookup modes from the field combination; an
-ambiguous or empty combination is `INVALID_REQUEST`.
+ambiguous or empty combination is `BAD_ARGS`.
 
 **Input payload / lookup modes**
 
@@ -302,8 +302,8 @@ snapshot.
 **Input payload.** `{ instance? }` — optional camera token.
 
 **Response payload.** With `instance`: a single `CameraSnapshot` (`instance`, `enabled`, `backend`,
-`generation`, `state`, `capabilities`, `capabilitiesDigest`, `connectedAt`, `lastError`, `updatedAt`).
-Without: `{ cameras: [ CameraSnapshot, … ] }`.
+`generation`, `state`, `capabilities`, `capabilitiesDigest`, `connectedAt`, `lastError`, `updatedAt`) plus
+`paused` (the `sb/pause` lifecycle state). Without: `{ cameras: [ CameraSnapshot + paused, … ] }`.
 
 **Example — request / response**
 ```json
@@ -311,6 +311,7 @@ Without: `{ cameras: [ CameraSnapshot, … ] }`.
 ```
 ```json
 { "instance": "camera-a", "enabled": true, "backend": "onvif-rtsp", "generation": 7, "state": "ONLINE",
+  "paused": false,
   "capabilities": { "captureModes": ["snapshot-uri"], "ptz": true, "presets": true, "presetMutation": false,
                     "vendor": "Acme", "model": "X9", "warnings": [] },
   "capabilitiesDigest": "3f2a…", "connectedAt": "2026-07-18T11:59:00Z",
@@ -431,6 +432,42 @@ session, not the camera); ledgered and settled immediately.
 ```json
 { "operationId": "op_018f2c3d-…", "instance": "camera-a", "state": "ACCEPTED" }
 ```
+
+## `sb/pause`
+
+**What it does.** Suspends a camera's new capture work: while paused, scheduled captures are held and new
+commanded captures (`sb/capture`, `sb/capture-submit`, `sb/capture-group`, `sb/capture-group-submit`) are
+refused with `INSTANCE_PAUSED`. Captures already in flight run to completion. The verb is idempotent, and
+`changed` reports whether the state moved. Pause is in-memory only — a restart begins unpaused. It applies
+only to capture workload: `sb/reconnect`, `sb/ptz*`, and the read-only verbs are unaffected, and the paused
+state is surfaced by `sb/status`.
+
+**Input payload.** `{ instance? }` (no `requestId` — the toggle is idempotent by nature). Omit `instance`
+only when exactly one camera is configured.
+
+**Response payload.** `{ id, paused: true, changed }`.
+
+**Example — request / response**
+```json
+{ "instance": "camera-a" }
+```
+```json
+{ "id": "camera-a", "paused": true, "changed": true }
+```
+
+## `sb/resume`
+
+**What it does.** Clears a paused camera, so scheduled and commanded capture work is admitted again.
+Idempotent; `changed` reports whether the state moved.
+
+**Input payload.** `{ instance? }`.
+
+**Response payload.** `{ id, paused: false, changed }`.
+
+> **`repoll` is not implemented (N/A).** The standardized `repoll` verb triggers an immediate poll cycle
+> for poll-loop adapters. This adapter is capture-on-demand and schedule-driven, not poll-based, so there is
+> no poll cycle to trigger: `sb/capture` / `sb/capture-submit` are the on-demand trigger, and schedules
+> drive the periodic work. The applicability decision is recorded in `DESIGN.md`.
 
 ---
 
@@ -561,13 +598,21 @@ lifecycle event.
 
 ## Stable errors
 
-The public error `code` is one of `INSTANCE_REQUIRED`, `UNKNOWN_INSTANCE`, `CAMERA_DISABLED`,
-`CAMERA_UNAVAILABLE`, `CAMERA_MOVING`, `UNSUPPORTED_CAPABILITY`, `INVALID_REQUEST`,
+The public error `code` is one of `BAD_ARGS`, `NO_SUCH_INSTANCE`, `CAMERA_DISABLED`,
+`DEVICE_UNAVAILABLE`, `INSTANCE_PAUSED`, `CAMERA_MOVING`, `UNSUPPORTED_CAPABILITY`,
 `UNKNOWN_CAPTURE_PROFILE`, `QUEUE_FULL`, `GROUP_TOO_LARGE`, `RESOURCE_LIMIT`, `CAPTURE_TIMEOUT`,
 `CAPTURE_CANCELLED`, `PROCESS_INTERRUPTED`, `CAPTURE_NOT_FOUND`, `IDEMPOTENCY_CONFLICT`,
 `PREVIOUS_OUTCOME_UNKNOWN`, `REPLY_REQUIRED`, `UNSUPPORTED_PIXEL_FORMAT`, `STORAGE_PRESSURE`,
 `PERSISTENCE_FAILED`, `PTZ_DISABLED`, `PTZ_RANGE_ERROR`, `PTZ_TIMEOUT`, `COMPONENT_STOPPING`, or
 `BACKEND_ERROR`. Branch on `code`, not the sanitized human-readable message.
+
+`BAD_ARGS` covers a malformed request body, an out-of-range field, and instance routing: a missing
+`instance` when more than one camera is configured is `BAD_ARGS`, and an unknown `instance` is
+`NO_SUCH_INSTANCE`. `INSTANCE_PAUSED` is returned when a camera has been paused with `sb/pause` and is
+asked to accept new capture work. The routing and availability codes (`BAD_ARGS`, `NO_SUCH_INSTANCE`,
+`DEVICE_UNAVAILABLE`) are the standardized southbound names shared across EdgeCommons adapters
+(`core/docs/SOUTHBOUND.md` §2.2); the domain codes (`CAPTURE_*`, `PTZ_*`, `STORAGE_PRESSURE`, …) are
+camera-specific.
 
 `STORAGE_PRESSURE` on a capture submission means the output or state root is below its configured
 free-space floor, or cannot be read. The component refuses new captures until that root recovers; a broker

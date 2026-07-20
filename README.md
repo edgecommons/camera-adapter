@@ -95,4 +95,4 @@ northbound without an explicit policy.
 
 ## License
 
-Apache-2.0.
+BUSL-1.1. See [`LICENSE`](LICENSE).

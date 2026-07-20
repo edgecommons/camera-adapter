@@ -61,7 +61,7 @@ pub fn encode_to<W: Write + Seek>(
     }
     if !(1..=100).contains(&request.jpeg_quality) {
         return Err(CameraError::rejected(
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             "JPEG quality must be between 1 and 100",
         ));
     }
@@ -718,7 +718,7 @@ mod tests {
             )
             .unwrap_err()
             .code(),
-            ErrorCode::InvalidRequest
+            ErrorCode::BadArgs
         );
     }
 

@@ -26,7 +26,7 @@ pub const MAX_CURSOR_BYTES: usize = 4_096;
 pub fn parse_closed<T: DeserializeOwned>(body: Value) -> Result<T> {
     serde_json::from_value(body).map_err(|error| {
         CameraError::rejected(
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             format!("request body does not match the closed schema: {error}"),
         )
     })
@@ -368,6 +368,25 @@ impl ReconnectRequest {
         validate_optional_token(self.instance.as_deref(), "instance")?;
         validate_request_id(&self.request_id)?;
         validate_reason(self.reason.as_deref())
+    }
+}
+
+/// `sb/pause` / `sb/resume` request.
+///
+/// The lifecycle verbs are idempotent in-memory toggles, so they carry no durable `requestId`: there
+/// is nothing to make exactly-once. Only the optional instance target, resolved by the single-camera
+/// omission rule.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PauseResumeRequest {
+    /// Optional camera target; omission selects the sole configured camera.
+    pub instance: Option<String>,
+}
+
+impl PauseResumeRequest {
+    /// Validates the optional instance token.
+    pub fn validate(&self) -> Result<()> {
+        validate_optional_token(self.instance.as_deref(), "instance")
     }
 }
 
@@ -732,7 +751,7 @@ fn ptz_range<T>(message: impl Into<String>) -> Result<T> {
 
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(CameraError::rejected(
-        ErrorCode::InvalidRequest,
+        ErrorCode::BadArgs,
         message.into(),
     ))
 }
@@ -908,7 +927,7 @@ mod tests {
             let request: ListRequest = parse_closed(body).unwrap();
             assert_eq!(
                 rejection_code(request.validate()),
-                ErrorCode::InvalidRequest
+                ErrorCode::BadArgs
             );
         }
 
@@ -921,7 +940,7 @@ mod tests {
             let request: DiscoverRequest = parse_closed(body).unwrap();
             assert_eq!(
                 rejection_code(request.validate()),
-                ErrorCode::InvalidRequest
+                ErrorCode::BadArgs
             );
         }
 
@@ -932,7 +951,7 @@ mod tests {
             let request: StatusRequest = parse_closed(body).unwrap();
             assert_eq!(
                 rejection_code(request.validate()),
-                ErrorCode::InvalidRequest
+                ErrorCode::BadArgs
             );
         }
 
@@ -944,7 +963,7 @@ mod tests {
             let request: CaptureRequest = parse_closed(body).unwrap();
             assert_eq!(
                 rejection_code(request.validate(8 * 1024)),
-                ErrorCode::InvalidRequest
+                ErrorCode::BadArgs
             );
         }
     }
@@ -958,7 +977,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             rejection_code(too_small.validate(8, 8 * 1024)),
-            ErrorCode::InvalidRequest
+            ErrorCode::BadArgs
         );
 
         let too_large: GroupCaptureRequest = parse_closed(json!({
@@ -990,7 +1009,7 @@ mod tests {
             let request: CaptureStatusRequest = parse_closed(body).unwrap();
             assert_eq!(
                 rejection_code(request.validate()),
-                ErrorCode::InvalidRequest
+                ErrorCode::BadArgs
             );
         }
     }
@@ -1042,7 +1061,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             rejection_code(empty_stop.validate(2_000)),
-            ErrorCode::InvalidRequest
+            ErrorCode::BadArgs
         );
         let home: PtzCommandRequest = parse_closed(json!({
             "operation": "home", "requestId": "home-1", "instance": "camera-a"
@@ -1053,7 +1072,7 @@ mod tests {
             parse_closed(json!({"operation": "status", "instance": "bad/token"})).unwrap();
         assert_eq!(
             rejection_code(bad_status.validate(2_000)),
-            ErrorCode::InvalidRequest
+            ErrorCode::BadArgs
         );
     }
 
@@ -1061,7 +1080,7 @@ mod tests {
     fn preset_operations_validate_pagination_tokens_and_names() {
         let list: PtzPresetsRequest =
             parse_closed(json!({"operation": "list", "limit": 0})).unwrap();
-        assert_eq!(rejection_code(list.validate()), ErrorCode::InvalidRequest);
+        assert_eq!(rejection_code(list.validate()), ErrorCode::BadArgs);
 
         for body in [
             json!({"operation": "goto", "instance": "camera-a", "requestId": "goto-1", "token": ""}),
@@ -1071,7 +1090,7 @@ mod tests {
             let request: PtzPresetsRequest = parse_closed(body).unwrap();
             assert_eq!(
                 rejection_code(request.validate()),
-                ErrorCode::InvalidRequest
+                ErrorCode::BadArgs
             );
         }
 
@@ -1108,7 +1127,7 @@ mod tests {
             parse_closed(serde_json::json!({"requestId": "r-3"})).unwrap();
         assert_eq!(
             bare.validate().unwrap_err().code(),
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             "omitting the camera must not silently mean the whole fleet"
         );
 
@@ -1118,8 +1137,27 @@ mod tests {
         .unwrap();
         assert_eq!(
             contradictory.validate().unwrap_err().code(),
-            ErrorCode::InvalidRequest,
+            ErrorCode::BadArgs,
             "naming a camera and asking for the whole fleet is a contradiction, not a preference"
+        );
+    }
+
+    /// The lifecycle verbs take an optional camera and nothing else -- a closed, `requestId`-free body.
+    #[test]
+    fn pause_resume_takes_an_optional_camera_and_rejects_anything_else() {
+        let fleet: PauseResumeRequest = parse_closed(json!({})).unwrap();
+        assert!(fleet.validate().is_ok());
+        assert_eq!(fleet.instance, None);
+
+        let one: PauseResumeRequest = parse_closed(json!({"instance": "camera-a"})).unwrap();
+        assert!(one.validate().is_ok());
+
+        let bad_token: PauseResumeRequest = parse_closed(json!({"instance": "bad/token"})).unwrap();
+        assert_eq!(rejection_code(bad_token.validate()), ErrorCode::BadArgs);
+
+        assert!(
+            parse_closed::<PauseResumeRequest>(json!({"requestId": "r-1"})).is_err(),
+            "the schema is closed: a field that does nothing must be rejected, not ignored"
         );
     }
 

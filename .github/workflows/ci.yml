@@ -105,18 +105,14 @@ jobs:
         run: rustup toolchain install 1.85 --profile minimal
 
 
-      # NOTE: no `--locked`, and `Cargo.lock` is not tracked. Three things cannot all be true at once:
-      #   1. a committed lockfile must record the pinned GIT source, or it lies to a fresh clone;
-      #   2. local dev builds through the gitignored `.cargo/config.toml` `[patch]`, and a patched
-      #      build REWRITES the lockfile to a PATH source;
-      #   3. simulators/run-rtsp-native-coverage.ps1 mounts the workspace READ-ONLY, so a git-sourced
-      #      lock plus the patch means cargo must rewrite it and cannot -- the build dies outright.
-      # Tracking the lockfile satisfies (1) and breaks (2) and (3); a patched lockfile satisfies (2)
-      # and (3) and lies about (1). `file-replicator` resolves this by not tracking it. So do we.
+      # `--locked` against the committed `Cargo.lock`, which records the pinned GIT source (it is
+      # regenerated on a fresh clone with the local `.cargo` `[patch]` inactive, so it never carries a
+      # path override, and the MSRV-aware resolver held every dependency to a 1.85-compatible version).
+      # CI has no `.cargo` override, so the lock resolves the pinned rev reproducibly.
       - name: Check on the declared MSRV
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-        run: cargo +1.85 check --all-targets
+        run: cargo +1.85 check --locked --all-targets
 
   rtsp-backend:
     # The `rtsp` (GStreamer) backend was compiled by NOTHING. The jobs above build default features
@@ -178,25 +174,21 @@ jobs:
 
   image:
     # The Dockerfile was built by NOTHING. Not by CI, not by any script -- the only automated docker
-    # builds in this repo are the simulator validation images, which are different files. So when
-    # 3c0d83d stopped tracking `Cargo.lock`, the `COPY camera-adapter/Cargo.lock` on line 35 and the
-    # two `cargo build --locked` invocations became a build that CANNOT SUCCEED in a clean clone --
-    # `"/camera-adapter/Cargo.lock": not found` -- and it stayed that way, because a developer with a
-    # stale lock still lying around in their working tree never saw it. The shipped container image
-    # was unbuildable by anyone who cloned the repo, and nothing said a word.
+    # builds in this repo are the simulator validation images, which are different files. This job
+    # builds the shipped image so it cannot silently rot.
     #
-    # This job builds it. Both targets, from a clean checkout, and it runs the binary it produced --
-    # compiling is not the same as producing a working image, and the RTSP target exists precisely to
-    # carry a GStreamer runtime the ONVIF one does not.
+    # It builds both targets from a clean checkout `--locked` against the committed `Cargo.lock` (which
+    # records the pinned git source; the image context carries no `.cargo` override) and runs the
+    # binary it produced -- compiling is not the same as producing a working image, and the RTSP target
+    # exists precisely to carry a GStreamer runtime the ONVIF one does not.
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
 
-      # A clean checkout has no `Cargo.lock` (it is untracked -- see the note in the `msrv` job). If a
-      # future change reintroduces `--locked` or copies the lock, the build dies here, which is the
-      # entire point of this job.
+      # A clean checkout carries the committed `Cargo.lock`; the Dockerfile copies it and builds
+      # `--locked` for a reproducible image. This job proves the image builds from a clean clone.
       - name: Build the default image (onvif)
         run: docker build --target onvif -t camera-adapter:onvif .
 

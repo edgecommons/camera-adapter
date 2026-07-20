@@ -171,6 +171,10 @@ impl CameraRuntime {
                     }
                 };
                 runtime.metrics.sample_queue(values).await;
+                // Drain the accumulated operational families on the same tick: the capture-lifecycle
+                // counters and the CameraCommand cells emit their Total/Interval pairs and reset.
+                runtime.metrics.drain_captures().await;
+                runtime.metrics.drain_commands().await;
                 runtime.sample_southbound_health(false).await;
             }
         })
@@ -594,7 +598,7 @@ impl CameraRuntime {
             .get_mut(&instance)
             .ok_or_else(|| {
                 crate::CameraError::rejected(
-                    crate::ErrorCode::UnknownInstance,
+                    crate::ErrorCode::NoSuchInstance,
                     format!("camera instance '{instance}' is not configured"),
                 )
             })?

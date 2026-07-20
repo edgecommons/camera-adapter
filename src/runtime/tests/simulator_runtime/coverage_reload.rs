@@ -513,7 +513,7 @@ async fn a_reload_whose_drain_budget_expires_while_a_capture_is_in_flight_vetoes
         .await
         .expect_err("an exhausted drain budget must veto the candidate rather than proceed");
 
-    assert_eq!(error.code(), crate::ErrorCode::CameraUnavailable);
+    assert_eq!(error.code(), crate::ErrorCode::DeviceUnavailable);
     let crate::config::BackendConfig::Sim(sim) =
         &runtime.config_snapshot().unwrap().instances[0].backend
     else {
@@ -550,13 +550,13 @@ async fn a_second_reload_is_rejected_while_one_is_already_draining() {
         .apply_reloaded_config(replacement, BTreeMap::new(), BTreeMap::new())
         .await
         .expect_err("a replacement must not begin while another is draining camera work");
-    assert_eq!(error.code(), crate::ErrorCode::CameraUnavailable);
+    assert_eq!(error.code(), crate::ErrorCode::DeviceUnavailable);
 
     let error = runtime
         .restore_reload_checkpoint(checkpoint)
         .await
         .expect_err("a rollback must not run while another reload is still draining");
-    assert_eq!(error.code(), crate::ErrorCode::CameraUnavailable);
+    assert_eq!(error.code(), crate::ErrorCode::DeviceUnavailable);
 
     let crate::config::BackendConfig::Sim(sim) =
         &runtime.config_snapshot().unwrap().instances[0].backend
@@ -597,7 +597,7 @@ async fn a_rollback_after_a_vetoed_reload_restores_a_working_camera_generation()
             .await
             .expect_err("a zero drain budget vetoes the candidate")
             .code(),
-        crate::ErrorCode::CameraUnavailable
+        crate::ErrorCode::DeviceUnavailable
     );
 
     runtime
@@ -923,6 +923,38 @@ async fn the_same_scheduled_occurrence_is_never_admitted_twice() {
     runtime.shutdown().await;
 }
 
+/// A paused camera's schedules are suspended: the occurrence is consumed (no error, the one-occurrence
+/// guarantee holds) but no durable job is written until the camera is resumed (SOUTHBOUND.md §2.2).
+#[tokio::test]
+async fn a_scheduled_occurrence_for_a_paused_camera_is_suspended_before_any_job_is_written() {
+    let directory = TempDir::new().unwrap();
+    let runtime = runtime(config(directory.path(), &["camera-a"], true), &directory).await;
+    let occurrence = occurrence(
+        crate::scheduler::ScheduleScope::Camera("camera-a".to_string()),
+        "minute",
+    );
+
+    assert!(runtime.set_paused("camera-a", true), "pausing an unpaused camera reports a change");
+    runtime
+        .submit_scheduled(&occurrence)
+        .await
+        .expect("a paused schedule occurrence is consumed, not an error");
+    assert!(
+        jobs_for(&runtime, "camera-a").await.is_empty(),
+        "a paused camera's schedule must write no durable capture"
+    );
+
+    // Resume, and the same schedule admits work again.
+    assert!(runtime.set_paused("camera-a", false));
+    runtime.submit_scheduled(&occurrence).await.unwrap();
+    assert_eq!(
+        jobs_for(&runtime, "camera-a").await.len(),
+        1,
+        "a resumed camera's schedule admits captures again"
+    );
+    runtime.shutdown().await;
+}
+
 /// A camera disabled between the cron firing and the occurrence being admitted must not be given
 /// work. The schedule loop consumes the occurrence either way -- what it must not do is write a
 /// durable job for a camera the operator has taken out of service.
@@ -989,7 +1021,7 @@ async fn a_scheduled_occurrence_for_a_schedule_that_was_disabled_is_rejected() {
         .await
         .expect_err("a disabled schedule cannot admit an occurrence");
 
-    assert_eq!(error.code(), crate::ErrorCode::InvalidRequest);
+    assert_eq!(error.code(), crate::ErrorCode::BadArgs);
     assert!(jobs_for(&runtime, "camera-a").await.is_empty());
     runtime.shutdown().await;
 }

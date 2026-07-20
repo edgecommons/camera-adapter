@@ -177,6 +177,10 @@ impl CameraRuntime {
                 crate::catalog::AcceptJobOutcome::Conflict
             });
         }
+        // A paused camera runs its in-flight captures to completion but accepts no NEW work. Checked
+        // AFTER the idempotency lookup (so an operator can still retry-to-poll a capture accepted
+        // before the pause) and BEFORE any durable row or physical work (SOUTHBOUND.md §2.2).
+        self.ensure_not_paused(&instance)?;
 
         let ResolvedCapture {
             camera,
@@ -415,9 +419,11 @@ impl CameraRuntime {
             config.global.limits.max_metadata_bytes,
         )?;
         // Resolve every member before creating any durable row. This gives the all-or-nothing
-        // error surface required by the group contract.
+        // error surface required by the group contract. A group is refused outright if ANY member is
+        // paused -- a partial group is not the contract (SOUTHBOUND.md §2.2).
         for instance in &body.instances {
-            let _ = self.registry.resolve_actuation_instance(Some(instance))?;
+            let resolved = self.registry.resolve_actuation_instance(Some(instance))?;
+            self.ensure_not_paused(&resolved)?;
         }
         let group_id = format!("grp_{}", uuid::Uuid::now_v7());
         let mut submissions = Vec::with_capacity(body.instances.len());
@@ -990,7 +996,7 @@ impl CameraRuntime {
 
         let capture_group_id = capture_group_id.ok_or_else(|| {
             crate::CameraError::rejected(
-                crate::ErrorCode::InvalidRequest,
+                crate::ErrorCode::BadArgs,
                 "captureGroupId is required",
             )
         })?;

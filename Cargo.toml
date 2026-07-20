@@ -3,7 +3,7 @@ name = "camera-adapter"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-license = "Apache-2.0"
+license = "BUSL-1.1"
 description = "EdgeCommons southbound adapter for GenICam and ONVIF cameras"
 publish = false
 

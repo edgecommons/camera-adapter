@@ -454,7 +454,7 @@ impl CursorStore {
                 let (cameras, unconfigured) = initial.ok_or_else(cursor_rejected)?;
                 if cameras.len().saturating_add(unconfigured.len()) > MAX_RETAINED_SNAPSHOT_VALUES {
                     return Err(crate::CameraError::rejected(
-                        crate::ErrorCode::InvalidRequest,
+                        crate::ErrorCode::BadArgs,
                         "result exceeds the retained snapshot bound",
                     ));
                 }
@@ -522,7 +522,7 @@ impl CursorStore {
                 let values = initial.ok_or_else(cursor_rejected)?;
                 if values.len() > MAX_RETAINED_SNAPSHOT_VALUES {
                     return Err(crate::CameraError::rejected(
-                        crate::ErrorCode::InvalidRequest,
+                        crate::ErrorCode::BadArgs,
                         "result exceeds the retained snapshot bound",
                     ));
                 }
@@ -631,7 +631,7 @@ fn cursor_query_hash(query: &serde_json::Value) -> Result<String> {
 
 fn cursor_rejected() -> crate::CameraError {
     crate::CameraError::rejected(
-        crate::ErrorCode::InvalidRequest,
+        crate::ErrorCode::BadArgs,
         "cursor is unknown, expired, or does not match this query",
     )
 }
@@ -872,6 +872,14 @@ pub struct CameraRuntime {
     cursors: CursorStore,
     reload_gate: tokio::sync::Mutex<()>,
     reloading: AtomicBool,
+    /// Cameras an operator has paused via `sb/pause`.
+    ///
+    /// A paused camera runs its in-flight captures to completion but accepts no new commanded or
+    /// scheduled capture work until `sb/resume` (SOUTHBOUND.md §2.2). The state is process-local and
+    /// deliberately not durable: a fresh start is unpaused, matching the scaffold's in-memory pause.
+    /// Keyed by instance id; a camera a reload removes leaves an inert entry that a restart clears and
+    /// that nothing reads (its schedules and capture paths no longer exist).
+    paused: RwLock<std::collections::BTreeSet<String>>,
     self_reference: OnceLock<Weak<Self>>,
 }
 
@@ -1406,6 +1414,38 @@ impl CameraRuntime {
             })
     }
 
+    /// Whether an operator has paused this camera via `sb/pause`.
+    fn is_paused(&self, instance: &str) -> bool {
+        self.paused
+            .read()
+            .map(|paused| paused.contains(instance))
+            .unwrap_or(false)
+    }
+
+    /// Sets the pause state for one camera, returning whether it CHANGED (the `changed` reply field).
+    fn set_paused(&self, instance: &str, paused: bool) -> bool {
+        let mut set = self
+            .paused
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if paused {
+            set.insert(instance.to_owned())
+        } else {
+            set.remove(instance)
+        }
+    }
+
+    /// Refuses new capture work while the camera is paused. In-flight captures are untouched.
+    fn ensure_not_paused(&self, instance: &str) -> Result<()> {
+        if self.is_paused(instance) {
+            return Err(crate::CameraError::rejected(
+                crate::ErrorCode::InstancePaused,
+                "camera is paused; resume it before submitting new capture work",
+            ));
+        }
+        Ok(())
+    }
+
     fn lifecycle_events(&self, instance: &str) -> Option<EventsFacade> {
         let config = match self.config_snapshot() {
             Ok(config) => config,
@@ -1623,6 +1663,7 @@ impl CameraRuntime {
             cursors: CursorStore::default(),
             reload_gate: tokio::sync::Mutex::new(()),
             reloading: AtomicBool::new(false),
+            paused: RwLock::new(std::collections::BTreeSet::new()),
             self_reference: OnceLock::new(),
         });
         let _ = runtime.self_reference.set(Arc::downgrade(&runtime));
@@ -1658,7 +1699,7 @@ impl CameraRuntime {
             .map(|session| session.actor.clone())
             .ok_or_else(|| {
                 crate::CameraError::rejected(
-                    crate::ErrorCode::CameraUnavailable,
+                    crate::ErrorCode::DeviceUnavailable,
                     format!("camera instance '{instance}' is not connected"),
                 )
             })
@@ -1673,7 +1714,7 @@ impl CameraRuntime {
             .map(|slot| slot.engine.clone())
             .ok_or_else(|| {
                 crate::CameraError::rejected(
-                    crate::ErrorCode::UnknownInstance,
+                    crate::ErrorCode::NoSuchInstance,
                     format!("camera instance '{instance}' is not configured"),
                 )
             })
@@ -1764,7 +1805,7 @@ impl CameraCommandService for CameraRuntime {
     ) -> CommandOutcome {
         if self.reloading.load(Ordering::Acquire) {
             return CommandOutcome::ImmediateError(CommandError::new(
-                crate::ErrorCode::CameraUnavailable.as_str(),
+                crate::ErrorCode::DeviceUnavailable.as_str(),
                 "the camera adapter is draining a configuration replacement",
             ));
         }
@@ -1777,11 +1818,39 @@ impl CameraCommandService for CameraRuntime {
                 "unsupported camera command",
             ));
         };
+        // The CameraCommand operational family (instance × verb × result). `instance` is best-effort
+        // from the request body ("main" for a fleet/component-scoped command); the result is recorded
+        // once the outcome is known. The deferred capture verbs count acceptance (the capture's own
+        // success/failure lives in camera_captures).
+        let command_started = std::time::Instant::now();
+        let command_instance = request
+            .body
+            .get("instance")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("main")
+            .to_owned();
+        let command_ms = |started: std::time::Instant| {
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+        };
         if verb == CommandVerb::Capture {
-            return self.handle_deferred_capture(request, deferred).await;
+            let outcome = self.handle_deferred_capture(request, deferred).await;
+            self.metrics.record_command(
+                &command_instance,
+                verb.as_str(),
+                !matches!(outcome, CommandOutcome::ImmediateError(_)),
+                command_ms(command_started),
+            );
+            return outcome;
         }
         if verb == CommandVerb::CaptureGroup {
-            return self.handle_deferred_group_capture(request, deferred).await;
+            let outcome = self.handle_deferred_group_capture(request, deferred).await;
+            self.metrics.record_command(
+                &command_instance,
+                verb.as_str(),
+                !matches!(outcome, CommandOutcome::ImmediateError(_)),
+                command_ms(command_started),
+            );
+            return outcome;
         }
         let config = match self.config_snapshot() {
             Ok(config) => config,
@@ -1845,8 +1914,32 @@ impl CameraCommandService for CameraRuntime {
                     let body: StatusRequest = commands::parse_closed(request.body.clone())?;
                     body.validate()?;
                     match body.instance {
-                        Some(instance) => Ok(serde_json::to_value(self.registry.snapshot(&instance)?)?),
-                        None => Ok(serde_json::json!({ "cameras": self.registry.snapshots(1_000)? })),
+                        // The `paused` flag is stamped onto the status view so the standardized
+                        // lifecycle state is visible where an operator (and the overview panel) reads
+                        // status, per SOUTHBOUND.md §2.2.
+                        Some(instance) => {
+                            let mut view = serde_json::to_value(self.registry.snapshot(&instance)?)?;
+                            if let Some(object) = view.as_object_mut() {
+                                object.insert("paused".to_owned(), self.is_paused(&instance).into());
+                            }
+                            Ok(view)
+                        }
+                        None => {
+                            let cameras = self
+                                .registry
+                                .snapshots(1_000)?
+                                .into_iter()
+                                .map(|snapshot| {
+                                    let paused = self.is_paused(&snapshot.instance);
+                                    let mut view = serde_json::to_value(snapshot)?;
+                                    if let Some(object) = view.as_object_mut() {
+                                        object.insert("paused".to_owned(), paused.into());
+                                    }
+                                    Ok(view)
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            Ok(serde_json::json!({ "cameras": cameras }))
+                        }
                     }
                 }
                 CommandVerb::CaptureSubmit => {
@@ -1902,24 +1995,24 @@ impl CameraCommandService for CameraRuntime {
                     let cursor = body.cursor.clone();
                     match body.validate()? {
                         CaptureStatusMode::Capture => {
-                            let id = body.capture_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::InvalidRequest, "captureId is required"))?;
+                            let id = body.capture_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::BadArgs, "captureId is required"))?;
                             let job = self.catalog.job(id).await?.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::CaptureNotFound, "capture was not found"))?;
                             Ok(job_status_json(&job))
                         }
                         CaptureStatusMode::Group => {
-                            let id = body.capture_group_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::InvalidRequest, "captureGroupId is required"))?;
+                            let id = body.capture_group_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::BadArgs, "captureGroupId is required"))?;
                             let group = self.catalog.group(id).await?.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::CaptureNotFound, "capture group was not found"))?;
                             self.group_status_page(group, usize::from(limit), cursor.as_deref())
                         }
                         CaptureStatusMode::CameraRequest => {
-                            let instance = body.instance.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::InvalidRequest, "instance is required"))?;
-                            let request_id = body.request_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::InvalidRequest, "requestId is required"))?;
+                            let instance = body.instance.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::BadArgs, "instance is required"))?;
+                            let request_id = body.request_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::BadArgs, "requestId is required"))?;
                             let job = self.catalog.job_by_ledger(crate::catalog::LedgerKey::new(instance, CommandVerb::Capture.as_str(), request_id)?).await?
                                 .ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::CaptureNotFound, "capture was not found"))?;
                             Ok(job_status_json(&job))
                         }
                         CaptureStatusMode::GroupRequest => {
-                            let request_id = body.request_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::InvalidRequest, "requestId is required"))?;
+                            let request_id = body.request_id.ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::BadArgs, "requestId is required"))?;
                             let group = self.catalog.group_by_ledger(crate::catalog::LedgerKey::new("main", CommandVerb::CaptureGroup.as_str(), request_id)?).await?
                                 .ok_or_else(|| crate::CameraError::rejected(crate::ErrorCode::CaptureNotFound, "capture group was not found"))?;
                             self.group_status_page(group, usize::from(limit), cursor.as_deref())
@@ -1955,6 +2048,22 @@ impl CameraCommandService for CameraRuntime {
                     let body: PtzPresetsRequest = commands::parse_closed(request.body.clone())?;
                     self.perform_presets(body).await
                 }
+                CommandVerb::Pause => {
+                    let body: commands::PauseResumeRequest =
+                        commands::parse_closed(request.body.clone())?;
+                    body.validate()?;
+                    let instance = self.registry.resolve_instance(body.instance.as_deref())?;
+                    let changed = self.set_paused(&instance, true);
+                    Ok(serde_json::json!({ "id": instance, "paused": true, "changed": changed }))
+                }
+                CommandVerb::Resume => {
+                    let body: commands::PauseResumeRequest =
+                        commands::parse_closed(request.body.clone())?;
+                    body.validate()?;
+                    let instance = self.registry.resolve_instance(body.instance.as_deref())?;
+                    let changed = self.set_paused(&instance, false);
+                    Ok(serde_json::json!({ "id": instance, "paused": false, "changed": changed }))
+                }
                 // The deferred verbs are answered above, before this match is reached. They are
                 // named here rather than swept up by a `_`, because a `_` is what let a fifteenth
                 // verb register with the inbox and then fall through to UNSUPPORTED_CAPABILITY at
@@ -1967,6 +2076,12 @@ impl CameraCommandService for CameraRuntime {
                 ),
             }
         }.await;
+        self.metrics.record_command(
+            &command_instance,
+            verb.as_str(),
+            outcome.is_ok(),
+            command_ms(command_started),
+        );
         match outcome {
             Ok(value) => CommandOutcome::ImmediateSuccess(Some(value)),
             Err(error) => CommandOutcome::ImmediateError(command_error(&error)),
@@ -2077,11 +2192,15 @@ pub enum CommandVerb {
     Ptz,
     /// `sb/ptz-presets`
     PtzPresets,
+    /// `sb/pause` -- suspend new capture work for the instance (standardized lifecycle verb).
+    Pause,
+    /// `sb/resume` -- resume a paused instance (standardized lifecycle verb).
+    Resume,
 }
 
 impl CommandVerb {
     /// Every verb the adapter answers, in the order the inbox registers them.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::List,
         Self::Discover,
         Self::Status,
@@ -2096,6 +2215,8 @@ impl CommandVerb {
         Self::Reconnect,
         Self::Ptz,
         Self::PtzPresets,
+        Self::Pause,
+        Self::Resume,
     ];
 
     /// The exact wire spelling. This string is durable: it is part of the idempotency key.
@@ -2116,6 +2237,8 @@ impl CommandVerb {
             Self::Reconnect => "sb/reconnect",
             Self::Ptz => "sb/ptz",
             Self::PtzPresets => "sb/ptz-presets",
+            Self::Pause => "sb/pause",
+            Self::Resume => "sb/resume",
         }
     }
 
@@ -2130,6 +2253,35 @@ impl CommandVerb {
 #[must_use]
 pub fn camera_command_verbs() -> Vec<&'static str> {
     CommandVerb::ALL.iter().map(|verb| verb.as_str()).collect()
+}
+
+/// The three edge-console panel descriptors for the camera adapter.
+///
+/// Core validates `id`/`title`/uniqueness; the widget kinds and bound verbs are console-interpreted,
+/// so they ride verbatim. `order` 10/20/30, every panel `scope: "instance"`. Each binds only verbs
+/// this adapter actually serves (SOUTHBOUND.md §2.2, the panel-trio baseline).
+#[must_use]
+pub fn camera_panels() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "id": "overview", "title": "Overview", "order": 10, "scope": "instance",
+            "widgets": [
+                { "kind": "summary", "fields": ["state", "connected", "paused", "backend"] },
+                { "kind": "commandSummary", "actions": ["sb/reconnect", "sb/pause", "sb/resume"] }
+            ],
+            "verbs": ["sb/status", "sb/reconnect", "sb/pause", "sb/resume"]
+        }),
+        serde_json::json!({
+            "id": "signals", "title": "Cameras", "order": 20, "scope": "instance",
+            "widgets": [ { "kind": "cameraRoster" }, { "kind": "captureSurface" } ],
+            "verbs": ["sb/list", "sb/status", "sb/capture", "sb/capture-status"]
+        }),
+        serde_json::json!({
+            "id": "diagnostics", "title": "Diagnostics", "order": 30, "scope": "instance",
+            "widgets": [ { "kind": "treeBrowser" }, { "kind": "keyValueList" } ],
+            "verbs": ["sb/discover", "sb/queue-status"]
+        }),
+    ]
 }
 
 /// Durable states in which a capture still owes the operator an outcome.
@@ -2734,6 +2886,12 @@ impl RuntimeCommandRouter {
                 }),
             )?;
         }
+        // The edge-console panel trio (overview / signals / diagnostics). Registered on the same inbox
+        // as the verbs, before the acknowledged subscription begins, so the descriptor surface is
+        // advertised atomically with the command surface it drives.
+        for panel in camera_panels() {
+            inbox.register_panel(panel)?;
+        }
         Ok(())
     }
 
@@ -2794,7 +2952,7 @@ impl RuntimeCommandRouter {
         match service {
             Some(service) => service.handle_camera_command(verb, request, deferred).await,
             None => CommandOutcome::ImmediateError(CommandError::new(
-                crate::ErrorCode::CameraUnavailable.as_str(),
+                crate::ErrorCode::DeviceUnavailable.as_str(),
                 "the camera adapter is still starting",
             )),
         }
