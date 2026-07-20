@@ -1085,7 +1085,7 @@ command wrapper:
 { "ok": true, "result": { } }
 
 // error
-{ "ok": false, "error": { "code": "CAMERA_UNAVAILABLE", "message": "..." } }
+{ "ok": false, "error": { "code": "DEVICE_UNAVAILABLE", "message": "..." } }
 ```
 
 Reply `header.name` remains the command verb, and `header.version` remains the core command contract
@@ -1119,6 +1119,8 @@ camera adapter.
 | `sb/queue-status` | immediate | Report live admission capacity, per-camera queue depth, and the durable backlog. |
 | `sb/queue-clear` | immediate | Break-glass: cancel the durable backlog for one camera or, explicitly, the fleet. |
 | `sb/reconnect` | immediate acceptance | Close and reconnect a configured camera session. |
+| `sb/pause` | immediate | Suspend a camera's new capture work (scheduled and commanded); idempotent `{ paused, changed }`. |
+| `sb/resume` | immediate | Resume a paused camera; idempotent `{ paused, changed }`. |
 | `sb/ptz` | immediate | Execute or inspect a capability-gated PTZ operation. |
 | `sb/ptz-presets` | immediate | List, recall, create, or remove presets subject to policy. |
 
@@ -1127,8 +1129,8 @@ camera adapter.
 Every command that targets a camera accepts `instance`:
 
 - When exactly one camera is configured, it MAY be omitted and defaults to that instance.
-- With more than one camera, omission returns `INSTANCE_REQUIRED`.
-- An unknown instance returns `UNKNOWN_INSTANCE`.
+- With more than one camera, omission returns `BAD_ARGS`.
+- An unknown instance returns `NO_SUCH_INSTANCE`.
 - A known but disabled camera returns status normally and rejects actuation with `CAMERA_DISABLED`.
 
 ### 13.2 `sb/list`
@@ -1291,7 +1293,7 @@ Request (both verbs):
 
 - `instances` MUST name 2 to `limits.maxCamerasPerGroup` distinct configured cameras. Validation is
   all-or-nothing: an unknown, disabled, or duplicate member rejects the whole request before any job is
-  created (`UNKNOWN_INSTANCE`, `CAMERA_DISABLED`, or `INVALID_REQUEST`); an oversize list returns
+  created (`NO_SUCH_INSTANCE`, `CAMERA_DISABLED`, or `BAD_ARGS`); an oversize list returns
   `GROUP_TOO_LARGE`.
 - `captureProfile` applies to every member unless overridden per member in `profileOverrides`; every
   effective profile must exist on its camera. `timeoutMs` is a per-member job deadline, not a group
@@ -1497,13 +1499,13 @@ must round-trip unchanged.
 
 | Code | Meaning |
 |---|---|
-| `INSTANCE_REQUIRED` | More than one camera exists and no target was supplied. |
-| `UNKNOWN_INSTANCE` | Target camera ID is not configured. |
+| `BAD_ARGS` | Malformed request body, an out-of-range field, or instance routing — a missing `instance` when more than one camera is configured, or any other invalid argument. |
+| `NO_SUCH_INSTANCE` | Target camera ID is not configured. |
 | `CAMERA_DISABLED` | The configured camera is disabled. |
-| `CAMERA_UNAVAILABLE` | Camera is offline and the command policy does not wait. |
+| `DEVICE_UNAVAILABLE` | Camera is offline (session down or unreachable) and the command policy does not wait. |
+| `INSTANCE_PAUSED` | The camera is paused (`sb/pause`) and refuses new capture work until resumed. |
 | `CAMERA_MOVING` | Capture/PTZ interlock rejected capture while the camera was moving. |
 | `UNSUPPORTED_CAPABILITY` | Camera/backend cannot perform the requested operation. |
-| `INVALID_REQUEST` | Body shape, range, or profile is invalid. |
 | `UNKNOWN_CAPTURE_PROFILE` | Named profile is not configured for the camera. |
 | `QUEUE_FULL` | Per-camera or global admission limit rejected the job. |
 | `GROUP_TOO_LARGE` | A group capture named more members than `limits.maxCamerasPerGroup`. |
