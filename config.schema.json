@@ -186,6 +186,10 @@
     }
   },
   "$defs": {
+    "instance": {
+      "description": "The shape of one `component.instances[]` entry. Tooling resolves instance config through this fixed name; the definition lives under its domain name below.",
+      "$ref": "#/$defs/camera"
+    },
     "camera": {
       "title": "One camera",
       "description": "One entry of `component.instances[]`. Each camera gets its own supervisor and connection lifecycle.",
