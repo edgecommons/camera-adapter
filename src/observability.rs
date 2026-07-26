@@ -508,18 +508,31 @@ impl CaptureMetrics {
         let metric = edgecommons::metrics::MetricBuilder::create(HEALTH_METRIC)
             .add_dimension("instance", instance)
             .add_measure("connectionState", "Count", 1)
+            .add_measure("signalsSubscribed", "Count", 1)
             .add_measure("publishLatencyMs", "Milliseconds", 1)
             .add_measure("pollLatencyMs", "Milliseconds", 1)
             .add_measure("readErrors", "Count", 60)
+            .add_measure("writeErrors", "Count", 60)
             .add_measure("staleSignals", "Count", 60)
             .add_measure("reconnects", "Count", 60)
             .build();
 
-        let mut values = std::collections::HashMap::with_capacity(6);
+        let mut values = std::collections::HashMap::with_capacity(8);
         values.insert(
             "connectionState".to_owned(),
             f64::from(sample.connection_state),
         );
+        // The two remaining SOUTHBOUND §5 measures are structurally constant for a camera and are
+        // emitted so the eight-measure family stays fleet-uniform:
+        // - `signalsSubscribed` counts the signal inventory a session serves. A camera serves no
+        //   `SouthboundSignalUpdate` signals -- its data points are images announced on
+        //   `app/image/*` -- so the gauge reads 0 whether connected or not (the contract's
+        //   "0 while disconnected" holds trivially).
+        // - `writeErrors` counts device-path failures of allow-listed signal writes. The adapter
+        //   exposes no southbound signal-write surface (`sb/write` is not served; PTZ failures are
+        //   the `CameraPtz` family), so the interval counter reads 0.
+        values.insert("signalsSubscribed".to_owned(), 0.0);
+        values.insert("writeErrors".to_owned(), 0.0);
         values.insert("readErrors".to_owned(), sample.read_errors as f64);
         values.insert("staleSignals".to_owned(), f64::from(sample.stale_signals));
         values.insert("reconnects".to_owned(), sample.reconnects as f64);
@@ -963,6 +976,25 @@ mod tests {
         assert_eq!(values.get("connectionState"), Some(&1.0));
         assert_eq!(values.get("readErrors"), Some(&2.0));
         assert_eq!(values.get("reconnects"), Some(&1.0));
+        // The SOUTHBOUND §5 measures with no camera-side source read 0, not absent: the family
+        // stays the exact eight-measure shape fleet dashboards consume.
+        assert_eq!(values.get("signalsSubscribed"), Some(&0.0));
+        assert_eq!(values.get("writeErrors"), Some(&0.0));
+        // The definition carries exactly the eight SOUTHBOUND §5 measures.
+        let defined = target.last_definition();
+        let measures: Vec<&str> = defined.get_measures().keys().map(String::as_str).collect();
+        let mut expected = vec![
+            "connectionState",
+            "publishLatencyMs",
+            "pollLatencyMs",
+            "readErrors",
+            "staleSignals",
+            "reconnects",
+            "writeErrors",
+            "signalsSubscribed",
+        ];
+        expected.sort_unstable();
+        assert_eq!(measures, expected, "southbound_health is the exact eight-measure family");
         assert_eq!(
             target.last_definition().get_dimensions().get("instance"),
             Some(&"camera-a".to_owned()),

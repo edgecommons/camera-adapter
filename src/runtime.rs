@@ -2259,26 +2259,64 @@ pub fn camera_command_verbs() -> Vec<&'static str> {
 ///
 /// Core validates `id`/`title`/uniqueness; the widget kinds and bound verbs are console-interpreted,
 /// so they ride verbatim. `order` 10/20/30, every panel `scope: "instance"`. Each binds only verbs
-/// this adapter actually serves (SOUTHBOUND.md §2.2, the panel-trio baseline).
+/// this adapter actually serves (SOUTHBOUND.md §2.2, the panel-trio baseline), and every panel
+/// carries at least one widget the shipped console renders today (`summary`/`keyValueList` rows,
+/// `commandSummary` verbs). The signal-adapter widgets do not map onto a camera and are absent by
+/// design: no `signalGrid` (the adapter serves no `sb/signals`/`sb/read` signal inventory -- the
+/// `cameraRoster`/`captureSurface` kinds are the camera-domain equivalents a future console can
+/// bind), no `treeBrowser` (there is no hierarchical `sb/browse`; `sb/discover` is an active
+/// network scan with a closed request schema, not a browse), and no widget names a `writeVerb`
+/// (there is no southbound signal-write surface).
 #[must_use]
 pub fn camera_panels() -> Vec<serde_json::Value> {
     vec![
         serde_json::json!({
             "id": "overview", "title": "Overview", "order": 10, "scope": "instance",
             "widgets": [
-                { "kind": "summary", "fields": ["state", "connected", "paused", "backend"] },
-                { "kind": "commandSummary", "actions": ["sb/reconnect", "sb/pause", "sb/resume"] }
+                {
+                    "kind": "summary", "id": "overview-summary", "title": "Camera overview",
+                    "rows": [
+                        { "label": "Status", "value": "State, connection, pause, and backend via cmd/sb/status" },
+                        { "label": "Lifecycle", "value": "Pause, resume, and reconnect the camera instance" },
+                        { "label": "Captures", "value": "On-demand and scheduled captures announced on app/image/*" }
+                    ]
+                },
+                {
+                    "kind": "commandSummary", "id": "overview-lifecycle", "title": "Lifecycle bindings",
+                    "verbs": ["sb/status", "sb/reconnect", "sb/pause", "sb/resume"]
+                }
             ],
             "verbs": ["sb/status", "sb/reconnect", "sb/pause", "sb/resume"]
         }),
         serde_json::json!({
             "id": "signals", "title": "Cameras", "order": 20, "scope": "instance",
-            "widgets": [ { "kind": "cameraRoster" }, { "kind": "captureSurface" } ],
+            "widgets": [
+                { "kind": "cameraRoster", "id": "camera-roster", "title": "Camera roster",
+                  "scope": "instance", "listVerb": "sb/list", "statusVerb": "sb/status" },
+                { "kind": "captureSurface", "id": "capture-surface", "title": "Captures",
+                  "scope": "instance", "captureVerb": "sb/capture", "statusVerb": "sb/capture-status" },
+                {
+                    "kind": "commandSummary", "id": "capture-commands", "title": "Capture bindings",
+                    "verbs": ["sb/list", "sb/status", "sb/capture", "sb/capture-status"]
+                }
+            ],
             "verbs": ["sb/list", "sb/status", "sb/capture", "sb/capture-status"]
         }),
         serde_json::json!({
             "id": "diagnostics", "title": "Diagnostics", "order": 30, "scope": "instance",
-            "widgets": [ { "kind": "treeBrowser" }, { "kind": "keyValueList" } ],
+            "widgets": [
+                {
+                    "kind": "keyValueList", "id": "diagnostic-surfaces", "title": "Diagnostics",
+                    "rows": [
+                        { "label": "Discovery", "value": "Scan for cameras via cmd/sb/discover" },
+                        { "label": "Queue", "value": "Capture queue depth and age via cmd/sb/queue-status" }
+                    ]
+                },
+                {
+                    "kind": "commandSummary", "id": "diagnostic-commands", "title": "Diagnostic commands",
+                    "verbs": ["sb/discover", "sb/queue-status"]
+                }
+            ],
             "verbs": ["sb/discover", "sb/queue-status"]
         }),
     ]

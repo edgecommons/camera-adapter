@@ -23,6 +23,8 @@ pub enum ErrorCode {
     /// southbound availability code.
     DeviceUnavailable,
     /// The camera instance is paused (`sb/pause`) and refuses new capture work until resumed.
+    /// Standardized southbound paused-refusal code (SOUTHBOUND.md §2.2): a whole operation the
+    /// paused state prohibits answers the top-level code `PAUSED`.
     InstancePaused,
     /// The capture/PTZ interlock rejected the operation.
     CameraMoving,
@@ -77,7 +79,7 @@ impl ErrorCode {
             Self::NoSuchInstance => "NO_SUCH_INSTANCE",
             Self::CameraDisabled => "CAMERA_DISABLED",
             Self::DeviceUnavailable => "DEVICE_UNAVAILABLE",
-            Self::InstancePaused => "INSTANCE_PAUSED",
+            Self::InstancePaused => "PAUSED",
             Self::CameraMoving => "CAMERA_MOVING",
             Self::UnsupportedCapability => "UNSUPPORTED_CAPABILITY",
             Self::UnknownCaptureProfile => "UNKNOWN_CAPTURE_PROFILE",
@@ -405,7 +407,7 @@ mod tests {
             (ErrorCode::NoSuchInstance, "NO_SUCH_INSTANCE"),
             (ErrorCode::CameraDisabled, "CAMERA_DISABLED"),
             (ErrorCode::DeviceUnavailable, "DEVICE_UNAVAILABLE"),
-            (ErrorCode::InstancePaused, "INSTANCE_PAUSED"),
+            (ErrorCode::InstancePaused, "PAUSED"),
             (ErrorCode::CameraMoving, "CAMERA_MOVING"),
             (ErrorCode::UnsupportedCapability, "UNSUPPORTED_CAPABILITY"),
             (ErrorCode::UnknownCaptureProfile, "UNKNOWN_CAPTURE_PROFILE"),

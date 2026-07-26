@@ -437,7 +437,7 @@ session, not the camera); ledgered and settled immediately.
 
 **What it does.** Suspends a camera's new capture work: while paused, scheduled captures are held and new
 commanded captures (`sb/capture`, `sb/capture-submit`, `sb/capture-group`, `sb/capture-group-submit`) are
-refused with `INSTANCE_PAUSED`. Captures already in flight run to completion. The verb is idempotent, and
+refused with `PAUSED`. Captures already in flight run to completion. The verb is idempotent, and
 `changed` reports whether the state moved. Pause is in-memory only — a restart begins unpaused. It applies
 only to capture workload: `sb/reconnect`, `sb/ptz*`, and the read-only verbs are unaffected, and the paused
 state is surfaced by `sb/status`.
@@ -599,7 +599,7 @@ lifecycle event.
 ## Stable errors
 
 The public error `code` is one of `BAD_ARGS`, `NO_SUCH_INSTANCE`, `CAMERA_DISABLED`,
-`DEVICE_UNAVAILABLE`, `INSTANCE_PAUSED`, `CAMERA_MOVING`, `UNSUPPORTED_CAPABILITY`,
+`DEVICE_UNAVAILABLE`, `PAUSED`, `CAMERA_MOVING`, `UNSUPPORTED_CAPABILITY`,
 `UNKNOWN_CAPTURE_PROFILE`, `QUEUE_FULL`, `GROUP_TOO_LARGE`, `RESOURCE_LIMIT`, `CAPTURE_TIMEOUT`,
 `CAPTURE_CANCELLED`, `PROCESS_INTERRUPTED`, `CAPTURE_NOT_FOUND`, `IDEMPOTENCY_CONFLICT`,
 `PREVIOUS_OUTCOME_UNKNOWN`, `REPLY_REQUIRED`, `UNSUPPORTED_PIXEL_FORMAT`, `STORAGE_PRESSURE`,
@@ -608,7 +608,7 @@ The public error `code` is one of `BAD_ARGS`, `NO_SUCH_INSTANCE`, `CAMERA_DISABL
 
 `BAD_ARGS` covers a malformed request body, an out-of-range field, and instance routing: a missing
 `instance` when more than one camera is configured is `BAD_ARGS`, and an unknown `instance` is
-`NO_SUCH_INSTANCE`. `INSTANCE_PAUSED` is returned when a camera has been paused with `sb/pause` and is
+`NO_SUCH_INSTANCE`. `PAUSED` is returned when a camera has been paused with `sb/pause` and is
 asked to accept new capture work. The routing and availability codes (`BAD_ARGS`, `NO_SUCH_INSTANCE`,
 `DEVICE_UNAVAILABLE`) are the standardized southbound names shared across EdgeCommons adapters
 (`core/docs/SOUTHBOUND.md` §2.2); the domain codes (`CAPTURE_*`, `PTZ_*`, `STORAGE_PRESSURE`, …) are
