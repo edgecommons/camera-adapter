@@ -4935,3 +4935,327 @@ fn the_panel_trio_is_registered_with_the_right_ids_orders_and_scope() {
         }
     }
 }
+
+// --- Live-inbox declared-scope integration (core 0.5.0, D-CAM-30) ----------------------------
+
+/// An in-process `MessagingService` double for driving the REAL command inbox: it captures the
+/// inbox's acknowledged subscriptions so a test can deliver command messages through the
+/// production dispatch — library scope enforcement, addressing resolution, and the registered
+/// per-verb closures — and records every reply the inbox sends back.
+#[derive(Default)]
+struct InboxLoopbackMessaging {
+    subscriptions: Mutex<Vec<(String, Arc<dyn edgecommons::messaging::MessageHandler>)>>,
+    replies: Mutex<Vec<(String, Message)>>,
+}
+
+impl InboxLoopbackMessaging {
+    fn unsupported<T>(&self) -> edgecommons::Result<T> {
+        Err(edgecommons::EdgeCommonsError::Messaging(
+            "not supported by the inbox loopback double".to_string(),
+        ))
+    }
+
+    /// Delivers one message to the handler subscribed under the first filter that matches
+    /// `topic` (MQTT `+`/`#` semantics — enough for the two D-U28 inbox filters).
+    async fn deliver(&self, topic: &str, message: Message) {
+        let handler = {
+            let subscriptions = self.subscriptions.lock().unwrap();
+            subscriptions
+                .iter()
+                .find(|(filter, _)| mqtt_filter_matches(filter, topic))
+                .map(|(_, handler)| Arc::clone(handler))
+                .expect("the inbox must have subscribed a filter matching the delivery topic")
+        };
+        handler.handle(topic.to_string(), message).await;
+    }
+
+    /// The reply the inbox sent for `correlation_id`.
+    fn reply_for(&self, correlation_id: &str) -> Message {
+        self.replies
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(correlation, _)| correlation == correlation_id)
+            .map(|(_, reply)| reply.clone())
+            .expect("the inbox must have replied to the delivered request")
+    }
+
+    fn filters(&self) -> Vec<String> {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(filter, _)| filter.clone())
+            .collect()
+    }
+}
+
+/// Minimal MQTT filter matching for the loopback double.
+fn mqtt_filter_matches(filter: &str, topic: &str) -> bool {
+    let mut filter_parts = filter.split('/');
+    let mut topic_parts = topic.split('/');
+    loop {
+        match (filter_parts.next(), topic_parts.next()) {
+            (Some("#"), _) => return true,
+            (Some("+"), Some(_)) => {}
+            (Some(expected), Some(actual)) if expected == actual => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+#[async_trait]
+impl edgecommons::messaging::MessagingService for InboxLoopbackMessaging {
+    async fn publish(&self, _topic: &str, _msg: &Message) -> edgecommons::Result<()> {
+        Ok(())
+    }
+    async fn publish_northbound(
+        &self,
+        _topic: &str,
+        _msg: &Message,
+        _qos: edgecommons::messaging::Qos,
+    ) -> edgecommons::Result<()> {
+        Ok(())
+    }
+    async fn publish_raw(
+        &self,
+        _topic: &str,
+        _payload: &serde_json::Value,
+    ) -> edgecommons::Result<()> {
+        Ok(())
+    }
+    async fn publish_northbound_raw(
+        &self,
+        _topic: &str,
+        _payload: &serde_json::Value,
+        _qos: edgecommons::messaging::Qos,
+    ) -> edgecommons::Result<()> {
+        Ok(())
+    }
+    async fn subscribe(
+        &self,
+        filter: &str,
+        handler: Arc<dyn edgecommons::messaging::MessageHandler>,
+        _max_messages: usize,
+        _max_concurrency: usize,
+    ) -> edgecommons::Result<()> {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .push((filter.to_string(), handler));
+        Ok(())
+    }
+    async fn subscribe_acknowledged(
+        &self,
+        filter: &str,
+        handler: Arc<dyn edgecommons::messaging::MessageHandler>,
+        max_messages: usize,
+        max_concurrency: usize,
+        _timeout: Duration,
+    ) -> edgecommons::Result<()> {
+        self.subscribe(filter, handler, max_messages, max_concurrency)
+            .await
+    }
+    async fn subscribe_northbound(
+        &self,
+        _filter: &str,
+        _handler: Arc<dyn edgecommons::messaging::MessageHandler>,
+        _qos: edgecommons::messaging::Qos,
+        _max_messages: usize,
+        _max_concurrency: usize,
+    ) -> edgecommons::Result<()> {
+        Ok(())
+    }
+    async fn unsubscribe(&self, filter: &str) -> edgecommons::Result<()> {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .retain(|(subscribed, _)| subscribed != filter);
+        Ok(())
+    }
+    async fn unsubscribe_northbound(&self, _filter: &str) -> edgecommons::Result<()> {
+        Ok(())
+    }
+    async fn request(
+        &self,
+        _topic: &str,
+        _msg: Message,
+    ) -> edgecommons::Result<edgecommons::messaging::ReplyFuture> {
+        self.unsupported()
+    }
+    async fn request_northbound(
+        &self,
+        _topic: &str,
+        _msg: Message,
+    ) -> edgecommons::Result<edgecommons::messaging::ReplyFuture> {
+        self.unsupported()
+    }
+    async fn request_with_timeout(
+        &self,
+        _topic: &str,
+        _msg: Message,
+        _timeout: Option<Duration>,
+    ) -> edgecommons::Result<edgecommons::messaging::ReplyFuture> {
+        self.unsupported()
+    }
+    async fn request_northbound_with_timeout(
+        &self,
+        _topic: &str,
+        _msg: Message,
+        _timeout: Option<Duration>,
+    ) -> edgecommons::Result<edgecommons::messaging::ReplyFuture> {
+        self.unsupported()
+    }
+    async fn reply(&self, request: &Message, reply: Message) -> edgecommons::Result<()> {
+        self.replies
+            .lock()
+            .unwrap()
+            .push((request.header.correlation_id.clone(), reply));
+        Ok(())
+    }
+    async fn reply_northbound(
+        &self,
+        _request: &Message,
+        _reply: Message,
+    ) -> edgecommons::Result<()> {
+        Ok(())
+    }
+    fn cancel_request(&self, _reply_future: edgecommons::messaging::ReplyFuture) {}
+    fn cancel_request_northbound(&self, _reply_future: edgecommons::messaging::ReplyFuture) {}
+    fn connected(&self) -> bool {
+        true
+    }
+}
+
+/// The declared-scope contract through the REAL inbox over the adapter's actual registrations
+/// (D-CAM-30): the library resolves the delivery topic's instance token and enforces the scope
+/// ahead of dispatch — the byte-pinned conflict and component-scope refusals — and the
+/// registered per-verb closures (immediate and deferred alike) receive the addressing and seed
+/// it into the body the runtime routes by.
+#[tokio::test]
+async fn the_live_inbox_enforces_declared_scope_over_the_registered_verbs() {
+    let messaging = Arc::new(InboxLoopbackMessaging::default());
+    let config = Arc::new(
+        edgecommons::config::Config::from_value(crate::COMPONENT_NAME, "inbox-e2e", json!({}))
+            .expect("an empty component config is valid"),
+    );
+    let inbox = edgecommons::commands::CommandInbox::new(
+        Arc::clone(&messaging) as Arc<dyn edgecommons::messaging::MessagingService>,
+        config,
+        Arc::new(|| 0),
+        Arc::new(|| Box::pin(async { true })),
+        Arc::new(|| None),
+        Arc::new(Vec::new),
+    );
+    let router = RuntimeCommandRouter::new();
+    router
+        .register(&inbox)
+        .expect("every camera verb registers with its declared scope");
+
+    /// Echoes the dispatched body back, so the reply proves what the pipeline seeded.
+    struct EchoService;
+    #[async_trait]
+    impl CameraCommandService for EchoService {
+        async fn handle_camera_command(
+            &self,
+            verb: &'static str,
+            request: Message,
+            _deferred: DeferredReplyRegistry,
+        ) -> CommandOutcome {
+            CommandOutcome::ImmediateSuccess(Some(json!({ "verb": verb, "body": request.body })))
+        }
+    }
+    router.install(Arc::new(EchoService)).unwrap();
+    let status = Arc::clone(&inbox).start().await;
+    assert_eq!(
+        status.state,
+        edgecommons::commands::CommandInboxStartupState::Active,
+        "the loopback inbox must activate"
+    );
+    let instance_prefix = messaging
+        .filters()
+        .into_iter()
+        .find_map(|filter| filter.strip_suffix("+/cmd/#").map(str::to_string))
+        .expect("the inbox subscribes the D-U28 instance-scope filter");
+
+    let request = |verb: &str, suffix: &str, body: serde_json::Value| {
+        MessageBuilder::new(verb, "1.0")
+            .correlation_id(format!("live-inbox-{suffix}"))
+            .reply_to("live-inbox/replies")
+            .structured_payload(body)
+            .build()
+    };
+
+    // An instance-addressed immediate verb: the token is seeded into the body the runtime
+    // routes by — exercising the registered immediate closure end to end.
+    messaging
+        .deliver(
+            &format!("{instance_prefix}camera-b/cmd/sb/status"),
+            request("sb/status", "status", json!({})),
+        )
+        .await;
+    let reply = messaging.reply_for("live-inbox-status");
+    assert_eq!(reply.body["ok"], json!(true));
+    assert_eq!(reply.body["result"]["body"], json!({ "instance": "camera-b" }));
+
+    // An instance-addressed DEFERRED verb routes by the token too (the closed D-CAM-29 gap),
+    // through the registered outcome closure.
+    messaging
+        .deliver(
+            &format!("{instance_prefix}camera-b/cmd/sb/capture"),
+            request("sb/capture", "capture", json!({ "requestId": "live-1" })),
+        )
+        .await;
+    let reply = messaging.reply_for("live-inbox-capture");
+    assert_eq!(reply.body["ok"], json!(true));
+    assert_eq!(
+        reply.body["result"]["body"],
+        json!({ "instance": "camera-b", "requestId": "live-1" })
+    );
+
+    // Conflict-first, byte-pinned, library-owned: the handler never runs.
+    messaging
+        .deliver(
+            &format!("{instance_prefix}camera-b/cmd/sb/status"),
+            request("sb/status", "conflict", json!({ "instance": "camera-a" })),
+        )
+        .await;
+    let reply = messaging.reply_for("live-inbox-conflict");
+    assert_eq!(reply.body["ok"], json!(false));
+    assert_eq!(reply.body["error"]["code"], json!("BAD_ARGS"));
+    assert_eq!(
+        reply.body["error"]["message"],
+        json!("instance in body conflicts with the addressed instance")
+    );
+
+    // A COMPONENT-scoped verb refuses an instance-addressed delivery...
+    messaging
+        .deliver(
+            &format!("{instance_prefix}camera-b/cmd/sb/list"),
+            request("sb/list", "component-topic", json!({})),
+        )
+        .await;
+    let reply = messaging.reply_for("live-inbox-component-topic");
+    assert_eq!(reply.body["error"]["code"], json!("BAD_ARGS"));
+    assert_eq!(
+        reply.body["error"]["message"],
+        json!("verb 'sb/list' is component-scoped")
+    );
+
+    // ...and a body-named instance at component scope.
+    messaging
+        .deliver(
+            &format!("{instance_prefix}cmd/sb/list"),
+            request("sb/list", "component-body", json!({ "instance": "camera-a" })),
+        )
+        .await;
+    let reply = messaging.reply_for("live-inbox-component-body");
+    assert_eq!(reply.body["error"]["code"], json!("BAD_ARGS"));
+    assert_eq!(
+        reply.body["error"]["message"],
+        json!("verb 'sb/list' is component-scoped - the body must not name an instance")
+    );
+
+    let _ = inbox.stop().await;
+}

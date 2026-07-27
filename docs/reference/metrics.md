@@ -84,7 +84,7 @@ camera has dropped from the keepalive rather than by polling `sb/list` or `sb/st
 |---|---|
 | `instance` | The camera ID. |
 | `connected` | True only while the camera's protocol session is online. The normalized flag any consumer can act on. |
-| `state` | The camera's own condition token: `ONLINE`, `CONNECTING`, `BACKOFF`, `OFFLINE`, `DEGRADED`, `DISABLED`, `STOPPING`. `BACKOFF` and `CONNECTING` are both `connected: false`, and they call for different responses. |
+| `state` | The camera's condition token: `ONLINE`, `CONNECTING`, `BACKOFF`, `PAUSED`, `OFFLINE`, `DEGRADED`, `DISABLED`, `STOPPING`. `BACKOFF` and `CONNECTING` are both `connected: false`, and they call for different responses. A camera paused with `sb/pause` reports `PAUSED` — deliberately quiet, not stale — while `connected` keeps reporting reachability, because pause suspends capture workload, not the session. The token comes from the same state model that answers `sb/status`, so the pushed and the pulled answer cannot disagree. |
 | `detail` | Why the camera is down, in its own words, when it has reported an error. A healthy camera carries none. |
 | `attributes` | Camera-specific data: `backend`, the connection `generation`, and `lastErrorCode` when an error is known. |
 

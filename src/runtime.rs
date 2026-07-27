@@ -45,7 +45,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use edgecommons::commands::{
     AVAILABILITY_AVAILABLE, AVAILABILITY_DISABLED, CommandError, CommandInbox, CommandOutcome,
-    DeferredReplyRegistry, DeferredReplyToken, outcome_handler, scoped_command_handler,
+    CommandScope, DeferredReplyRegistry, DeferredReplyToken, command_handler, outcome_handler,
 };
 use edgecommons::config::{
     Config, ConfigurationApplicationError, ConfigurationApplicationResult,
@@ -2250,33 +2250,47 @@ impl CommandVerb {
 
     /// True for the verbs whose reply may be deferred (`sb/capture`, `sb/capture-group`).
     ///
-    /// These stay on the outcome registration: the core 0.4.0 scoped registration is
-    /// immediate-reply only, and giving up the deferred settlement (the dispatch permit is
-    /// released while a capture runs; `sb/capture-cancel` settles the pending reply) is not an
-    /// acceptable trade for topic-token visibility. See the D-CAM-18 register entry for the
-    /// recorded consequence.
+    /// These register through `register_outcome`, keeping the deferred settlement (the dispatch
+    /// permit is released while a capture runs; `sb/capture-cancel` settles the pending reply).
+    /// The outcome registration receives the addressed instance exactly like the immediate one
+    /// (core 0.5.0, D-SC-1), so deferral costs no addressing fidelity.
     #[must_use]
     pub const fn defers(self) -> bool {
         matches!(self, Self::Capture | Self::CaptureGroup)
     }
 
-    /// True when the verb's closed request schema carries a camera `instance` selector, so an
-    /// instance-addressed delivery topic (D-U28) can route it.
+    /// The [`CommandScope`] this verb declares at registration (D-SC-2), derived from its closed
+    /// request schema. The library enforces it ahead of dispatch: a topic/body instance conflict
+    /// and any instance addressing at a `Component` verb are refused with `BAD_ARGS` before a
+    /// handler runs.
     ///
-    /// The rest are component-scoped by design — `sb/list` and `sb/discover` answer for the
-    /// fleet, the group verbs target `instances[]`, and `sb/capture-cancel` targets a durable
-    /// component-scoped capture/group id — so an instance-addressed delivery of one of them is
-    /// refused rather than silently accepted with the token ignored.
+    /// - `Component` — the schema carries no camera selector: `sb/list` and `sb/discover` answer
+    ///   for the fleet, the group verbs target `instances[]`, and `sb/capture-cancel` targets a
+    ///   durable component-scoped capture/group id.
+    /// - `Instance` — per-camera actuation; an unaddressed delivery falls back to the adapter's
+    ///   optional-iff-one configured-camera default (D-SC-4).
+    /// - `Both` — dual-semantics: an addressed camera narrows the answer, no addressing means the
+    ///   whole component (`sb/status` answers every camera, `sb/queue-status` the whole fleet,
+    ///   `sb/capture-status` component-wide lookups, `sb/queue-clear` the `allCameras` drain).
     #[must_use]
-    pub const fn instance_routable(self) -> bool {
-        !matches!(
-            self,
+    pub const fn scope(self) -> CommandScope {
+        match self {
             Self::List
-                | Self::Discover
-                | Self::CaptureGroup
-                | Self::CaptureGroupSubmit
-                | Self::CaptureCancel
-        )
+            | Self::Discover
+            | Self::CaptureGroup
+            | Self::CaptureGroupSubmit
+            | Self::CaptureCancel => CommandScope::Component,
+            Self::Capture
+            | Self::CaptureSubmit
+            | Self::Reconnect
+            | Self::Ptz
+            | Self::PtzPresets
+            | Self::Pause
+            | Self::Resume => CommandScope::Instance,
+            Self::Status | Self::CaptureStatus | Self::QueueStatus | Self::QueueClear => {
+                CommandScope::Both
+            }
+        }
     }
 }
 
@@ -2286,63 +2300,41 @@ pub fn camera_command_verbs() -> Vec<&'static str> {
     CommandVerb::ALL.iter().map(|verb| verb.as_str()).collect()
 }
 
-/// SOUTHBOUND §2.2 addressed-instance routing (D-U28): reconcile the delivery topic's
-/// `{instance}` token with the request body before dispatch.
+/// Seeds the library-resolved `addressed_instance` (SOUTHBOUND §2.2 / D-SC-4) into the request
+/// body's `instance` selector, so the adapter's existing configured-default and unknown-camera
+/// resolution (`resolve_actuation_instance` / `resolve_instance`, answering `NO_SUCH_INSTANCE`
+/// for an unknown name) routes the command.
 ///
-/// - **Topic instance is authoritative**: a `body.instance` that disagrees with the topic token
-///   is refused with `BAD_ARGS`.
-/// - **Topic-only**: the token is injected as the body's `instance` selector, so the existing
-///   registry routing resolves it (an unknown token then answers `NO_SUCH_INSTANCE`).
-/// - **Component scope** (`addressed` = `None`): the request passes through unchanged — the
-///   existing body routing applies, including the single-camera default.
-/// - A verb that is not [`CommandVerb::instance_routable`] refuses an instance-addressed
-///   delivery with `BAD_ARGS` instead of silently ignoring the token.
-fn scoped_request(
-    verb: CommandVerb,
+/// The library owns addressing ahead of dispatch: a `body.instance` conflicting with the topic
+/// token, and any instance addressing at a `Component`-scoped verb, are refused with `BAD_ARGS`
+/// before a handler runs — neither can reach this function. What remains adapter-side is exactly
+/// the split D-SC-4 assigns it: the optional-iff-one configured-camera default and the
+/// instance-existence check, both applied by the body routing this seeds.
+fn addressed_request(
     mut request: Message,
     addressed: Option<&str>,
 ) -> std::result::Result<Message, CommandError> {
-    let Some(topic) = addressed else {
+    let Some(instance) = addressed else {
         return Ok(request);
     };
-    if !verb.instance_routable() {
-        return Err(CommandError::new(
-            crate::ErrorCode::BadArgs.as_str(),
-            format!(
-                "{} is component-scoped; publish it to the component command topic, not a camera instance",
-                verb.as_str()
-            ),
-        ));
-    }
-    match request.body.get("instance").and_then(serde_json::Value::as_str) {
-        Some(in_body) if in_body != topic => Err(CommandError::new(
-            crate::ErrorCode::BadArgs.as_str(),
-            format!(
-                "body `instance` (`{in_body}`) conflicts with the topic-addressed instance (`{topic}`)"
-            ),
-        )),
-        Some(_) => Ok(request),
-        None => {
-            match &mut request.body {
-                serde_json::Value::Object(map) => {
-                    map.insert(
-                        "instance".to_string(),
-                        serde_json::Value::String(topic.to_string()),
-                    );
-                }
-                body @ serde_json::Value::Null => {
-                    *body = serde_json::json!({ "instance": topic });
-                }
-                _ => {
-                    return Err(CommandError::new(
-                        crate::ErrorCode::BadArgs.as_str(),
-                        "an instance-addressed command body must be a JSON object",
-                    ));
-                }
-            }
-            Ok(request)
+    match &mut request.body {
+        serde_json::Value::Object(map) => {
+            // An existing `body.instance` is identical to the addressed one — the library has
+            // already refused a conflict — so the insert only fills an absent selector.
+            map.entry("instance".to_string())
+                .or_insert_with(|| serde_json::Value::String(instance.to_string()));
+        }
+        body @ serde_json::Value::Null => {
+            *body = serde_json::json!({ "instance": instance });
+        }
+        _ => {
+            return Err(CommandError::new(
+                crate::ErrorCode::BadArgs.as_str(),
+                "an instance-addressed command body must be a JSON object",
+            ));
         }
     }
+    Ok(request)
 }
 
 /// Publishes `sb/discover`'s configuration-conditional availability into `describe`.
@@ -3042,12 +3034,12 @@ impl RuntimeCommandRouter {
 
     /// Registers every required adapter verb before the core subscribes to the command filters.
     ///
-    /// Every verb whose reply is always immediate is registered through the **scoped**
-    /// registration (SOUTHBOUND §2.2 / D-U28): the handler receives the delivery topic's
-    /// `{instance}` token and [`scoped_request`] reconciles it with the request body before
-    /// dispatch — the topic token is authoritative. The two deferred-capable verbs
-    /// ([`CommandVerb::defers`]) must stay on the outcome registration, which core 0.4.0 does
-    /// not expose the topic token to; they keep body-only routing (recorded under D-CAM-18).
+    /// Every verb declares its [`CommandScope`] at registration (SOUTHBOUND §2.2 / D-SC-2), and
+    /// every handler — immediate and deferred alike — receives the library-resolved addressed
+    /// instance (D-SC-1): the delivery topic's `{instance}` token is authoritative, a
+    /// conflicting `body.instance` and any instance addressing at a `Component` verb are refused
+    /// by the library before dispatch, and [`addressed_request`] seeds the resolved token into
+    /// the body so the adapter's configured-default/unknown-camera resolution routes it.
     ///
     /// A registration failure is fatal to component construction; a partial command surface is
     /// never exposed as active.
@@ -3058,32 +3050,23 @@ impl RuntimeCommandRouter {
             if verb.defers() {
                 inbox.register_outcome(
                     verb.as_str(),
-                    outcome_handler(move |request, deferred| {
-                        let router = Arc::clone(&router);
-                        async move { router.dispatch(verb.as_str(), request, deferred).await }
+                    verb.scope(),
+                    outcome_handler(move |request, deferred, addressed| {
+                        Arc::clone(&router).dispatch_outcome(verb, request, deferred, addressed)
                     }),
                 )?;
             } else {
                 let deferred_registry = deferred_registry.clone();
-                inbox.register_scoped(
+                inbox.register(
                     verb.as_str(),
-                    scoped_command_handler(move |request, addressed| {
-                        let router = Arc::clone(&router);
-                        let deferred_registry = deferred_registry.clone();
-                        async move {
-                            let request = scoped_request(verb, request, addressed.as_deref())?;
-                            match router
-                                .dispatch(verb.as_str(), request, deferred_registry)
-                                .await
-                            {
-                                CommandOutcome::ImmediateSuccess(value) => Ok(value),
-                                CommandOutcome::ImmediateError(error) => Err(error),
-                                _ => Err(CommandError::new(
-                                    crate::ErrorCode::BackendError.as_str(),
-                                    "verb settled through a deferred path it does not declare",
-                                )),
-                            }
-                        }
+                    verb.scope(),
+                    command_handler(move |request, addressed| {
+                        Arc::clone(&router).dispatch_immediate(
+                            verb,
+                            request,
+                            deferred_registry.clone(),
+                            addressed,
+                        )
                     }),
                 )?;
             }
@@ -3123,6 +3106,44 @@ impl RuntimeCommandRouter {
     /// Permanently stops new command delegation before runtime shutdown starts.
     pub fn begin_shutdown(&self) {
         self.stopping.store(true, Ordering::Release);
+    }
+
+    /// The registered pipeline for a deferred-capable verb: seed the library-resolved addressed
+    /// instance into the body selector ([`addressed_request`]), then delegate. Named rather than
+    /// inlined in the registration closure so the pipeline the inbox invokes is directly
+    /// testable.
+    async fn dispatch_outcome(
+        self: Arc<Self>,
+        verb: CommandVerb,
+        request: Message,
+        deferred: DeferredReplyRegistry,
+        addressed: Option<String>,
+    ) -> CommandOutcome {
+        match addressed_request(request, addressed.as_deref()) {
+            Ok(request) => self.dispatch(verb.as_str(), request, deferred).await,
+            Err(error) => CommandOutcome::ImmediateError(error),
+        }
+    }
+
+    /// The registered pipeline for an immediate verb: seed the addressing, delegate, and map the
+    /// runtime's [`CommandOutcome`] onto the immediate handler contract. A deferred settlement
+    /// out of a verb that does not declare one is a wiring fault, answered as `BACKEND_ERROR`.
+    async fn dispatch_immediate(
+        self: Arc<Self>,
+        verb: CommandVerb,
+        request: Message,
+        deferred: DeferredReplyRegistry,
+        addressed: Option<String>,
+    ) -> std::result::Result<Option<serde_json::Value>, CommandError> {
+        let request = addressed_request(request, addressed.as_deref())?;
+        match self.dispatch(verb.as_str(), request, deferred).await {
+            CommandOutcome::ImmediateSuccess(value) => Ok(value),
+            CommandOutcome::ImmediateError(error) => Err(error),
+            _ => Err(CommandError::new(
+                crate::ErrorCode::BackendError.as_str(),
+                "verb settled through a deferred path it does not declare",
+            )),
+        }
     }
 
     async fn dispatch(

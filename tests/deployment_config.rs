@@ -21,7 +21,8 @@ fn docker_simulator_config_is_a_valid_initial_configuration() {
 
 #[test]
 fn kubernetes_configmap_embeds_a_valid_initial_configuration() {
-    let document = include_str!("../k8s/configmap.yaml");
+    // Normalized so the contract check also runs on a CRLF checkout (Windows autocrlf).
+    let document = include_str!("../k8s/configmap.yaml").replace("\r\n", "\n");
     let marker = "  config.json: |-\n";
     let (_, body) = document
         .split_once(marker)
