@@ -1,14 +1,17 @@
 # Messaging interface
 
-Every command is a request/reply exchange on the component command inbox:
+Every command is a request/reply exchange on the command inbox, which serves both command scopes:
 
 ```text
-ecv1/{device}/camera-adapter/cmd/sb/{verb}
+ecv1/{device}/camera-adapter/cmd/sb/{verb}              (component scope)
+ecv1/{device}/camera-adapter/{instance}/cmd/sb/{verb}   (instance-addressed)
 ```
 
-Select a camera with the JSON body field `instance`; do not construct a per-instance command topic. The
-reply is correlated with the incoming envelope. Normal capture *completion* is a separate terminal
-application message, not the command reply — see [Terminal application messages](#terminal-application-messages).
+On the component-scope topic, select a camera with the JSON body field `instance`. On an
+instance-addressed topic the topic's `{instance}` token is authoritative: it routes the command, and a
+body `instance` that disagrees with it is refused with `BAD_ARGS`. The reply is correlated with the
+incoming envelope. Normal capture *completion* is a separate terminal application message, not the
+command reply — see [Terminal application messages](#terminal-application-messages).
 
 ## Conventions
 
@@ -16,10 +19,17 @@ These rules apply to every verb below.
 
 - **Closed request schema.** Bodies are parsed with `deny_unknown_fields`: any field not listed for a
   verb is rejected with `BAD_ARGS`. All field names are **camelCase** on the wire.
-- **Selecting a camera.** Actuation verbs take an optional `instance`. Omit it only when exactly one
-  camera is configured — the sole camera is then used. With more than one camera, omission is
-  `BAD_ARGS`; an unknown name is `NO_SUCH_INSTANCE`; a disabled camera is `CAMERA_DISABLED`. An
-  `instance` token is non-empty, ≤128 bytes, ASCII letters/digits/`.`/`_`/`-`.
+- **Selecting a camera.** Actuation verbs take an optional `instance`. On the component-scope topic,
+  omit it only when exactly one camera is configured — the sole camera is then used; with more than
+  one camera, omission is `BAD_ARGS`. An unknown name is `NO_SUCH_INSTANCE`; a disabled camera is
+  `CAMERA_DISABLED`. An `instance` token is non-empty, ≤128 bytes, ASCII
+  letters/digits/`.`/`_`/`-`.
+- **Instance-addressed topics.** A verb that takes an `instance` selector also accepts the
+  instance-addressed topic form: the topic token routes it (no body `instance` needed), and a
+  conflicting body `instance` is `BAD_ARGS`. The component-scoped verbs `sb/list`, `sb/discover`,
+  `sb/capture-group-submit`, and `sb/capture-cancel` refuse an instance-addressed delivery with
+  `BAD_ARGS`. The two deferred verbs, `sb/capture` and `sb/capture-group`, select their target(s)
+  from the body only — the topic token does not route them; send them to the component-scope topic.
 - **Idempotency.** Every *mutating* verb requires a caller-owned `requestId` (1–256 bytes, no control
   characters). A retry with the same `requestId` and the same arguments returns the original outcome; a
   reused `requestId` with **different** arguments is `IDEMPOTENCY_CONFLICT`; an operation whose outcome
@@ -322,7 +332,8 @@ snapshot.
 
 **What it does.** Runs one bounded, credential-free discovery pass across the compiled backends (or serves a
 continuation of a retained pass). Discovery must be enabled in config, or the verb replies
-`UNSUPPORTED_CAPABILITY`.
+`UNSUPPORTED_CAPABILITY` — and the built-in `describe` verb lists `sb/discover` as `disabled` with the
+reason, so a console can grey it out instead of discovering the refusal.
 
 **Input payload**
 

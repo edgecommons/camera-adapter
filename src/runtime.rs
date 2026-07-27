@@ -44,8 +44,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use edgecommons::commands::{
-    CommandError, CommandInbox, CommandOutcome, DeferredReplyRegistry, DeferredReplyToken,
-    outcome_handler,
+    AVAILABILITY_AVAILABLE, AVAILABILITY_DISABLED, CommandError, CommandInbox, CommandOutcome,
+    DeferredReplyRegistry, DeferredReplyToken, outcome_handler, scoped_command_handler,
 };
 use edgecommons::config::{
     Config, ConfigurationApplicationError, ConfigurationApplicationResult,
@@ -2247,12 +2247,128 @@ impl CommandVerb {
     pub fn parse(verb: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|known| known.as_str() == verb)
     }
+
+    /// True for the verbs whose reply may be deferred (`sb/capture`, `sb/capture-group`).
+    ///
+    /// These stay on the outcome registration: the core 0.4.0 scoped registration is
+    /// immediate-reply only, and giving up the deferred settlement (the dispatch permit is
+    /// released while a capture runs; `sb/capture-cancel` settles the pending reply) is not an
+    /// acceptable trade for topic-token visibility. See the D-CAM-18 register entry for the
+    /// recorded consequence.
+    #[must_use]
+    pub const fn defers(self) -> bool {
+        matches!(self, Self::Capture | Self::CaptureGroup)
+    }
+
+    /// True when the verb's closed request schema carries a camera `instance` selector, so an
+    /// instance-addressed delivery topic (D-U28) can route it.
+    ///
+    /// The rest are component-scoped by design — `sb/list` and `sb/discover` answer for the
+    /// fleet, the group verbs target `instances[]`, and `sb/capture-cancel` targets a durable
+    /// component-scoped capture/group id — so an instance-addressed delivery of one of them is
+    /// refused rather than silently accepted with the token ignored.
+    #[must_use]
+    pub const fn instance_routable(self) -> bool {
+        !matches!(
+            self,
+            Self::List
+                | Self::Discover
+                | Self::CaptureGroup
+                | Self::CaptureGroupSubmit
+                | Self::CaptureCancel
+        )
+    }
 }
 
 /// The verbs registered with the command inbox, derived from [`CommandVerb::ALL`].
 #[must_use]
 pub fn camera_command_verbs() -> Vec<&'static str> {
     CommandVerb::ALL.iter().map(|verb| verb.as_str()).collect()
+}
+
+/// SOUTHBOUND §2.2 addressed-instance routing (D-U28): reconcile the delivery topic's
+/// `{instance}` token with the request body before dispatch.
+///
+/// - **Topic instance is authoritative**: a `body.instance` that disagrees with the topic token
+///   is refused with `BAD_ARGS`.
+/// - **Topic-only**: the token is injected as the body's `instance` selector, so the existing
+///   registry routing resolves it (an unknown token then answers `NO_SUCH_INSTANCE`).
+/// - **Component scope** (`addressed` = `None`): the request passes through unchanged — the
+///   existing body routing applies, including the single-camera default.
+/// - A verb that is not [`CommandVerb::instance_routable`] refuses an instance-addressed
+///   delivery with `BAD_ARGS` instead of silently ignoring the token.
+fn scoped_request(
+    verb: CommandVerb,
+    mut request: Message,
+    addressed: Option<&str>,
+) -> std::result::Result<Message, CommandError> {
+    let Some(topic) = addressed else {
+        return Ok(request);
+    };
+    if !verb.instance_routable() {
+        return Err(CommandError::new(
+            crate::ErrorCode::BadArgs.as_str(),
+            format!(
+                "{} is component-scoped; publish it to the component command topic, not a camera instance",
+                verb.as_str()
+            ),
+        ));
+    }
+    match request.body.get("instance").and_then(serde_json::Value::as_str) {
+        Some(in_body) if in_body != topic => Err(CommandError::new(
+            crate::ErrorCode::BadArgs.as_str(),
+            format!(
+                "body `instance` (`{in_body}`) conflicts with the topic-addressed instance (`{topic}`)"
+            ),
+        )),
+        Some(_) => Ok(request),
+        None => {
+            match &mut request.body {
+                serde_json::Value::Object(map) => {
+                    map.insert(
+                        "instance".to_string(),
+                        serde_json::Value::String(topic.to_string()),
+                    );
+                }
+                body @ serde_json::Value::Null => {
+                    *body = serde_json::json!({ "instance": topic });
+                }
+                _ => {
+                    return Err(CommandError::new(
+                        crate::ErrorCode::BadArgs.as_str(),
+                        "an instance-addressed command body must be a JSON object",
+                    ));
+                }
+            }
+            Ok(request)
+        }
+    }
+}
+
+/// Publishes `sb/discover`'s configuration-conditional availability into `describe`.
+///
+/// `sb/discover` is the one verb a configuration can switch off outright
+/// (`component.global.discovery.enabled: false` answers `UNSUPPORTED_CAPABILITY`), so its
+/// describe entry is marked `disabled` with that reason — and reverts to `available` when a
+/// configuration (re)load enables discovery again. PTZ capability is deliberately NOT mirrored
+/// here: it is per-camera and discovered at runtime, and availability is component-scope.
+///
+/// Best-effort: a failure is logged, never fatal — availability is advisory metadata on
+/// `describe`, not a gate on the verb itself.
+pub fn apply_discover_availability(inbox: &CommandInbox, discovery_enabled: bool) {
+    let (state, reason) = if discovery_enabled {
+        (AVAILABILITY_AVAILABLE, None)
+    } else {
+        (
+            AVAILABILITY_DISABLED,
+            Some("camera discovery is disabled by configuration"),
+        )
+    };
+    if let Err(error) =
+        inbox.set_command_availability(CommandVerb::Discover.as_str(), state, reason)
+    {
+        tracing::warn!(error = %error, "sb/discover availability could not be published to describe");
+    }
 }
 
 /// The three edge-console panel descriptors for the camera adapter.
@@ -2733,6 +2849,9 @@ struct RuntimeReloadTransaction {
     apps: BTreeMap<String, Arc<AppFacade>>,
     events: BTreeMap<String, EventsFacade>,
     checkpoint: Option<RuntimeReloadCheckpoint>,
+    /// The command inbox, when available, so a committed reload republishes the
+    /// configuration-conditional `sb/discover` availability into `describe`.
+    commands: Option<Arc<CommandInbox>>,
 }
 
 impl RuntimeReloadTransaction {
@@ -2767,6 +2886,12 @@ impl PreparedConfigurationApply for RuntimeReloadTransaction {
                 // A successful adapter transition is now waiting only for Core's infallible
                 // ArcSwap store. Rollback is no longer permitted after this point.
                 self.checkpoint = None;
+                if let Some(inbox) = &self.commands {
+                    apply_discover_availability(
+                        inbox,
+                        self.replacement.global.discovery.enabled,
+                    );
+                }
                 Ok(())
             }
             Err(error) => {
@@ -2800,6 +2925,9 @@ pub struct RuntimeConfigListener {
     runtime: Weak<CameraRuntime>,
     app_factory: Arc<AppFacadeFactory>,
     events_factory: Arc<EventsFacadeFactory>,
+    /// The command inbox, when available, so a committed reload republishes the
+    /// configuration-conditional `sb/discover` availability ([`apply_discover_availability`]).
+    commands: Option<Arc<CommandInbox>>,
 }
 
 impl RuntimeConfigListener {
@@ -2810,11 +2938,13 @@ impl RuntimeConfigListener {
         runtime: Weak<CameraRuntime>,
         app_factory: Arc<AppFacadeFactory>,
         events_factory: Arc<EventsFacadeFactory>,
+        commands: Option<Arc<CommandInbox>>,
     ) -> Self {
         Self {
             runtime,
             app_factory,
             events_factory,
+            commands,
         }
     }
 }
@@ -2885,6 +3015,7 @@ impl ConfigurationApplyListener for RuntimeConfigListener {
             apps,
             events,
             checkpoint: Some(checkpoint),
+            commands: self.commands.clone(),
         }))
     }
 }
@@ -2909,20 +3040,53 @@ impl RuntimeCommandRouter {
         })
     }
 
-    /// Registers every required adapter verb before the core subscribes to the command filter.
+    /// Registers every required adapter verb before the core subscribes to the command filters.
+    ///
+    /// Every verb whose reply is always immediate is registered through the **scoped**
+    /// registration (SOUTHBOUND §2.2 / D-U28): the handler receives the delivery topic's
+    /// `{instance}` token and [`scoped_request`] reconciles it with the request body before
+    /// dispatch — the topic token is authoritative. The two deferred-capable verbs
+    /// ([`CommandVerb::defers`]) must stay on the outcome registration, which core 0.4.0 does
+    /// not expose the topic token to; they keep body-only routing (recorded under D-CAM-18).
     ///
     /// A registration failure is fatal to component construction; a partial command surface is
     /// never exposed as active.
     pub fn register(self: &Arc<Self>, inbox: &CommandInbox) -> edgecommons::Result<()> {
-        for verb in camera_command_verbs() {
+        let deferred_registry = inbox.deferred_replies();
+        for verb in CommandVerb::ALL {
             let router = Arc::clone(self);
-            inbox.register_outcome(
-                verb,
-                outcome_handler(move |request, deferred| {
-                    let router = Arc::clone(&router);
-                    async move { router.dispatch(verb, request, deferred).await }
-                }),
-            )?;
+            if verb.defers() {
+                inbox.register_outcome(
+                    verb.as_str(),
+                    outcome_handler(move |request, deferred| {
+                        let router = Arc::clone(&router);
+                        async move { router.dispatch(verb.as_str(), request, deferred).await }
+                    }),
+                )?;
+            } else {
+                let deferred_registry = deferred_registry.clone();
+                inbox.register_scoped(
+                    verb.as_str(),
+                    scoped_command_handler(move |request, addressed| {
+                        let router = Arc::clone(&router);
+                        let deferred_registry = deferred_registry.clone();
+                        async move {
+                            let request = scoped_request(verb, request, addressed.as_deref())?;
+                            match router
+                                .dispatch(verb.as_str(), request, deferred_registry)
+                                .await
+                            {
+                                CommandOutcome::ImmediateSuccess(value) => Ok(value),
+                                CommandOutcome::ImmediateError(error) => Err(error),
+                                _ => Err(CommandError::new(
+                                    crate::ErrorCode::BackendError.as_str(),
+                                    "verb settled through a deferred path it does not declare",
+                                )),
+                            }
+                        }
+                    }),
+                )?;
+            }
         }
         // The edge-console panel trio (overview / signals / diagnostics). Registered on the same inbox
         // as the verbs, before the acknowledged subscription begins, so the descriptor surface is
