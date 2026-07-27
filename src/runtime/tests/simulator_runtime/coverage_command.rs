@@ -4754,7 +4754,7 @@ async fn a_thumbnail_that_fails_or_is_dropped_is_counted_on_the_capture_metric()
 /// The lifecycle verbs suspend a camera's new capture work and surface the state in `sb/status`.
 ///
 /// `sb/pause` / `sb/resume` are the standardized lifecycle verbs (SOUTHBOUND.md §2.2). Pausing a
-/// camera refuses NEW capture work with a stable `INSTANCE_PAUSED` code while leaving its sibling
+/// camera refuses NEW capture work with the standardized `PAUSED` code while leaving its sibling
 /// untouched; the toggle is idempotent (`changed` reports whether it moved); and the paused flag is
 /// visible where an operator and the overview panel read status. Resuming clears it.
 #[tokio::test]
@@ -4893,4 +4893,45 @@ fn the_panel_trio_is_registered_with_the_right_ids_orders_and_scope() {
         json!(["sb/status", "sb/reconnect", "sb/pause", "sb/resume"])
     );
     assert_eq!(panels[2]["verbs"], json!(["sb/discover", "sb/queue-status"]));
+
+    // The renderable-descriptor floor: every panel carries a widget the shipped console renders
+    // today -- `summary`/`keyValueList` with `rows`, `commandSummary` with `verbs` -- and no widget
+    // advertises a `writeVerb` (the guarded-write console flow does not exist, and this adapter
+    // serves no southbound signal-write surface). The signal-adapter kinds (`signalGrid`,
+    // `treeBrowser`) are deliberately absent: no signal inventory, no hierarchical browse.
+    for panel in &panels {
+        let widgets = panel["widgets"].as_array().expect("widgets");
+        assert!(
+            widgets.iter().any(|widget| {
+                let rows = widget["rows"].as_array().is_some_and(|rows| !rows.is_empty());
+                let verbs = widget["kind"] == json!("commandSummary")
+                    && widget["verbs"].as_array().is_some_and(|verbs| !verbs.is_empty());
+                rows || verbs
+            }),
+            "panel {} carries a console-renderable widget",
+            panel["id"]
+        );
+        for widget in widgets {
+            assert!(widget.get("writeVerb").is_none(), "no widget advertises writeVerb");
+            assert!(widget.get("id").is_some() && widget.get("title").is_some());
+            assert!(widget.get("kind") != Some(&json!("signalGrid")));
+            assert!(widget.get("kind") != Some(&json!("treeBrowser")));
+        }
+    }
+    // Every commandSummary lists verbs (not the retired `actions` key), and each listed verb is one
+    // the adapter registers.
+    let registered = crate::runtime::camera_command_verbs();
+    for panel in &panels {
+        for widget in panel["widgets"].as_array().unwrap() {
+            assert!(widget.get("actions").is_none(), "the `actions` key is retired");
+            if let Some(verbs) = widget["verbs"].as_array() {
+                for verb in verbs {
+                    assert!(
+                        registered.contains(&verb.as_str().unwrap()),
+                        "panel widget binds only served verbs"
+                    );
+                }
+            }
+        }
+    }
 }

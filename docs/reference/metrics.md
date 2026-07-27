@@ -14,9 +14,11 @@ a camera connects or disconnects.
 | Measure | Unit | Meaning |
 |---|---|---|
 | `connectionState` | Count | 1 while the camera's session is live, 0 otherwise. |
+| `signalsSubscribed` | Count | The signal inventory the session serves. A camera serves no `SouthboundSignalUpdate` signals — its data points are images announced on `app/image/*` — so the gauge reads 0. |
 | `publishLatencyMs` | Milliseconds | How long the camera's last terminal message took to reach the transport. Absent until one has. |
 | `pollLatencyMs` | Milliseconds | The last acquisition round-trip. Absent until the camera has produced a frame. |
 | `readErrors` | Count | Acquisition failures in the interval. A failure to encode or to write to disk is not counted: it is not the camera's fault. |
+| `writeErrors` | Count | Device-path failures of southbound signal writes. The adapter serves no signal-write surface (PTZ failures are counted in `CameraPtz`), so the counter reads 0. |
 | `staleSignals` | Count | 1 when the camera has produced nothing within `healthThresholds.staleSignalSecs`, 0 otherwise. A camera can be connected and stale. |
 | `reconnects` | Count | Sessions re-established in the interval. A camera's first connection is not a reconnect. |
 
