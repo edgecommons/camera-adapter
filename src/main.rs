@@ -66,6 +66,14 @@ async fn main() -> anyhow::Result<()> {
         cameras = loaded.config.instances.len(),
         "camera-adapter configuration accepted"
     );
+    // Publish `sb/discover`'s configuration-conditional availability into `describe` (a reload
+    // republishes it through the configuration listener below).
+    if let Some(inbox) = gg.commands() {
+        camera_adapter::runtime::apply_discover_availability(
+            &inbox,
+            loaded.config.global.discovery.enabled,
+        );
+    }
     let credential_service = gg.credentials();
     credential_service_available.store(credential_service.is_some(), Ordering::Release);
     let backend_context =
@@ -149,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::downgrade(&runtime),
         app_factory,
         events_factory,
+        gg.commands(),
     ));
     gg.add_config_apply_listener(runtime_config_listener)?;
     readiness.complete_startup();

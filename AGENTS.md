@@ -17,7 +17,7 @@ the bus carries control and terminal metadata (`app/image/*` announcements, `evt
 It serves the canonical `southbound_health` metric plus operational families (`camera_captures`,
 `camera_queue`, `CameraCommand`), the standardized lifecycle verbs `sb/pause` / `sb/resume` /
 `sb/reconnect`, and 16 domain `sb/*` verbs (`sb/capture` and friends, `sb/ptz*`, queue verbs) on the
-D-U28 component command inbox — SOUTHBOUND.md §2.2 sanctions `sb/capture`-style domain verbs. Runs on
+D-U28 two-scope command inbox — SOUTHBOUND.md §2.2 sanctions `sb/capture`-style domain verbs. Runs on
 `GREENGRASS` / `HOST` / `KUBERNETES` via `edgecommons`, with no platform branching in this component.
 
 ## The seam
@@ -56,7 +56,8 @@ the standard `edgecommons` envelope, owned by the canonical schema and not redec
 
 - Southbound routing/availability error codes are the standardized `BAD_ARGS` / `NO_SUCH_INSTANCE` /
   `DEVICE_UNAVAILABLE` (SOUTHBOUND.md §2.2); domain codes (`CAPTURE_*`, `PTZ_*`, …) are camera-specific.
-- Instance routing is D-EIP-13/D-U28: body `instance`, optional iff exactly one camera is configured.
+- Instance routing is D-EIP-13/D-U28: body `instance`, optional iff exactly one camera is configured;
+  an instance-addressed command topic routes by its token, which is authoritative (SOUTHBOUND.md §2.2).
 - Builders/facades are the construction path (`app()`, `events()`, `commands()`, `MetricBuilder`) —
   never hand-built topics or envelopes.
 - Runtime artifacts (durable state DBs, captured images, TLS fixtures, logs, build output) stay out of

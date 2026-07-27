@@ -596,6 +596,7 @@ async fn runtime_config_listener_rejects_when_its_runtime_is_gone_before_factory
         Arc::new(|_instance, _config| -> edgecommons::Result<EventsFacade> {
             unreachable!("unavailable runtimes must not construct event facades")
         }),
+        None,
     );
     let candidate = Arc::new(
         Config::from_value(COMPONENT_NAME, "gw-01", reload_config("C:/captures-a"))
@@ -606,6 +607,104 @@ async fn runtime_config_listener_rejects_when_its_runtime_is_gone_before_factory
         Err(error) => error,
     };
     assert_eq!(error.code, "CONFIG_APPLICATION_UNAVAILABLE");
+}
+
+// --- SOUTHBOUND §2.2 addressed-instance routing (D-U28) --------------------------------------
+
+fn scoped_fixture_message(body: serde_json::Value) -> Message {
+    edgecommons::messaging::MessageBuilder::new("sb/status", "1.0")
+        .structured_payload(body)
+        .build()
+}
+
+/// Topic-only (§2.2): the delivery topic's instance token becomes the routing selector the
+/// registry resolves — no `body.instance` needed.
+#[test]
+fn topic_addressed_instance_is_injected_as_the_routing_selector() {
+    let request = scoped_request(
+        CommandVerb::Status,
+        scoped_fixture_message(json!({})),
+        Some("camera-b"),
+    )
+    .expect("a topic-only instance routes the command");
+    assert_eq!(request.body, json!({ "instance": "camera-b" }));
+
+    // An agreeing `body.instance` passes through untouched.
+    let request = scoped_request(
+        CommandVerb::Status,
+        scoped_fixture_message(json!({ "instance": "camera-b" })),
+        Some("camera-b"),
+    )
+    .expect("an agreeing body instance is accepted");
+    assert_eq!(request.body, json!({ "instance": "camera-b" }));
+
+    // A non-object body cannot carry the routing selector.
+    let error = scoped_request(
+        CommandVerb::Status,
+        scoped_fixture_message(json!("junk")),
+        Some("camera-b"),
+    )
+    .expect_err("a non-object body cannot be instance-addressed");
+    assert_eq!(error.code, crate::ErrorCode::BadArgs.as_str());
+}
+
+/// The topic token is authoritative (§2.2): a disagreeing `body.instance` is refused.
+#[test]
+fn conflicting_body_and_topic_instance_is_refused_bad_args() {
+    let error = scoped_request(
+        CommandVerb::Status,
+        scoped_fixture_message(json!({ "instance": "camera-a" })),
+        Some("camera-b"),
+    )
+    .expect_err("a conflicting body instance must be refused");
+    assert_eq!(error.code, crate::ErrorCode::BadArgs.as_str());
+    assert!(error.message.contains("camera-a") && error.message.contains("camera-b"));
+}
+
+/// Component scope (§2.2): no topic token means the body passes through unchanged and the
+/// existing `body.instance` routing (including the single-camera default) applies.
+#[test]
+fn component_scope_keeps_body_instance_routing() {
+    let request = scoped_request(
+        CommandVerb::Status,
+        scoped_fixture_message(json!({ "instance": "camera-a" })),
+        None,
+    )
+    .expect("component-scoped requests pass through");
+    assert_eq!(request.body, json!({ "instance": "camera-a" }));
+
+    let request = scoped_request(CommandVerb::Status, scoped_fixture_message(json!({})), None)
+        .expect("an empty component-scoped body passes through");
+    assert_eq!(request.body, json!({}));
+}
+
+/// The verbs whose schemas cannot name a camera refuse instance addressing instead of silently
+/// ignoring the token; the deferred set is exactly the two capture verbs.
+#[test]
+fn verb_scoping_classification_matches_the_request_schemas() {
+    for verb in CommandVerb::ALL {
+        assert_eq!(
+            verb.defers(),
+            matches!(verb, CommandVerb::Capture | CommandVerb::CaptureGroup),
+            "{} deferral classification",
+            verb.as_str()
+        );
+    }
+    for verb in [
+        CommandVerb::List,
+        CommandVerb::Discover,
+        CommandVerb::CaptureGroupSubmit,
+        CommandVerb::CaptureCancel,
+    ] {
+        assert!(!verb.instance_routable());
+        let error = scoped_request(verb, scoped_fixture_message(json!({})), Some("camera-a"))
+            .expect_err("a component-scoped verb refuses instance addressing");
+        assert_eq!(error.code, crate::ErrorCode::BadArgs.as_str());
+    }
+    // Component-scoped deliveries of those verbs are untouched.
+    let request = scoped_request(CommandVerb::List, scoped_fixture_message(json!({})), None)
+        .expect("component-scoped fleet verbs pass through");
+    assert_eq!(request.body, json!({}));
 }
 
 #[cfg(test)]

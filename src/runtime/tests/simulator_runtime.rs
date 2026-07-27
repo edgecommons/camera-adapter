@@ -794,6 +794,61 @@ fn immediate_success(outcome: CommandOutcome) -> serde_json::Value {
     }
 }
 
+/// SOUTHBOUND §2.2 through the production dispatch stack: an instance-ADDRESSED command (the
+/// delivery topic's `{instance}` token, D-U28) routes to the addressed camera with no
+/// `body.instance`, and an unknown token answers the standardized `NO_SUCH_INSTANCE` — proving
+/// the scoped reconciliation composes with the registry routing the runtime already serves.
+#[tokio::test]
+async fn an_instance_addressed_command_routes_by_the_topic_token() {
+    let (port, _broker) = spawn_recording_mqtt_broker().await;
+    let directory = TempDir::new().unwrap();
+    let configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+    let runtime = runtime(configuration, &directory).await;
+    for instance in ["camera-a", "camera-b"] {
+        runtime
+            .start_supervisor(instance.to_string(), runtime.engine(instance).unwrap())
+            .unwrap();
+        wait_for_online(&runtime, instance).await;
+    }
+    let (_app, deferred) = command_deferred_registry(&directory, port).await;
+
+    // Topic-only: the token routes the command even with two cameras configured.
+    let request = scoped_request(
+        CommandVerb::Status,
+        command_message("sb/status", "addressed-status", json!({})),
+        Some("camera-b"),
+    )
+    .expect("a topic-only instance routes the command");
+    let status = immediate_success(
+        runtime
+            .handle_camera_command("sb/status", request, deferred.clone())
+            .await,
+    );
+    assert_eq!(
+        status.get("instance"),
+        Some(&json!("camera-b")),
+        "the addressed camera answers its own status"
+    );
+
+    // An unknown topic token still routes by the token and is refused by the registry.
+    let request = scoped_request(
+        CommandVerb::Status,
+        command_message("sb/status", "addressed-ghost", json!({})),
+        Some("camera-ghost"),
+    )
+    .expect("an unknown token is a routing question, not a schema error");
+    let outcome = runtime
+        .handle_camera_command("sb/status", request, deferred.clone())
+        .await;
+    match outcome {
+        CommandOutcome::ImmediateError(error) => {
+            assert_eq!(error.code, crate::ErrorCode::NoSuchInstance.as_str());
+        }
+        other => panic!("an unknown addressed camera must answer NO_SUCH_INSTANCE, got {other:?}"),
+    }
+    runtime.shutdown().await;
+}
+
 fn queued_job(config: &AdapterConfig, capture_id: &str) -> crate::catalog::NewJob {
     let camera = config
         .instances
@@ -3435,6 +3490,7 @@ async fn runtime_config_listener_rejects_invalid_candidates_and_factory_failures
                 ))
             })
         },
+        None,
     );
 
     let mut invalid_raw = core_config_value(directory.path(), &["camera-a"], false);
@@ -3527,6 +3583,7 @@ async fn runtime_config_listener_does_not_mutate_when_event_facade_preparation_f
                 ))
             })
         },
+        None,
     );
 
     let error = match listener
@@ -3974,6 +4031,7 @@ async fn rejected_reload_preflight_keeps_the_prior_supervisor_serving_captures()
         Arc::new(|_instance, _config| -> edgecommons::Result<EventsFacade> {
             unreachable!("the application facade rejection occurs first")
         }),
+        None,
     );
     let candidate = Arc::new(core_config(directory.path(), &["camera-a"], false));
     assert!(
@@ -4067,6 +4125,7 @@ async fn failed_reload_transition_restores_prior_config_and_capture_service() {
         apps: BTreeMap::new(),
         events: BTreeMap::new(),
         checkpoint: Some(checkpoint),
+        commands: None,
     };
 
     assert!(
@@ -4172,6 +4231,7 @@ async fn runtime_config_listener_refreshes_retained_facades_and_applies_roster_a
                     .events())
             })
         },
+        None,
     );
 
     let roster_candidate = Arc::new(core_config(
@@ -4864,6 +4924,19 @@ async fn runtime_startup_router_and_deferred_capture_flows_use_real_core_facades
             "router registration omitted required camera verb {verb}"
         );
     }
+    // `sb/discover` is registered through the scoped path, so its configuration-conditional
+    // describe availability can be published (disabled) and cleared (available) — the direct
+    // call proves the registered-verb precondition `apply_discover_availability` relies on.
+    inbox
+        .set_command_availability(
+            CommandVerb::Discover.as_str(),
+            AVAILABILITY_DISABLED,
+            Some("probe"),
+        )
+        .expect("sb/discover is a registered verb - availability applies to it");
+    apply_discover_availability(&inbox, true);
+    apply_discover_availability(&inbox, false);
+    apply_discover_availability(&inbox, true);
     let deferred = inbox.deferred_replies();
 
     match router
