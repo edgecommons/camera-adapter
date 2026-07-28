@@ -795,9 +795,10 @@ fn immediate_success(outcome: CommandOutcome) -> serde_json::Value {
 }
 
 /// SOUTHBOUND §2.2 through the production dispatch stack: an instance-ADDRESSED command (the
-/// delivery topic's `{instance}` token, D-U28) routes to the addressed camera with no
-/// `body.instance`, and an unknown token answers the standardized `NO_SUCH_INSTANCE` — proving
-/// the scoped reconciliation composes with the registry routing the runtime already serves.
+/// delivery topic's `{instance}` token, D-U28, resolved by the library and seeded via
+/// `addressed_request`) routes to the addressed camera with no `body.instance`, and an unknown
+/// token answers the standardized `NO_SUCH_INSTANCE` — proving the library-resolved addressing
+/// composes with the registry routing the runtime already serves.
 #[tokio::test]
 async fn an_instance_addressed_command_routes_by_the_topic_token() {
     let (port, _broker) = spawn_recording_mqtt_broker().await;
@@ -812,13 +813,12 @@ async fn an_instance_addressed_command_routes_by_the_topic_token() {
     }
     let (_app, deferred) = command_deferred_registry(&directory, port).await;
 
-    // Topic-only: the token routes the command even with two cameras configured.
-    let request = scoped_request(
-        CommandVerb::Status,
+    // Addressed: the token routes the command even with two cameras configured.
+    let request = addressed_request(
         command_message("sb/status", "addressed-status", json!({})),
         Some("camera-b"),
     )
-    .expect("a topic-only instance routes the command");
+    .expect("an addressed instance routes the command");
     let status = immediate_success(
         runtime
             .handle_camera_command("sb/status", request, deferred.clone())
@@ -830,9 +830,8 @@ async fn an_instance_addressed_command_routes_by_the_topic_token() {
         "the addressed camera answers its own status"
     );
 
-    // An unknown topic token still routes by the token and is refused by the registry.
-    let request = scoped_request(
-        CommandVerb::Status,
+    // An unknown addressed token still routes by the token and is refused by the registry.
+    let request = addressed_request(
         command_message("sb/status", "addressed-ghost", json!({})),
         Some("camera-ghost"),
     )
@@ -847,6 +846,190 @@ async fn an_instance_addressed_command_routes_by_the_topic_token() {
         other => panic!("an unknown addressed camera must answer NO_SUCH_INSTANCE, got {other:?}"),
     }
     runtime.shutdown().await;
+}
+
+/// D-CAM-29 closed: the deferred `sb/capture` is scoped too. The addressed camera routes the
+/// capture with no `body.instance` — through the production deferred dispatch, keeping the
+/// deferred settlement — and the durable job lands on the ADDRESSED camera.
+#[tokio::test]
+async fn an_instance_addressed_deferred_capture_routes_by_the_topic_token() {
+    let (port, _broker) = spawn_recording_mqtt_broker().await;
+    let directory = TempDir::new().unwrap();
+    let configuration = config(directory.path(), &["camera-a", "camera-b"], false);
+    let runtime = runtime(configuration, &directory).await;
+    for instance in ["camera-a", "camera-b"] {
+        runtime
+            .start_supervisor(instance.to_string(), runtime.engine(instance).unwrap())
+            .unwrap();
+        wait_for_online(&runtime, instance).await;
+    }
+    let (_app, deferred) = command_deferred_registry(&directory, port).await;
+
+    // The body names no camera; only the library-resolved topic token selects camera-b. With two
+    // cameras configured, body-only routing would have refused this as ambiguous.
+    let request = addressed_request(
+        command_message(
+            "sb/capture",
+            "addressed-capture",
+            json!({ "requestId": "addressed-capture-1" }),
+        ),
+        Some("camera-b"),
+    )
+    .expect("an addressed instance routes the deferred capture");
+    let outcome = runtime
+        .handle_camera_command("sb/capture", request, deferred.clone())
+        .await;
+    let CommandOutcome::DeferredWithContinuation { continuation, .. } = outcome else {
+        panic!("an addressed capture must keep the deferred settlement path");
+    };
+    continuation
+        .await
+        .expect("the addressed capture must be durably accepted");
+
+    let job = runtime
+        .catalog
+        .job_by_ledger(
+            crate::catalog::LedgerKey::new("camera-b", "sb/capture", "addressed-capture-1")
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("the capture must be ledgered under the addressed camera");
+    assert_eq!(
+        job.instance, "camera-b",
+        "the topic token, not a body default, selected the camera"
+    );
+    runtime.shutdown().await;
+}
+
+/// The registered per-verb pipelines — the exact functions the inbox invokes for every delivery —
+/// seed the library-resolved addressing before dispatch and map the runtime's outcome onto each
+/// registration contract: immediate success/error onto the immediate handler result, an
+/// addressing seed fault onto an immediate refusal on both forms, and a deferred settlement out
+/// of an immediate verb onto the `BACKEND_ERROR` wiring fault.
+#[tokio::test]
+async fn the_registered_dispatch_pipelines_seed_addressing_and_map_outcomes() {
+    let (port, _broker) = spawn_recording_mqtt_broker().await;
+    let directory = TempDir::new().unwrap();
+    let (_app, deferred) = command_deferred_registry(&directory, port).await;
+
+    // An uninstalled router answers the stable startup-unavailable error through the immediate
+    // mapping.
+    let router = RuntimeCommandRouter::new();
+    let error = Arc::clone(&router)
+        .dispatch_immediate(
+            CommandVerb::List,
+            command_message("sb/list", "pipeline-uninstalled", json!({})),
+            deferred.clone(),
+            None,
+        )
+        .await
+        .expect_err("an uninstalled router must answer an immediate error");
+    assert_eq!(error.code, crate::ErrorCode::DeviceUnavailable.as_str());
+
+    // An addressing seed fault (a non-object body under an addressed delivery) is refused before
+    // dispatch, on the immediate and the outcome pipeline alike.
+    let error = Arc::clone(&router)
+        .dispatch_immediate(
+            CommandVerb::Status,
+            command_message("sb/status", "pipeline-junk", json!("junk")),
+            deferred.clone(),
+            Some("camera-a".to_string()),
+        )
+        .await
+        .expect_err("a non-object body cannot be instance-addressed");
+    assert_eq!(error.code, crate::ErrorCode::BadArgs.as_str());
+    match Arc::clone(&router)
+        .dispatch_outcome(
+            CommandVerb::Capture,
+            command_message("sb/capture", "pipeline-junk-deferred", json!("junk")),
+            deferred.clone(),
+            Some("camera-a".to_string()),
+        )
+        .await
+    {
+        CommandOutcome::ImmediateError(error) => {
+            assert_eq!(error.code, crate::ErrorCode::BadArgs.as_str());
+        }
+        other => panic!("a non-object deferred body must be refused, got {other:?}"),
+    }
+
+    // A service that echoes what it was dispatched proves the pipelines seed the addressed
+    // instance into the body selector before delegating.
+    struct EchoService;
+    #[async_trait]
+    impl CameraCommandService for EchoService {
+        async fn handle_camera_command(
+            &self,
+            verb: &'static str,
+            request: Message,
+            _deferred: DeferredReplyRegistry,
+        ) -> CommandOutcome {
+            CommandOutcome::ImmediateSuccess(Some(json!({ "verb": verb, "body": request.body })))
+        }
+    }
+    router.install(Arc::new(EchoService)).unwrap();
+    let value = Arc::clone(&router)
+        .dispatch_immediate(
+            CommandVerb::Status,
+            command_message("sb/status", "pipeline-seeded", json!({})),
+            deferred.clone(),
+            Some("camera-b".to_string()),
+        )
+        .await
+        .expect("the immediate pipeline maps success through")
+        .expect("the echo service always answers a value");
+    assert_eq!(value["verb"], json!("sb/status"));
+    assert_eq!(value["body"], json!({ "instance": "camera-b" }));
+    match Arc::clone(&router)
+        .dispatch_outcome(
+            CommandVerb::Capture,
+            command_message(
+                "sb/capture",
+                "pipeline-seeded-deferred",
+                json!({ "requestId": "pipeline-1" }),
+            ),
+            deferred.clone(),
+            Some("camera-b".to_string()),
+        )
+        .await
+    {
+        CommandOutcome::ImmediateSuccess(Some(value)) => {
+            assert_eq!(value["body"]["instance"], json!("camera-b"));
+            assert_eq!(value["body"]["requestId"], json!("pipeline-1"));
+        }
+        other => panic!("the outcome pipeline must hand the seeded request through, got {other:?}"),
+    }
+
+    // A verb registered immediate must never settle through a deferred path; the mapping answers
+    // the wiring fault as BACKEND_ERROR instead of leaving an open token behind.
+    struct DeferringService;
+    #[async_trait]
+    impl CameraCommandService for DeferringService {
+        async fn handle_camera_command(
+            &self,
+            _verb: &'static str,
+            request: Message,
+            deferred: DeferredReplyRegistry,
+        ) -> CommandOutcome {
+            match deferred.defer(&request, Duration::from_secs(5)) {
+                Ok(token) => CommandOutcome::Deferred(token),
+                Err(error) => CommandOutcome::ImmediateError(error),
+            }
+        }
+    }
+    let wired = RuntimeCommandRouter::new();
+    wired.install(Arc::new(DeferringService)).unwrap();
+    let error = Arc::clone(&wired)
+        .dispatch_immediate(
+            CommandVerb::List,
+            command_message("sb/list", "pipeline-deferred-fault", json!({})),
+            deferred.clone(),
+            None,
+        )
+        .await
+        .expect_err("a deferred settlement out of an immediate verb is a wiring fault");
+    assert_eq!(error.code, crate::ErrorCode::BackendError.as_str());
 }
 
 fn queued_job(config: &AdapterConfig, capture_id: &str) -> crate::catalog::NewJob {
@@ -7357,6 +7540,70 @@ async fn every_camera_reports_its_reachability_to_the_heartbeat() {
             .find(|camera| camera.instance == "camera-b")
             .is_some_and(|camera| !camera.connected),
         "and the camera that never started must still be reported as down"
+    );
+
+    runtime.shutdown().await;
+}
+
+/// D-SC-7: a deliberately paused camera is distinguishable on the passive surface. The keepalive
+/// `state` comes from the same instance state model that answers `sb/status` — the registry's
+/// lifecycle plus the operator pause flag — so a paused camera reports `PAUSED` (the shared
+/// `CONNECTING`/`ONLINE`/`BACKOFF`/`PAUSED` vocabulary) while `connected` keeps reporting
+/// reachability, because pause suspends capture workload, not the session. The exact wire
+/// element is pinned through the public `InstanceConnectivity::to_json`.
+#[tokio::test]
+async fn a_paused_camera_reports_paused_in_the_keepalive_instance_state() {
+    let directory = TempDir::new().unwrap();
+    let runtime = runtime(
+        config(directory.path(), &["camera-a", "camera-b"], false),
+        &directory,
+    )
+    .await;
+    runtime
+        .start_supervisor("camera-a".to_string(), runtime.engine("camera-a").unwrap())
+        .unwrap();
+    wait_for_online(&runtime, "camera-a").await;
+
+    assert!(runtime.set_paused("camera-a", true));
+    let samples = runtime.camera_connectivity();
+    let paused = samples
+        .iter()
+        .find(|camera| camera.instance == "camera-a")
+        .expect("the paused camera must still be reported");
+    assert!(
+        paused.connected,
+        "pause suspends capture workload, not the session — reachability is unchanged"
+    );
+    assert_eq!(
+        paused.state.as_deref(),
+        Some("PAUSED"),
+        "the keepalive state must say the quiet is deliberate"
+    );
+
+    // The exact published element (the shape a console consumes), byte-pinned via the public
+    // to_json: a healthy-but-paused camera carries no detail and no lastErrorCode.
+    let generation = runtime.registry.snapshot("camera-a").unwrap().generation;
+    assert_eq!(
+        paused.to_json(),
+        json!({
+            "instance": "camera-a",
+            "connected": true,
+            "state": "PAUSED",
+            "attributes": { "backend": "sim", "generation": generation },
+        }),
+        "the wire element must carry PAUSED exactly where the state token rides"
+    );
+
+    // Resume restores the single state model's lifecycle token on the same surface.
+    assert!(runtime.set_paused("camera-a", false));
+    let resumed = runtime.camera_connectivity();
+    assert_eq!(
+        resumed
+            .iter()
+            .find(|camera| camera.instance == "camera-a")
+            .and_then(|camera| camera.state.as_deref()),
+        Some("ONLINE"),
+        "resume must hand the keepalive back to the connection lifecycle"
     );
 
     runtime.shutdown().await;

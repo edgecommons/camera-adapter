@@ -9,9 +9,11 @@ ecv1/{device}/camera-adapter/{instance}/cmd/sb/{verb}   (instance-addressed)
 
 On the component-scope topic, select a camera with the JSON body field `instance`. On an
 instance-addressed topic the topic's `{instance}` token is authoritative: it routes the command, and a
-body `instance` that disagrees with it is refused with `BAD_ARGS`. The reply is correlated with the
-incoming envelope. Normal capture *completion* is a separate terminal application message, not the
-command reply — see [Terminal application messages](#terminal-application-messages).
+body `instance` that disagrees with it is refused with `BAD_ARGS`. Every verb declares a **scope** —
+`component`, `instance`, or `both` — advertised in the built-in `describe` verb's per-command `scope`
+field and enforced before the verb's handler runs. The reply is correlated with the incoming
+envelope. Normal capture *completion* is a separate terminal application message, not the command
+reply — see [Terminal application messages](#terminal-application-messages).
 
 ## Conventions
 
@@ -24,12 +26,19 @@ These rules apply to every verb below.
   one camera, omission is `BAD_ARGS`. An unknown name is `NO_SUCH_INSTANCE`; a disabled camera is
   `CAMERA_DISABLED`. An `instance` token is non-empty, ≤128 bytes, ASCII
   letters/digits/`.`/`_`/`-`.
-- **Instance-addressed topics.** A verb that takes an `instance` selector also accepts the
-  instance-addressed topic form: the topic token routes it (no body `instance` needed), and a
-  conflicting body `instance` is `BAD_ARGS`. The component-scoped verbs `sb/list`, `sb/discover`,
-  `sb/capture-group-submit`, and `sb/capture-cancel` refuse an instance-addressed delivery with
-  `BAD_ARGS`. The two deferred verbs, `sb/capture` and `sb/capture-group`, select their target(s)
-  from the body only — the topic token does not route them; send them to the component-scope topic.
+- **Command scope.** Each verb's declared scope decides which addressing it accepts:
+
+  | Scope | Verbs | Addressing |
+  |---|---|---|
+  | `component` | `sb/list`, `sb/discover`, `sb/capture-group`, `sb/capture-group-submit`, `sb/capture-cancel` | Component-scope topic only. Any instance addressing — a topic `{instance}` token or a body `instance` — is refused with `BAD_ARGS`. |
+  | `instance` | `sb/capture`, `sb/capture-submit`, `sb/reconnect`, `sb/ptz`, `sb/ptz-presets`, `sb/pause`, `sb/resume` | Targets one camera: the topic token, else the body `instance`, else the single-camera omission rule. |
+  | `both` | `sb/status`, `sb/capture-status`, `sb/queue-status`, `sb/queue-clear` | An addressed camera narrows the answer; no addressing at all means the whole component (every camera / the whole fleet). |
+
+- **Instance addressing.** A topic `{instance}` token and a body `instance` that are both present
+  and different are refused with `BAD_ARGS` — checked first, for every scope. At an `instance` or
+  `both` verb the topic token is authoritative and routes the command with no body `instance`
+  needed; an unknown addressed camera is `NO_SUCH_INSTANCE`. This applies to the deferred verbs
+  (`sb/capture`) exactly as to the immediate ones.
 - **Idempotency.** Every *mutating* verb requires a caller-owned `requestId` (1–256 bytes, no control
   characters). A retry with the same `requestId` and the same arguments returns the original outcome; a
   reused `requestId` with **different** arguments is `IDEMPOTENCY_CONFLICT`; an operation whose outcome
@@ -60,7 +69,7 @@ reaches a terminal state, then settles with the full terminal body.
 
 | Field | Type | Required | Meaning |
 |---|---|---|---|
-| `instance` | string | optional* | Target camera (*single-camera omission rule). |
+| `instance` | string | optional* | Target camera (*single-camera omission rule). On an instance-addressed topic the topic token selects the camera and no body `instance` is needed. |
 | `requestId` | string | **yes** | Durable idempotency key, 1–256 bytes. |
 | `captureProfile` | string | optional | Named profile (≤128 bytes); defaults to the camera's `defaultCaptureProfile`. Unknown → `UNKNOWN_CAPTURE_PROFILE`. |
 | `timeoutMs` | u64 | optional | 1000–1800000. Defaults to the profile's `timeoutMs`, else `global.timeouts.jobTerminalMs`. |

@@ -56,8 +56,12 @@ the standard `edgecommons` envelope, owned by the canonical schema and not redec
 
 - Southbound routing/availability error codes are the standardized `BAD_ARGS` / `NO_SUCH_INSTANCE` /
   `DEVICE_UNAVAILABLE` (SOUTHBOUND.md §2.2); domain codes (`CAPTURE_*`, `PTZ_*`, …) are camera-specific.
-- Instance routing is D-EIP-13/D-U28: body `instance`, optional iff exactly one camera is configured;
-  an instance-addressed command topic routes by its token, which is authoritative (SOUTHBOUND.md §2.2).
+- Instance routing is D-EIP-13/D-U28 with declared verb scope (SOUTHBOUND.md §2.2 / D-SC-2): every
+  verb — deferred captures included — registers a `CommandScope` (`Component`/`Instance`/`Both`) and
+  the library enforces the addressing before dispatch (conflict-first `BAD_ARGS`; a `Component` verb
+  refuses any instance addressing). The topic token is authoritative; a body `instance` is optional
+  iff exactly one camera is configured, and that default plus the `NO_SUCH_INSTANCE` existence check
+  stay adapter-side (D-SC-4).
 - Builders/facades are the construction path (`app()`, `events()`, `commands()`, `MetricBuilder`) —
   never hand-built topics or envelopes.
 - Runtime artifacts (durable state DBs, captured images, TLS fixtures, logs, build output) stay out of

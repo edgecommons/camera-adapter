@@ -708,6 +708,13 @@ impl CameraRuntime {
     ///
     /// The same element shape answers core's built-in `status` verb, so one sampler serves both the
     /// push and the pull.
+    ///
+    /// D-SC-7: the `state` token comes from the single instance state model that answers
+    /// `sb/status` — the registry's connection lifecycle plus the operator pause flag, never a
+    /// second bookkeeping path. A deliberately paused camera reports `PAUSED` (the shared
+    /// `CONNECTING`/`ONLINE`/`BACKOFF`/`PAUSED` keepalive vocabulary), so a console can tell
+    /// expected-quiet from silently-stale; `connected` still reports reachability, because pause
+    /// suspends capture workload, not the session.
     #[must_use]
     pub fn camera_connectivity(&self) -> Vec<edgecommons::heartbeat::InstanceConnectivity> {
         let Ok(snapshots) = self.registry.snapshots(MAX_CONNECTIVITY_INSTANCES) else {
@@ -716,6 +723,7 @@ impl CameraRuntime {
         snapshots
             .into_iter()
             .map(|snapshot| {
+                let paused = self.is_paused(&snapshot.instance);
                 let connected = snapshot.state == CameraConnectionState::Online;
                 let mut attributes = serde_json::Map::new();
                 attributes.insert(
@@ -732,9 +740,13 @@ impl CameraRuntime {
                         serde_json::Value::from(error.code.clone()),
                     );
                 }
-                let state = serde_json::to_value(snapshot.state)
-                    .ok()
-                    .and_then(|token| token.as_str().map(str::to_owned));
+                let state = if paused {
+                    Some("PAUSED".to_owned())
+                } else {
+                    serde_json::to_value(snapshot.state)
+                        .ok()
+                        .and_then(|token| token.as_str().map(str::to_owned))
+                };
                 let detail = snapshot
                     .last_error
                     .as_ref()
