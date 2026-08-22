@@ -107,6 +107,53 @@ Put no credentials in the `url` (`rtsp://user:pass@…` is rejected) — supply 
 or discovery. It is built with the `rtsp` feature (which no longer requires `onvif`) plus the GStreamer
 runtime. See the [sample configuration](sample-configurations.md#5-bare-rtsp-camera-no-onvif).
 
+## Replay real images with the simulator
+
+Point the `sim` backend at a directory of images to feed a downstream vision component real pictures through
+the real camera path. Each capture takes the next file and finalizes it the way a camera frame is finalized:
+the metadata sidecar lands first, the image becomes visible atomically, the catalog records the job, and
+`ImageCaptured` announces the result.
+
+To replay a directory of images:
+
+1. Put the images in a directory the adapter can read. Only regular files join the playlist, and the walk
+   rejects symbolic links, so a camera whose directory holds one refuses to connect.
+2. Set the camera's `frame.pattern` to a `playlist` object that names that absolute `directory`.
+3. Choose the capture profile's output encoding. `passthrough` installs a JPEG member byte for byte, so
+   `image.sha256` is the digest of the source file. `jpeg`, `png`, and `tiff` decode the member and re-encode
+   it.
+4. Start the camera and capture. `sb/capture` and schedules both draw from the same playlist.
+
+```json
+"backend": {
+  "type": "sim",
+  "frame": {
+    "pattern": {
+      "playlist": {
+        "directory": "/srv/line-clearance/reference-images",
+        "include": ["**/*.jpg", "**/*.jpeg", "**/*.png"],
+        "order": "sorted",
+        "loop": true,
+        "advance": "perCapture"
+      }
+    }
+  }
+}
+```
+
+The adapter reads the directory once, when the camera connects, so images added later take effect on
+`sb/reconnect`. `order: "seeded"` shuffles the list deterministically from the camera's `seed`, which gives a
+repeatable order that is not alphabetical. `loop: false` replays each file once and then fails further
+captures with `DEVICE_UNAVAILABLE`, which is how you drive a fixed-length rehearsal. `advance: "perTrigger"`
+holds one file for every capture that shares a trigger — one command request, one capture-group request, or
+one schedule occurrence.
+
+Every replayed capture names its source. The terminal `ImageCaptured` body and the metadata sidecar beside
+the image both carry `backendMetadata.playlist.sourcePath`, the file's path relative to the playlist
+directory, and `backendMetadata.playlist.index`, its position in the replay order. With `passthrough` output
+the installed file is the source file, so a consumer that verifies `image.sha256` is verifying the image an
+operator put in the directory.
+
 ## Hand completed files to file-replicator
 
 The adapter and [file-replicator](https://docs.edgecommons.mbreissi.com/components/file-replicator/) couple

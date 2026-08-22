@@ -4877,6 +4877,7 @@ wkWsh7u3nnr9fXRpWsamYEAKGzNo0istMB6rD6cMzNfRZCMk4rXuokYWOw==
             session
                 .capture(CaptureRequest {
                     capture_id: "closed-session".to_owned(),
+                    trigger_key: None,
                     profile,
                     maximum_frame_bytes: 1_024,
                     timeout: Duration::from_secs(1),
@@ -6491,6 +6492,7 @@ wkWsh7u3nnr9fXRpWsamYEAKGzNo0istMB6rD6cMzNfRZCMk4rXuokYWOw==
         let frame = session
             .capture(CaptureRequest {
                 capture_id: "capture-1".to_owned(),
+                trigger_key: None,
                 profile,
                 maximum_frame_bytes: 1_048_576,
                 timeout: Duration::from_secs(2),
@@ -6779,6 +6781,7 @@ wkWsh7u3nnr9fXRpWsamYEAKGzNo0istMB6rD6cMzNfRZCMk4rXuokYWOw==
         .expect("capture profile");
         CaptureRequest {
             capture_id: "byte-fidelity".to_owned(),
+            trigger_key: None,
             profile,
             maximum_frame_bytes: 1_048_576,
             timeout: Duration::from_secs(5),

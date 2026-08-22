@@ -433,6 +433,7 @@ mod tests {
         let frame = session
             .capture(CaptureRequest {
                 capture_id: "cap-live-1".to_string(),
+                trigger_key: None,
                 profile,
                 maximum_frame_bytes: 1_048_576,
                 timeout: Duration::from_secs(15),

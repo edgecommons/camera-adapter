@@ -120,6 +120,23 @@ authority; they do not disable per-connection address validation.
 `pattern`), `connectDelayMs`, `captureDelayMs` (default 10), PTZ capability switches, and deterministic
 fault counters. It is intended for configured test and development cameras.
 
+`frame.pattern` is either one of the four synthetic generators (`color-bars` by default, `gradient`,
+`checkerboard`, `solid`), which draw pixels from the seed and the capture ordinal, or a `playlist` object
+that replays a directory of real image files. A playlist requires an absolute `directory` and accepts
+`include` (case-sensitive globs matched against each file's `/`-separated path relative to `directory`,
+default `**/*.jpg`, `**/*.jpeg`, `**/*.png`; `**` spans path segments, `*` matches within one segment, `?`
+matches one character), `order` (`sorted` by relative path, or `seeded` for a deterministic shuffle keyed by
+the camera's `seed`), `loop` (default true; with `false` a capture past the last file fails
+`DEVICE_UNAVAILABLE`), and `advance` (`perCapture`, or `perTrigger` to hold one file for every capture that
+shares a command request, capture-group request, or schedule occurrence). The directory is read once when
+the camera connects and holds at most 10,000 files nested at most 32 levels deep; symbolic links are
+refused. `frame.width`, `frame.height`, and `frame.pixelFormat` configure the synthetic generators and are
+not consulted for a playlist — each capture reports the replayed file's own dimensions and format. A JPEG
+member captured under a `passthrough` or `raw` profile is installed byte for byte, so `image.sha256` is the
+source file's digest; every other combination decodes the member to pixels and re-encodes it. The terminal
+body and the metadata sidecar carry `backendMetadata.playlist.sourcePath` and
+`backendMetadata.playlist.index`.
+
 `rtsp` is a bare-RTSP backend for a camera addressed directly by an `rtsp://` or `rtsps://` `url`, with no
 ONVIF device. It captures still frames only — `captureMode` is `rtsp-frame`, its single valid value — and
 exposes no PTZ, snapshot, or discovery. The `url` must carry no embedded credentials (`rtsp://user:pass@…`
