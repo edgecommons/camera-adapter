@@ -561,19 +561,13 @@
           "type": "boolean",
           "default": true,
           "description": "Whether replay restarts at the first file after the last one."
-        },
-        "advance": { "$ref": "#/$defs/simPlaylistAdvance" }
+        }
       }
     },
     "simPlaylistOrder": {
       "enum": ["sorted", "seeded"],
       "default": "sorted",
       "description": "Playlist replay order: ascending by relative path, or a deterministic shuffle derived from the simulator seed."
-    },
-    "simPlaylistAdvance": {
-      "enum": ["perCapture", "perTrigger"],
-      "default": "perCapture",
-      "description": "When the playlist cursor moves to the next file."
     },
     "genicamTransport": {
       "enum": ["auto", "gige-vision", "usb3-vision"],

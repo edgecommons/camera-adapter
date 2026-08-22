@@ -133,8 +133,7 @@ To replay a directory of images:
         "directory": "/srv/line-clearance/reference-images",
         "include": ["**/*.jpg", "**/*.jpeg", "**/*.png"],
         "order": "sorted",
-        "loop": true,
-        "advance": "perCapture"
+        "loop": true
       }
     }
   }
@@ -144,9 +143,7 @@ To replay a directory of images:
 The adapter reads the directory once, when the camera connects, so images added later take effect on
 `sb/reconnect`. `order: "seeded"` shuffles the list deterministically from the camera's `seed`, which gives a
 repeatable order that is not alphabetical. `loop: false` replays each file once and then fails further
-captures with `DEVICE_UNAVAILABLE`, which is how you drive a fixed-length rehearsal. `advance: "perTrigger"`
-holds one file for every capture that shares a trigger — one command request, one capture-group request, or
-one schedule occurrence.
+captures with `DEVICE_UNAVAILABLE`, which is how you drive a fixed-length rehearsal.
 
 Every replayed capture names its source. The terminal `ImageCaptured` body and the metadata sidecar beside
 the image both carry `backendMetadata.playlist.sourcePath`, the file's path relative to the playlist

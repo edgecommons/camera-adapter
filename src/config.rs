@@ -562,9 +562,6 @@ pub struct SimPlaylistConfig {
     /// Whether replay restarts at the first file after the last one.
     #[serde(default = "default_true", rename = "loop")]
     pub loop_playlist: bool,
-    /// When the cursor moves to the next file.
-    #[serde(default)]
-    pub advance: SimPlaylistAdvance,
 }
 
 /// Order in which a playlist replays its files.
@@ -576,18 +573,6 @@ pub enum SimPlaylistOrder {
     Sorted,
     /// Deterministic shuffle derived from the simulator seed.
     Seeded,
-}
-
-/// When a playlist cursor moves to the next file.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SimPlaylistAdvance {
-    /// Every capture replays the next file.
-    #[default]
-    PerCapture,
-    /// Every trigger replays the next file. Captures that share a trigger -- one command request,
-    /// one capture-group request, or one schedule occurrence -- replay the same file.
-    PerTrigger,
 }
 
 /// Simulator PTZ capability switches.
@@ -3310,7 +3295,6 @@ mod tests {
             .expect("the playlist settings survive parsing");
         assert_eq!(playlist.include, ["**/*.jpg", "**/*.jpeg", "**/*.png"]);
         assert_eq!(playlist.order, SimPlaylistOrder::Sorted);
-        assert_eq!(playlist.advance, SimPlaylistAdvance::PerCapture);
         assert!(
             playlist.loop_playlist,
             "replay loops unless it is told not to"

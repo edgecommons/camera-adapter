@@ -85,14 +85,6 @@ pub struct ConnectRequest {
 pub struct CaptureRequest {
     /// Adapter-generated durable capture id.
     pub capture_id: String,
-    /// Opaque identity of the operator action or schedule occurrence this capture belongs to.
-    ///
-    /// Captures produced by one command request, one capture-group request, or one schedule
-    /// occurrence carry the same key. A backend compares it for equality and never parses it, which
-    /// is what keeps the seam protocol-neutral: nothing about EdgeCommons triggers crosses it beyond
-    /// "same action" or "different action". `None` means the caller has no trigger to report, and a
-    /// backend that does not model triggers ignores the field.
-    pub trigger_key: Option<String>,
     /// Immutable effective profile.
     pub profile: CaptureProfile,
     /// Hard accepted source-frame ceiling.

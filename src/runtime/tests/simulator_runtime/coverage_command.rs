@@ -4387,7 +4387,6 @@ async fn the_image_that_is_delivered_is_the_image_the_camera_took() {
     let expected = session
         .capture(crate::backend::CaptureRequest {
             capture_id: "regenerated".to_owned(),
-            trigger_key: None,
             profile: terminal_profile(&terminal),
             maximum_frame_bytes: 8 * 1024 * 1024,
             timeout: Duration::from_secs(5),
@@ -4548,7 +4547,6 @@ async fn the_thumbnail_that_is_announced_is_a_downscale_of_the_frame_the_camera_
         .expect("the simulator must connect");
     let regenerate = || crate::backend::CaptureRequest {
         capture_id: "regenerated".to_owned(),
-        trigger_key: None,
         profile: terminal_profile(&terminal),
         maximum_frame_bytes: 8 * 1024 * 1024,
         timeout: Duration::from_secs(5),

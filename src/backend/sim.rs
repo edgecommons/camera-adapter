@@ -28,8 +28,7 @@ use super::{
     DiscoveryCandidate, DiscoveryRequest,
 };
 use crate::config::{
-    BackendConfig, SimBackendConfig, SimPattern, SimPlaylistAdvance, SimPlaylistConfig,
-    SimPlaylistOrder,
+    BackendConfig, SimBackendConfig, SimPattern, SimPlaylistConfig, SimPlaylistOrder,
 };
 use crate::error::{CameraError, ErrorCode, Result};
 use crate::model::{
@@ -320,7 +319,7 @@ impl CameraSession for SimSession {
         let limit = request.maximum_frame_bytes;
         let mut acquired = match self.playlist.as_mut() {
             Some(playlist) => {
-                let index = playlist.take(request.trigger_key.as_deref())?;
+                let index = playlist.take()?;
                 let entry = playlist.entry(index).clone();
                 let root = playlist.root.clone();
                 let encoding = request.profile.output.encoding;
@@ -612,11 +611,6 @@ struct Playlist {
     /// Position the next capture replays.
     cursor: usize,
     loop_playlist: bool,
-    advance: SimPlaylistAdvance,
-    /// Trigger the current position was taken for, under `perTrigger`.
-    last_trigger: Option<String>,
-    /// Position the last capture replayed.
-    current: Option<usize>,
 }
 
 impl Playlist {
@@ -647,9 +641,6 @@ impl Playlist {
             entries,
             cursor: 0,
             loop_playlist: config.loop_playlist,
-            advance: config.advance,
-            last_trigger: None,
-            current: None,
         })
     }
 
@@ -658,17 +649,11 @@ impl Playlist {
         &self.entries[index]
     }
 
-    /// The position this capture replays, moving the cursor when the advance policy says to.
+    /// The position this capture replays, moving the cursor to the next file.
     ///
     /// # Errors
     /// `DEVICE_UNAVAILABLE` once an unlooped playlist has replayed its last file.
-    fn take(&mut self, trigger: Option<&str>) -> Result<usize> {
-        let repeat = self.advance == SimPlaylistAdvance::PerTrigger
-            && trigger.is_some()
-            && self.last_trigger.as_deref() == trigger;
-        if let Some(current) = self.current.filter(|_| repeat) {
-            return Ok(current);
-        }
+    fn take(&mut self) -> Result<usize> {
         if self.cursor >= self.entries.len() {
             if !self.loop_playlist {
                 return Err(playlist_unavailable(
@@ -679,8 +664,6 @@ impl Playlist {
         }
         let index = self.cursor;
         self.cursor += 1;
-        self.current = Some(index);
-        self.last_trigger = trigger.map(str::to_owned);
         Ok(index)
     }
 
@@ -1097,7 +1080,6 @@ mod tests {
         let mut second = session(config).await;
         let request = || CaptureRequest {
             capture_id: "cap-1".to_string(),
-            trigger_key: None,
             profile: profile(),
             maximum_frame_bytes: 1_000_000,
             timeout: Duration::from_secs(1),
@@ -1114,7 +1096,6 @@ mod tests {
         let mut camera = session(json!({"type":"sim","faults":{"failEveryNthCapture":2}})).await;
         let request = || CaptureRequest {
             capture_id: "cap".to_string(),
-            trigger_key: None,
             profile: profile(),
             maximum_frame_bytes: 1_000_000,
             timeout: Duration::from_secs(1),
@@ -1168,7 +1149,6 @@ mod tests {
         let error = camera
             .capture(CaptureRequest {
                 capture_id: "cap".to_string(),
-                trigger_key: None,
                 profile: profile(),
                 maximum_frame_bytes: 1_000_000,
                 timeout: Duration::from_secs(1),
@@ -1185,7 +1165,6 @@ mod tests {
             session(json!({"type":"sim","faults":{"incompleteEveryNthCapture":1}})).await;
         let request = || CaptureRequest {
             capture_id: "cap-fault".to_string(),
-            trigger_key: None,
             profile: profile(),
             maximum_frame_bytes: 1_000_000,
             timeout: Duration::from_secs(1),
@@ -1264,7 +1243,6 @@ mod tests {
     async fn simulator_emits_declared_raw_and_jpeg_formats_with_frame_bounds() {
         let request = || CaptureRequest {
             capture_id: "format-check".to_owned(),
-            trigger_key: None,
             profile: profile(),
             maximum_frame_bytes: 1_000_000,
             timeout: Duration::from_secs(1),
@@ -1591,10 +1569,9 @@ mod tests {
             .expect("valid capture profile")
     }
 
-    fn playlist_request(capture_id: &str, encoding: &str, trigger: Option<&str>) -> CaptureRequest {
+    fn playlist_request(capture_id: &str, encoding: &str) -> CaptureRequest {
         CaptureRequest {
             capture_id: capture_id.to_owned(),
-            trigger_key: trigger.map(str::to_owned),
             profile: encoding_profile(encoding),
             maximum_frame_bytes: 1_000_000,
             timeout: Duration::from_secs(1),
@@ -1711,9 +1688,7 @@ mod tests {
             .expect("looping playlist");
         assert_eq!(
             (0..5)
-                .map(|_| looping
-                    .take(None)
-                    .expect("a looping playlist never runs out"))
+                .map(|_| looping.take().expect("a looping playlist never runs out"))
                 .collect::<Vec<_>>(),
             vec![0, 1, 2, 0, 1]
         );
@@ -1725,11 +1700,11 @@ mod tests {
         .expect("single-pass playlist");
         assert_eq!(
             (0..3)
-                .map(|_| once.take(None).expect("every file is replayed once"))
+                .map(|_| once.take().expect("every file is replayed once"))
                 .collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
-        let spent = once.take(None).expect_err("a spent playlist has no frame");
+        let spent = once.take().expect_err("a spent playlist has no frame");
         assert_eq!(spent.code(), ErrorCode::DeviceUnavailable);
         assert!(spent.to_string().contains("spent"));
         assert_eq!(
@@ -1741,43 +1716,12 @@ mod tests {
         let mut wrapped = Playlist::load(&playlist_settings(directory.path(), json!({})), 1)
             .expect("looping playlist");
         for _ in 0..3 {
-            wrapped.take(None).expect("every file replayed once");
+            wrapped.take().expect("every file replayed once");
         }
         assert_eq!(
             wrapped.diagnostics()["index"],
             0,
             "a looping playlist reports the file the next capture will replay"
-        );
-    }
-
-    #[test]
-    fn per_trigger_holds_one_file_for_captures_that_share_a_trigger() {
-        let directory = three_jpeg_directory();
-        let mut per_trigger = Playlist::load(
-            &playlist_settings(directory.path(), json!({ "advance": "perTrigger" })),
-            1,
-        )
-        .expect("per-trigger playlist");
-        assert_eq!(per_trigger.take(Some("schedule:minute@0")).unwrap(), 0);
-        assert_eq!(
-            per_trigger.take(Some("schedule:minute@0")).unwrap(),
-            0,
-            "a second capture under the same trigger replays the same file"
-        );
-        assert_eq!(per_trigger.take(Some("schedule:minute@60000")).unwrap(), 1);
-        assert_eq!(
-            per_trigger.take(None).unwrap(),
-            2,
-            "a capture with no trigger to compare always takes the next file"
-        );
-
-        let mut per_capture = Playlist::load(&playlist_settings(directory.path(), json!({})), 1)
-            .expect("per-capture playlist");
-        assert_eq!(per_capture.take(Some("command:one")).unwrap(), 0);
-        assert_eq!(
-            per_capture.take(Some("command:one")).unwrap(),
-            1,
-            "the default advances on every capture whatever the trigger says"
         );
     }
 
@@ -1835,21 +1779,18 @@ mod tests {
         let directory = TempDir::new().expect("playlist directory");
         write_fixture(directory.path(), "a.jpg", &jpeg_bytes(4, 4, 1));
         write_fixture(directory.path(), "b.jpg", &jpeg_bytes(4, 4, 2));
-        let mut camera = session(playlist_backend(
-            directory.path(),
-            json!({ "advance": "perCapture" }),
-        ))
-        .await;
+        let mut camera =
+            session(playlist_backend(directory.path(), json!({ "loop": false }))).await;
         fs::remove_file(directory.path().join("a.jpg")).expect("remove the first member");
 
         let gone = camera
-            .capture(playlist_request("cap-1", "passthrough", None))
+            .capture(playlist_request("cap-1", "passthrough"))
             .await
             .expect_err("a member that is no longer there is not a frame");
         assert_eq!(gone.code(), ErrorCode::DeviceUnavailable);
         assert!(gone.to_string().contains("cannot be read"));
         camera
-            .capture(playlist_request("cap-2", "passthrough", None))
+            .capture(playlist_request("cap-2", "passthrough"))
             .await
             .expect("the rest of the playlist still replays");
     }
@@ -1865,7 +1806,7 @@ mod tests {
 
         let mut camera = session(playlist_backend(directory.path(), json!({}))).await;
         let undecodable = camera
-            .capture(playlist_request("cap-1", "png", None))
+            .capture(playlist_request("cap-1", "png"))
             .await
             .expect_err("a truncated PNG is not a frame");
         assert_eq!(undecodable.code(), ErrorCode::UnsupportedPixelFormat);
@@ -1876,7 +1817,7 @@ mod tests {
         let over_ceiling = camera
             .capture(CaptureRequest {
                 maximum_frame_bytes: 4_096,
-                ..playlist_request("cap-2", "png", None)
+                ..playlist_request("cap-2", "png")
             })
             .await
             .expect_err("the decoded frame is bounded too");
@@ -1894,7 +1835,7 @@ mod tests {
 
         let mut camera = session(playlist_backend(directory.path(), json!({}))).await;
         let frame = camera
-            .capture(playlist_request("cap-1", "passthrough", None))
+            .capture(playlist_request("cap-1", "passthrough"))
             .await
             .expect("the first playlist file");
         assert_eq!(
@@ -1910,7 +1851,7 @@ mod tests {
         assert_eq!(frame.backend_metadata["playlist"]["index"], 0);
 
         let next = camera
-            .capture(playlist_request("cap-2", "passthrough", None))
+            .capture(playlist_request("cap-2", "passthrough"))
             .await
             .expect("the second playlist file");
         assert_eq!(next.bytes.as_ref(), second.as_slice());
@@ -1928,7 +1869,7 @@ mod tests {
 
         let mut camera = session(playlist_backend(directory.path(), json!({}))).await;
         let colour = camera
-            .capture(playlist_request("cap-1", "png", None))
+            .capture(playlist_request("cap-1", "png"))
             .await
             .expect("a colour PNG decodes to RGB8");
         assert_eq!(colour.pixel_format, PixelFormat::Rgb8);
@@ -1936,14 +1877,14 @@ mod tests {
         assert_eq!(colour.bytes.len(), 6 * 5 * 3);
 
         let grey = camera
-            .capture(playlist_request("cap-2", "png", None))
+            .capture(playlist_request("cap-2", "png"))
             .await
             .expect("a grayscale PNG decodes to Mono8");
         assert_eq!(grey.pixel_format, PixelFormat::Mono8);
         assert_eq!(grey.bytes.len(), 6 * 5);
 
         let photo = camera
-            .capture(playlist_request("cap-3", "png", None))
+            .capture(playlist_request("cap-3", "png"))
             .await
             .expect("a JPEG asked for as PNG is decoded rather than refused");
         assert_eq!(photo.pixel_format, PixelFormat::Rgb8);
@@ -1974,7 +1915,7 @@ mod tests {
         );
 
         camera
-            .capture(playlist_request("cap-1", "passthrough", None))
+            .capture(playlist_request("cap-1", "passthrough"))
             .await
             .expect("one replayed capture");
         let after = camera.status().await.expect("session status");
@@ -2013,20 +1954,20 @@ mod tests {
         let oversized = camera
             .capture(CaptureRequest {
                 maximum_frame_bytes: 16,
-                ..playlist_request("cap-1", "passthrough", None)
+                ..playlist_request("cap-1", "passthrough")
             })
             .await
             .expect_err("the frame ceiling is checked before the file is read");
         assert_eq!(oversized.code(), ErrorCode::ResourceLimit);
 
         let undecodable = camera
-            .capture(playlist_request("cap-2", "passthrough", None))
+            .capture(playlist_request("cap-2", "passthrough"))
             .await
             .expect_err("a truncated JPEG is not a frame");
         assert_eq!(undecodable.code(), ErrorCode::UnsupportedPixelFormat);
 
         let still_serving = camera
-            .capture(playlist_request("cap-3", "png", None))
+            .capture(playlist_request("cap-3", "png"))
             .await
             .expect("a refused file does not close the session");
         assert_eq!(still_serving.backend_metadata["playlist"]["index"], 2);
@@ -2038,7 +1979,7 @@ mod tests {
         write_fixture(directory.path(), "a.jpg", b"GIF89a and not a JPEG");
         let mut camera = session(playlist_backend(directory.path(), json!({}))).await;
         let error = camera
-            .capture(playlist_request("cap-1", "passthrough", None))
+            .capture(playlist_request("cap-1", "passthrough"))
             .await
             .expect_err("an extension is not evidence of a format");
         assert_eq!(error.code(), ErrorCode::UnsupportedPixelFormat);
@@ -2068,7 +2009,7 @@ mod tests {
         std::os::unix::fs::symlink(&secret, directory.path().join("a.jpg"))
             .expect("swap the member for a link");
         let swapped = camera
-            .capture(playlist_request("cap-1", "passthrough", None))
+            .capture(playlist_request("cap-1", "passthrough"))
             .await
             .expect_err("a member replaced by a link is not replayed");
         assert_eq!(swapped.code(), ErrorCode::DeviceUnavailable);

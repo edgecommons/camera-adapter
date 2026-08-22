@@ -1062,7 +1062,6 @@ impl JobEngine {
 
         let capture = session.capture(CaptureRequest {
             capture_id: runtime.spec.capture_id.clone(),
-            trigger_key: Some(trigger_key(&runtime.spec.trigger)),
             profile: runtime.spec.profile.capture.clone(),
             maximum_frame_bytes: runtime.spec.profile.maximum_frame_bytes,
             timeout: remaining_duration(runtime.deadlines().capture_at_ms),
@@ -2431,28 +2430,6 @@ fn cancelled_error(stage: &'static str) -> CameraError {
         ErrorCode::CaptureCancelled,
         format!("capture cancelled {stage}"),
     )
-}
-
-/// The opaque trigger identity handed to a backend on every capture.
-///
-/// Captures that belong to the same operator action or the same schedule occurrence produce the same
-/// key: one command request, one capture-group request, or one occurrence of one schedule. It is
-/// deliberately a flat string -- the backend seam compares it and nothing more, so no trigger type
-/// leaks into a protocol backend.
-fn trigger_key(trigger: &CaptureTrigger) -> String {
-    match trigger {
-        CaptureTrigger::Command { request_id } => format!("command:{request_id}"),
-        CaptureTrigger::GroupCommand {
-            capture_group_id, ..
-        } => format!("group:{capture_group_id}"),
-        CaptureTrigger::Schedule {
-            schedule_id,
-            intended_fire_time,
-        } => format!(
-            "schedule:{schedule_id}@{}",
-            intended_fire_time.timestamp_millis()
-        ),
-    }
 }
 
 fn is_retriable(code: ErrorCode) -> bool {

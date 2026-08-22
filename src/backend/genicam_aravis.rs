@@ -2228,7 +2228,6 @@ mod tests {
     fn fake_gige_request(capture_id: &str) -> CaptureRequest {
         CaptureRequest {
             capture_id: capture_id.to_owned(),
-            trigger_key: None,
             profile: fake_gige_profile(),
             maximum_frame_bytes: 76_800,
             timeout: Duration::from_secs(5),
@@ -2255,7 +2254,6 @@ mod tests {
         let frame = session
             .capture(CaptureRequest {
                 capture_id: "cap-1".to_owned(),
-                trigger_key: None,
                 profile: profile(),
                 maximum_frame_bytes: 1,
                 timeout: Duration::from_secs(1),
@@ -3313,7 +3311,6 @@ mod tests {
             let frame = session
                 .capture(CaptureRequest {
                     capture_id: "cap-frame-fidelity".to_owned(),
-                    trigger_key: None,
                     profile: requested,
                     maximum_frame_bytes,
                     timeout: Duration::from_secs(5),
@@ -3390,7 +3387,6 @@ mod tests {
         let error = session
             .capture(CaptureRequest {
                 capture_id: "cap-over-bound".to_owned(),
-                trigger_key: None,
                 profile: profile(),
                 maximum_frame_bytes: 1,
                 timeout: Duration::from_secs(5),
