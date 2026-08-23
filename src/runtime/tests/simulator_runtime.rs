@@ -4,6 +4,7 @@
 //! production paths the suite had never reached, and keeping them separate keeps this file readable.
 
 mod coverage_command;
+mod coverage_playlist;
 mod coverage_reload;
 mod coverage_supervision;
 

@@ -6,7 +6,7 @@
 //! relationships before runtime state changes.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use chrono_tz::Tz;
@@ -509,7 +509,11 @@ impl Default for SimFrameConfig {
 }
 
 /// Simulator frame patterns.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+///
+/// The four synthetic patterns are generated per capture from the seed and the capture ordinal.
+/// [`SimPattern::Playlist`] instead replays a directory of real image files, so a downstream
+/// consumer receives genuine imagery through the ordinary capture, encoding, and storage path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SimPattern {
     /// SMPTE-like color bands.
@@ -521,6 +525,54 @@ pub enum SimPattern {
     Checkerboard,
     /// Seed-derived solid color.
     Solid,
+    /// Replay of a directory of real image files.
+    Playlist(SimPlaylistConfig),
+}
+
+impl SimPattern {
+    /// The playlist settings when this pattern replays files, and `None` for a synthetic pattern.
+    #[must_use]
+    pub const fn playlist(&self) -> Option<&SimPlaylistConfig> {
+        match self {
+            Self::Playlist(playlist) => Some(playlist),
+            _ => None,
+        }
+    }
+}
+
+/// Settings for the simulator pattern that replays a directory of real image files.
+///
+/// The directory is read once, when the camera connects, so the playlist is a fixed list for the
+/// life of the session; `sb/reconnect` re-reads it. `frame.width`, `frame.height`, and
+/// `frame.pixelFormat` describe the synthetic generator and carry no meaning for a playlist: each
+/// capture reports the replayed file's own dimensions and format.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SimPlaylistConfig {
+    /// Absolute directory holding the image files.
+    pub directory: PathBuf,
+    /// Glob patterns, matched case-sensitively against each file's `/`-separated path relative to
+    /// `directory`. A file joins the playlist when it matches at least one pattern. `**` matches any
+    /// number of path segments, `*` matches within one segment, and `?` matches one character.
+    #[serde(default = "default_playlist_include")]
+    pub include: Vec<String>,
+    /// Replay order.
+    #[serde(default)]
+    pub order: SimPlaylistOrder,
+    /// Whether replay restarts at the first file after the last one.
+    #[serde(default = "default_true", rename = "loop")]
+    pub loop_playlist: bool,
+}
+
+/// Order in which a playlist replays its files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SimPlaylistOrder {
+    /// Ascending by relative path.
+    #[default]
+    Sorted,
+    /// Deterministic shuffle derived from the simulator seed.
+    Seeded,
 }
 
 /// Simulator PTZ capability switches.
@@ -1575,6 +1627,18 @@ fn validate_sim(sim: &SimBackendConfig, global: &GlobalConfig, path: &str) -> Re
             );
         }
     }
+    if let Some(playlist) = sim.frame.pattern.playlist() {
+        let field = format!("{path}.frame.pattern.playlist");
+        if !playlist.directory.is_absolute() {
+            return config_error(format!("{field}.directory"), "must be an absolute path");
+        }
+        if playlist.include.is_empty() {
+            return config_error(format!("{field}.include"), "must list at least one glob");
+        }
+        if playlist.include.iter().any(|glob| glob.trim().is_empty()) {
+            return config_error(format!("{field}.include"), "globs must not be empty");
+        }
+    }
     for (value, field) in [
         (
             sim.faults.disconnect_after_captures,
@@ -2253,6 +2317,13 @@ fn issue_from_error(instance: Option<String>, error: CameraError) -> ConfigIssue
 
 fn default_true() -> bool {
     true
+}
+fn default_playlist_include() -> Vec<String> {
+    vec![
+        "**/*.jpg".to_string(),
+        "**/*.jpeg".to_string(),
+        "**/*.png".to_string(),
+    ]
 }
 fn default_camera_directory_template() -> String {
     "{cameraId}/{yyyy}/{MM}/{dd}".to_string()
@@ -3189,6 +3260,86 @@ mod tests {
             }),
         ];
 
+        for mutate in cases {
+            let mut value = valid_config();
+            mutate(&mut value);
+            assert!(AdapterConfig::from_core_initial(&core(value)).is_err());
+        }
+    }
+
+    /// An absolute directory the current platform agrees is absolute.
+    fn playlist_directory() -> String {
+        if cfg!(windows) {
+            "C:/line-clearance".to_string()
+        } else {
+            "/srv/line-clearance".to_string()
+        }
+    }
+
+    #[test]
+    fn a_simulator_playlist_is_defaulted_and_validated_before_startup() {
+        let mut value = valid_config();
+        value["component"]["instances"][0]["backend"] = json!({
+            "type": "sim",
+            "frame": { "pattern": { "playlist": { "directory": playlist_directory() } } }
+        });
+        let config =
+            AdapterConfig::from_core_initial(&core(value)).expect("a valid playlist simulator");
+        let BackendConfig::Sim(sim) = &config.config.instances[0].backend else {
+            panic!("the fixture configures the simulator");
+        };
+        let playlist = sim
+            .frame
+            .pattern
+            .playlist()
+            .expect("the playlist settings survive parsing");
+        assert_eq!(playlist.include, ["**/*.jpg", "**/*.jpeg", "**/*.png"]);
+        assert_eq!(playlist.order, SimPlaylistOrder::Sorted);
+        assert!(
+            playlist.loop_playlist,
+            "replay loops unless it is told not to"
+        );
+
+        let cases: Vec<ConfigMutation> = vec![
+            // A relative directory resolves against whatever the process happens to be running in.
+            Box::new(|value| {
+                value["component"]["instances"][0]["backend"] = json!({
+                    "type": "sim",
+                    "frame": { "pattern": { "playlist": { "directory": "line-clearance" } } }
+                });
+            }),
+            Box::new(|value| {
+                value["component"]["instances"][0]["backend"] = json!({
+                    "type": "sim",
+                    "frame": { "pattern": { "playlist": {
+                        "directory": playlist_directory(), "include": []
+                    } } }
+                });
+            }),
+            Box::new(|value| {
+                value["component"]["instances"][0]["backend"] = json!({
+                    "type": "sim",
+                    "frame": { "pattern": { "playlist": {
+                        "directory": playlist_directory(), "include": ["   "]
+                    } } }
+                });
+            }),
+            // The playlist object is closed like every other block in this schema.
+            Box::new(|value| {
+                value["component"]["instances"][0]["backend"] = json!({
+                    "type": "sim",
+                    "frame": { "pattern": { "playlist": {
+                        "directory": playlist_directory(), "shuffle": true
+                    } } }
+                });
+            }),
+            Box::new(|value| {
+                value["component"]["instances"][0]["backend"] = json!({
+                    "type": "sim",
+                    "frame": { "pattern": { "playlist": {} } }
+                });
+            }),
+        ];
         for mutate in cases {
             let mut value = valid_config();
             mutate(&mut value);

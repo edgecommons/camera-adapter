@@ -527,9 +527,47 @@
       "description": "Capture mechanism."
     },
     "simPattern": {
-      "enum": ["color-bars", "gradient", "checkerboard", "solid"],
+      "description": "Simulator frame pattern: one of the synthetic generators, or a playlist that replays a directory of real image files.",
       "default": "color-bars",
-      "description": "Simulator frame pattern."
+      "oneOf": [
+        { "enum": ["color-bars", "gradient", "checkerboard", "solid"] },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["playlist"],
+          "properties": { "playlist": { "$ref": "#/$defs/simPlaylist" } }
+        }
+      ]
+    },
+    "simPlaylist": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["directory"],
+      "description": "Replay of a directory of real image files, read once when the camera connects.",
+      "properties": {
+        "directory": {
+          "type": "string",
+          "description": "Absolute directory holding the image files."
+        },
+        "include": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1,
+          "default": ["**/*.jpg", "**/*.jpeg", "**/*.png"],
+          "description": "Case-sensitive globs matched against each file's `/`-separated path relative to `directory`. `**` spans path segments, `*` matches within one segment, `?` matches one character."
+        },
+        "order": { "$ref": "#/$defs/simPlaylistOrder" },
+        "loop": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether replay restarts at the first file after the last one."
+        }
+      }
+    },
+    "simPlaylistOrder": {
+      "enum": ["sorted", "seeded"],
+      "default": "sorted",
+      "description": "Playlist replay order: ascending by relative path, or a deterministic shuffle derived from the simulator seed."
     },
     "genicamTransport": {
       "enum": ["auto", "gige-vision", "usb3-vision"],
