@@ -1,5 +1,10 @@
 # Camera Adapter Session Handoff — 2026-07-11
 
+This is the historical July 11 stop record. Later implementation and validation supersede its pending
+items; start with the [current README status](README.md#current-implementation-status) and
+[acceptance matrix](ACCEPTANCE-MATRIX.md). Retain this record as evidence of that session, not a
+current instruction to resume its old stop point.
+
 User requested a stop after verification of the Core Python native-streaming fix so the Windows
 machine can reboot. Resume this file first. Do not discard or reset the existing dirty worktrees.
 

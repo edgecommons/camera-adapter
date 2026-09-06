@@ -1,6 +1,6 @@
 # Camera Adapter — Requirements and Design
 
-> **Status:** Proposed for full review  
+> **Status:** Accepted design and implementation contract; current release evidence is tracked in [ACCEPTANCE-MATRIX.md](ACCEPTANCE-MATRIX.md).
 > **Version:** 0.2  
 > **Date:** 2026-07-10  
 > **Component:** `camera-adapter`  

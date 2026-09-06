@@ -82,7 +82,9 @@ Each named profile carries a **required `output` object** and optional overrides
 The instances below are fragments. A complete document also sets absolute durable roots and a component
 token — the minimum HOST shape is:
 
-```json
+Illustrative JSON fragment; omitted fields and surrounding object context are not shown. This is not a complete input document.
+
+```text
 {
   "component": {
     "token": "camera-adapter",
@@ -96,7 +98,7 @@ token — the minimum HOST shape is:
 ```
 
 `component.token` is a **core** EdgeCommons field (not adapter-owned): it is the component's UNS identity —
-the `{component}` segment in `ecv1/{device}/{component}/{instance}/{class}` — under which the adapter
+the `{component}` segment in `ecv1/{device}/{component}[/{instance}]/{class}` — under which the adapter
 publishes and is addressed on the bus (its command inbox, state, metrics, and per-camera messages). Set it
 to `camera-adapter` as shown. If you omit it, the core falls back to the short form of the full component
 name (`com.mbreissi.edgecommons.CameraAdapter` → `CameraAdapter`), and the component would appear at
@@ -297,7 +299,9 @@ See [how-to: move or stop PTZ safely](how-to-guides.md#move-or-stop-ptz-safely).
 
 ## 9. A group schedule
 
-```json
+Illustrative JSON fragment; omitted fields and surrounding object context are not shown. This is not a complete input document.
+
+```text
 "captureGroupSchedules": [{
   "id": "line-a-sync",
   "cron": "0 */5 * * * *",

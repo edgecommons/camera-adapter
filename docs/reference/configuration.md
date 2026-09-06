@@ -82,7 +82,9 @@ RGB.
 A capture profile may also ask for a thumbnail. It is off unless the profile carries a `thumbnail`
 object:
 
-```json
+Illustrative JSON fragment; omitted fields and surrounding object context are not shown. This is not a complete input document.
+
+```text
 "captureProfiles": {
   "inspection": {
     "output": { "encoding": "jpeg" },
@@ -162,7 +164,9 @@ ordinary bounded queued overlap.
 A schedule under a camera captures that camera. A schedule under `global.captureGroupSchedules` captures
 several cameras together, as one group:
 
-```json
+Illustrative JSON fragment; omitted fields and surrounding object context are not shown. This is not a complete input document.
+
+```text
 "captureGroupSchedules": [{
   "id": "line-a-sync",
   "cron": "0 */5 * * * *",

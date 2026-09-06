@@ -10,7 +10,9 @@ Add a named schedule to a camera instance to capture on a cron instead of waitin
 occurrence follows the *same* admission, deadline, persistence, and terminal-message path as a command
 capture, so it is indistinguishable from one on the bus.
 
-```json
+Illustrative JSON fragment; omitted fields and surrounding object context are not shown. This is not a complete input document.
+
+```text
 "schedules": [{
   "id": "hourly-inspection",
   "cron": "0 0 * * * *",
@@ -54,7 +56,9 @@ overwrite them. A capture requested while the camera is moving is governed by th
 Reference a **whole** credential secret through `backend.credentials` — never inline a username or password.
 Its UTF-8 JSON value contains exactly `username` and `password`.
 
-```json
+Illustrative JSON fragment; omitted fields and surrounding object context are not shown. This is not a complete input document.
+
+```text
 "backend": {
   "type": "onvif-rtsp",
   "deviceServiceUrl": "https://camera.example/onvif/device_service",
@@ -92,7 +96,9 @@ explicit safe hosts in `backend.allowedUriHosts`.
 
 For a camera that has no ONVIF service, use the `rtsp` backend and point it straight at the stream:
 
-```json
+Illustrative JSON fragment; omitted fields and surrounding object context are not shown. This is not a complete input document.
+
+```text
 "backend": {
   "type": "rtsp",
   "url": "rtsp://line-cam.example:554/stream1",
@@ -124,7 +130,9 @@ To replay a directory of images:
    it.
 4. Start the camera and capture. `sb/capture` and schedules both draw from the same playlist.
 
-```json
+Illustrative JSON fragment; omitted fields and surrounding object context are not shown. This is not a complete input document.
+
+```text
 "backend": {
   "type": "sim",
   "frame": {
