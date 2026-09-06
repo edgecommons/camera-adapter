@@ -1,7 +1,8 @@
 # Acceptance matrix
 
-This is the live local release record for the binding design. `Validated` means evidence exists for the
-current branch; `Blocked` means the requirement remains a release gate and is not represented as complete;
+This is the maintained release record for the binding design. `Validated` means the cited evidence exists
+for its recorded source revision and environment, not that it was rerun on today's checkout;
+`Blocked` means the requirement remains a release gate and is not represented as complete;
 `In progress` means a repeatable harness exists but its required evidence has not yet been recorded; and
 `Waived` records an explicit project decision and never implies untested hardware compatibility. A
 `Deferred` activity is intentionally postponed to a later validation phase and is not a current gate.

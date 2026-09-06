@@ -7,21 +7,21 @@ disk rather than sent over MQTT or Greengrass IPC.
 
 ## Current implementation status
 
-The component has a functional durable startup path, command-router startup gate, SQLite-backed
-catalog, deterministic simulated backend, ONVIF snapshot/RTSP backend, and an optional
-Linux GenICam/Aravis backend. It is **not a general-release component yet**: the 256-camera/24-hour
-capacity validation is being built as a separate simulator harness; its short 1,024-configured/256-session/
-32-capture proof and optional 15-minute partial mixed-traffic smoke are runnable on a true Linux host,
-while execution of the 24-hour soak is explicitly deferred to a later phase and is not a current gate.
-A deployed Greengrass regression runs on a real nucleus (`--platform GREENGRASS -c GG_CONFIG`, IPC
-transport): the component reaches RUNNING, captures on its own schedule, the delivered images match the
-frames the camera produced byte for byte against independently computed digests, and a corrupted catalog is
-quarantined without stopping capture. The PTZ command path over Greengrass IPC and cross-language IPC
-interop are not covered by it. Kubernetes deployment, file-replicator and bottling-company integration,
-deployment threat review, and combined native-feature coverage gates remain.
-Physical-camera validation is waived for this project because no hardware is available; the component must
-not be represented as hardware-certified based on simulator results. The live status is the
-[acceptance matrix](ACCEPTANCE-MATRIX.md).
+The current implementation includes durable startup, bounded admission, a SQLite job catalog,
+a simulated backend, ONVIF snapshot/RTSP, and optional Linux GenICam/Aravis capture. It remains
+short of general release. The [acceptance matrix](ACCEPTANCE-MATRIX.md) is the release record;
+its dated evidence is historical validation, not a fresh test run from this documentation review.
+
+Recorded evidence includes four-language local MQTT and real Greengrass IPC core conformance;
+Greengrass scheduled capture and announcements; Kubernetes ConfigMap/Downward API capture with
+thumbnail decoding; the 1,024-configured/256-session/32-capture short proof and 15-minute simulator
+smoke; native-feature coverage; and cross-host simulated GigE and 32-camera RTSP capture.
+
+Remaining gates include the southbound command inbox over Greengrass IPC, PVC-backed streaming
+on a StatefulSet, FileReplicator and Dallas integration, and deployment threat review. Cross-host
+WS-Discovery remains blocked by multicast forwarding in the test environment. The 24-hour soak
+is explicitly deferred and is not a current gate. Physical-camera validation is waived because
+hardware is unavailable; simulator evidence does not certify camera models or firmware.
 
 Configured output and state roots are monitored against the output free-space floors. A low or
 unreadable root raises the stateful critical `storage-low` alarm and rejects new captures with
